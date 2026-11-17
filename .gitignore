@@ -1,0 +1,11 @@
+/.local/
+/.venv/
+/windows/bin/*.exe
+/windows/config.json
+/windows/tasks.json
+/windows/web/
+__pycache__/
+.pytest_cache/
+*.log
+*.zip
+*.xml

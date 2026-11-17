@@ -1,0 +1,30 @@
+services:
+  omni-agent:
+    build:
+      context: ..
+      dockerfile: agent-edition/Dockerfile
+    image: omnidownloader-agent:0.1.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:58080:58080"
+    environment:
+      OMNI_AGENT_ADMIN_TOKEN: ${OMNI_AGENT_ADMIN_TOKEN:-}
+      OMNI_AGENT_TOKEN: ${OMNI_AGENT_TOKEN:-}
+      OMNI_AGENT_ALLOWED_HOSTS: ${OMNI_AGENT_ALLOWED_HOSTS:-}
+      OMNI_AGENT_PUBLIC_ORIGIN: ${OMNI_AGENT_PUBLIC_ORIGIN:-}
+      OMNI_AGENT_PROXY: ${OMNI_AGENT_PROXY:-}
+    volumes:
+      - agent-data:/data
+      - agent-cache:/cache
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    mem_limit: 2g
+    pids_limit: 128
+    stop_grace_period: 20s
+volumes:
+  agent-data:
+  agent-cache:

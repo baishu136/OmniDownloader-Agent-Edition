@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "omni-agent": {
+      "command": "C:\\OmniDownloaderAgent\\OmniDownloaderAgentMCP.exe",
+      "args": ["--stdio"],
+      "env": {"OMNI_AGENT_SERVER": "http://127.0.0.1:58080"}
+    }
+  }
+}
