@@ -1,8 +1,7 @@
 {
   "mcpServers": {
     "omni-agent": {
-      "url": "http://127.0.0.1:58080/mcp",
-      "headers": {"Authorization": "Bearer REPLACE_WITH_YOUR_AGENT_IDENTITY_TOKEN"}
+      "url": "http://127.0.0.1:58080/mcp"
     }
   }
 }

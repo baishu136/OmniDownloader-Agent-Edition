@@ -60,8 +60,10 @@ def main():
         'This distribution does not ship pywebview or the original desktop GUI.\n',encoding='utf-8')
     (output/'使用说明.txt').write_text(
         '双击 OmniDownloaderAgent.exe 启动后台服务。首次自动打开 http://127.0.0.1:58080/ 。\n'
-        '访问令牌位于 %LOCALAPPDATA%\\OmniDownloaderAgent\\auth.json，管理页选择该文件即可读取管理员令牌。\n'
-        '右下角托盘菜单可打开管理页或安全退出。MCP stdio请使用 OmniDownloaderAgentMCP.exe --stdio 。\n'
+        '本版本已取消令牌授权设定，用户与 Agent 可免令牌本机直连并直接管理设置。\n'
+        '工作与数据目录优先使用独立工作区根目录下的 data/（独立便携复制时使用同级 data/），不再写入 %LOCALAPPDATA%。\n'
+        '平台 Cookie 仅可由用户在管理页导入与启用；Agent 仅可查看非敏感状态、禁用与移除 Cookie。\n'
+        '右下角托盘菜单可打开管理页或安全退出。MCP stdio 请使用 OmniDownloaderAgentMCP.exe --stdio 。\n'
         '无需安装 Python、FFmpeg 或浏览器运行时。未提供平台测试账号，平台登录和真实发送请按 docs/OPERATIONS.md 验证。\n',encoding='utf-8')
     release=BASE/'dist'/f'OmniDownloader-Agent-Edition-{VERSION}-windows-x64.zip'
     with zipfile.ZipFile(release,'w',zipfile.ZIP_DEFLATED) as archive:

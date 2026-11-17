@@ -1,5 +1,6 @@
 /.local/
 /.venv/
+/data/
 /windows/bin/*.exe
 /windows/config.json
 /windows/tasks.json

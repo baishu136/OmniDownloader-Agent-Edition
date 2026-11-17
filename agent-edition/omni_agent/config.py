@@ -1,6 +1,5 @@
-import json
 import os
-import secrets
+import sys
 import hashlib
 from pathlib import Path
 from typing import Literal
@@ -40,21 +39,34 @@ class Settings(BaseModel):
     @model_validator(mode='after')
     def defaults_obey_limits(self):
         if self.default_height > self.max_height:
-            raise ValueError('默认画质不得高于管理员最高画质')
+            raise ValueError('默认画质不得高于最高允许画质')
         if self.max_file_bytes > self.max_cache_bytes:
             raise ValueError('单文件上限不得大于缓存总上限')
         if self.proxy:
             from urllib.parse import urlsplit
             p = urlsplit(self.proxy)
-            if p.scheme not in ('http','https','socks5') or not p.hostname or not p.port or p.username or p.password or p.query or p.fragment or p.path not in ('','/'):
+            if p.scheme not in ('http', 'https', 'socks5') or not p.hostname or not p.port or p.username or p.password or p.query or p.fragment or p.path not in ('', '/'):
                 raise ValueError('代理需为带端口的 http/https/socks5 地址，不接受嵌入凭据')
         return self
+
+
+def default_data_dir():
+    """解析独立默认数据目录，不再写入系统 %LOCALAPPDATA% 全局目录。"""
+    if getattr(sys, 'frozen', False):
+        exe_dir = Path(sys.executable).resolve().parent
+        # 若 EXE 位于独立源码工程内部（如 dist/OmniDownloaderAgent），统一共用工作区根目录的 data/
+        for candidate in (exe_dir, *exe_dir.parents[:3]):
+            if (candidate / 'agent-edition' / 'omni_agent').is_dir() and (candidate / 'windows').is_dir():
+                return candidate / 'data'
+        return exe_dir / 'data'
+    return Path(__file__).resolve().parents[2] / 'data'
 
 
 def private_dir(path):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
-    if os.name != 'nt': path.chmod(0o700)
+    if os.name != 'nt':
+        path.chmod(0o700)
     return path
 
 
@@ -71,22 +83,13 @@ def atomic_write(path, data):
 
 class Config:
     def __init__(self, directory=None):
-        default = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'OmniDownloaderAgent'
-        self.directory = private_dir(directory or os.environ.get('OMNI_AGENT_DATA', default))
+        data_dir = directory or os.environ.get('OMNI_AGENT_DATA') or default_data_dir()
+        self.directory = private_dir(data_dir)
         self.path = self.directory / 'settings.json'
         self.settings = Settings.model_validate_json(self.path.read_text('utf-8')) if self.path.exists() else Settings(
             cache_dir=os.environ.get('OMNI_AGENT_CACHE', ''), proxy=os.environ.get('OMNI_AGENT_PROXY', ''))
         self.cache = private_dir(Path(self.settings.cache_dir or self.directory / 'cache') / 'omni-agent-managed')
         self.bind_cache()
-        self.auth_path = self.directory / 'auth.json'
-        if not self.auth_path.exists():
-            atomic_write(self.auth_path, json.dumps({'admin': os.environ.get('OMNI_AGENT_ADMIN_TOKEN') or secrets.token_urlsafe(32),
-                                                   'agent': os.environ.get('OMNI_AGENT_TOKEN') or secrets.token_urlsafe(32)}).encode())
-        self.tokens = json.loads(self.auth_path.read_text('utf-8'))
-        for key, env in [('admin', 'OMNI_AGENT_ADMIN_TOKEN'), ('agent', 'OMNI_AGENT_TOKEN')]:
-            if os.environ.get(env): self.tokens[key] = os.environ[env]
-        if any(len(v) < 24 for v in self.tokens.values()) or self.tokens['admin'] == self.tokens['agent']:
-            raise ValueError('管理员与 Agent 令牌必须不同且至少24字符')
 
     def save(self, settings):
         if settings.cache_dir != self.settings.cache_dir:
@@ -95,14 +98,16 @@ class Config:
                 raise AgentError('CACHE_NOT_EMPTY', '更换缓存目录前请完成交付并清理旧缓存')
             destination = private_dir(Path(settings.cache_dir or self.directory / 'cache') / 'omni-agent-managed')
             self.bind_cache(destination)
-        else: destination=self.cache
+        else:
+            destination = self.cache
         atomic_write(self.path, settings.model_dump_json(indent=2).encode())
-        self.cache=destination
+        self.cache = destination
         self.settings = settings
 
-    def bind_cache(self,directory=None):
+    def bind_cache(self, directory=None):
         marker = (directory or self.cache) / '.owner'
         owner = hashlib.sha256(str(self.directory.resolve()).encode()).hexdigest()
         if marker.exists() and marker.read_text() != owner:
             raise ValueError('缓存目录已属于另一个 Agent Edition 状态目录')
-        if not marker.exists(): atomic_write(marker,owner.encode())
+        if not marker.exists():
+            atomic_write(marker, owner.encode())

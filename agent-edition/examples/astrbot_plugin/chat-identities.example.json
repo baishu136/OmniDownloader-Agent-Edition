@@ -1,12 +1,10 @@
 {
   "YOUR_EXACT_ASTRBOT_UNIFIED_MSG_ORIGIN": {
     "adapter": "telegram",
-    "target": "123456789",
-    "token": "REPLACE_WITH_ADMIN_CREATED_PER_CHAT_TOKEN"
+    "target": "123456789"
   },
   "YOUR_OTHER_EXACT_ASTRBOT_UNIFIED_MSG_ORIGIN": {
     "adapter": "onebot",
-    "target": "group:123456789",
-    "token": "REPLACE_WITH_A_DIFFERENT_PER_CHAT_TOKEN"
+    "target": "group:123456789"
   }
 }
