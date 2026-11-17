@@ -10,7 +10,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 
-@register('omni_agent', 'OmniDownloader', 'Headless media delivery through Agent Edition', '0.1.0')
+@register('omni_agent', 'OmniDownloader', 'Headless media delivery through Agent Edition', '0.2.0')
 class OmniAgentPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
