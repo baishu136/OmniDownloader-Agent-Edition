@@ -1,0 +1,92 @@
+name: Publish Agent Edition release
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful independent verification run ID
+        required: true
+        type: string
+      source_sha:
+        description: Exact commit verified by that run
+        required: true
+        type: string
+      tag:
+        description: Independent Agent Edition release tag
+        required: true
+        default: v0.1.0
+        type: string
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_ID: ${{ inputs.run_id }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Validate exact successful build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os,re
+          assert re.fullmatch(r'[0-9]+',os.environ['RUN_ID'])
+          assert re.fullmatch(r'[0-9a-f]{40}',os.environ['SOURCE_SHA'])
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?',os.environ['RELEASE_TAG'])
+          assert os.environ['GH_REPO']=='baishu136/OmniDownloader-Agent-Edition'
+          PY
+          gh run view "$RUN_ID" --json headSha,status,conclusion > build.json
+          python - <<'PY'
+          import json,os
+          data=json.load(open('build.json'))
+          assert data['status']=='completed' and data['conclusion']=='success',data
+          assert data['headSha']==os.environ['SOURCE_SHA'],data
+          PY
+      - name: Download tested Windows artifact
+        run: gh run download "$RUN_ID" --name OmniDownloader-Agent-Edition-windows-x64 --dir release
+      - name: Verify artifact checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum -c ./*.sha256
+      - name: Write release notes
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os,pathlib
+          repo=os.environ['GH_REPO']; sha=os.environ['SOURCE_SHA']; run=os.environ['RUN_ID']
+          checksum=next(pathlib.Path('release').glob('*.sha256')).read_text().split()[0]
+          text=f'''OmniDownloader Agent Edition 0.1.0 Preview
+
+This is an independently maintained public Headless edition. Code, versions, CI, tags and release assets live in this repository. Shared media-core provenance and licenses are documented in UPSTREAM.md and LICENSE.
+
+- Official MCP Python SDK: stdio and Streamable HTTP; 10 media, task and delivery tools.
+- Telegram / OneBot 11 / NapCat delivery, administrator restrictions, encrypted sessions and a minimal local management panel.
+- Durable file references and platform receipts; successful-send cleanup, failed-send retention, bounded caching and restart recovery.
+- Windows ZIP includes Python, FFmpeg, yt-dlp and Deno. Extract and launch OmniDownloaderAgent.exe. MCP stdio uses OmniDownloaderAgentMCP.exe --stdio.
+- Docker: clone this repository, cd agent-edition, docker compose up -d --build.
+
+独立公开发行版。Windows解压后双击主EXE；管理令牌位于 %LOCALAPPDATA%\\OmniDownloaderAgent\\auth.json。MCP、QQ/Telegram共享目录、AstrBot示例、Docker及限制说明见 agent-edition/docs/OPERATIONS.md。
+
+Verification: 80 Agent tests and 140 upstream-core tests passed. Actual Windows EXE startup, official MCP connections and Docker build/start/restart/cache persistence/mock Telegram delivery were checked.
+
+Real QQ, Telegram and AstrBot accounts have not been end-to-end verified. Mock API success is not real-platform acceptance. Account entitlements, DRM and CAPTCHA are not bypassed. Fake-IP DNS mapping to non-public addresses is rejected by the SSRF boundary. Some OneBot implementations without verifiable file/message IDs remain UNCERTAIN and retain their files.
+
+CI: https://github.com/{repo}/actions/runs/{run}
+Build commit: {sha}
+Windows ZIP SHA256: {checksum}
+
+Documentation: https://github.com/{repo}/blob/main/agent-edition/docs/OPERATIONS.md
+'''
+          pathlib.Path('release-notes.md').write_text(text,encoding='utf-8')
+          PY
+      - name: Publish independent preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" release/*.zip release/*.sha256 --target "$SOURCE_SHA" --title "OmniDownloader Agent Edition ${RELEASE_TAG} Preview" --notes-file release-notes.md --prerelease --latest=false
