@@ -1,0 +1,65 @@
+name: Agent Edition verification
+on:
+  push:
+    branches: [main]
+    paths: ['agent-edition/**', 'windows/core/**', 'windows/engine/**', '.github/workflows/agent-edition.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --require-hashes -r agent-edition/requirements.lock
+      - run: python -m pip install pytest pytest-asyncio aiofiles pystray
+      - if: runner.os == 'Windows'
+        run: python windows/tools/prepare_runtime.py
+      - run: python -m pytest agent-edition/tests -q --junitxml=agent-tests.xml
+      - if: runner.os == 'Windows'
+        run: python -m pytest windows/tests -q --junitxml=windows-core-tests.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ runner.os }}
+          path: '*tests.xml'
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f agent-edition/docker-compose.yml build
+      - run: docker compose -f agent-edition/docker-compose.yml up -d --wait
+      - name: Test container service and restart persistence
+        run: |
+          docker compose -f agent-edition/docker-compose.yml exec -T omni-agent python /app/agent-edition/tools/docker_smoke.py
+          docker compose -f agent-edition/docker-compose.yml restart
+          sleep 5
+          docker compose -f agent-edition/docker-compose.yml exec -T omni-agent python /app/agent-edition/tools/docker_smoke.py --check-persistence
+      - if: always()
+        run: docker compose -f agent-edition/docker-compose.yml logs
+      - if: always()
+        run: docker compose -f agent-edition/docker-compose.yml down
+  windows-package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --require-hashes -r agent-edition/requirements.lock
+      - run: python -m pip install pyinstaller pystray
+      - run: python agent-edition/build_windows.py
+      - run: python agent-edition/tools/portable_smoke.py --directory agent-edition/dist/OmniDownloaderAgent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OmniDownloader-Agent-Edition-windows-x64
+          path: |
+            agent-edition/dist/*.zip
+            agent-edition/dist/*.sha256
