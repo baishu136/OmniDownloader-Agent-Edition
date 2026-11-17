@@ -33,7 +33,3 @@ docker compose up -d --build
 工具包括 analyze_media、download_media、get_task_status、list_tasks、cancel_task、download_collection、get_media_file、get_service_capabilities、deliver_media、get_delivery_status。
 
 管理页分为下载设置、功能权限、平台登录、服务与交付四区。QQ / Telegram 连接、每个聊天独立身份、MCP配置与AstrBot示例见 [操作手册](agent-edition/docs/OPERATIONS.md)。
-
-## 验证边界
-
-Agent测试80项、上游Windows核心140项通过；同时验证官方SDK协议、模拟平台交付、浏览器页面、实际Windows EXE与Docker部署。真实QQ、Telegram或AstrBot账号发送尚未验收。平台登录、画质与接口可用性取决于实际账号及网络；不绕过会员、DRM或验证码。Fake-IP DNS映射到非公网地址时会被SSRF防护拒绝。
