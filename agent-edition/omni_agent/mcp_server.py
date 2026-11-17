@@ -29,17 +29,18 @@ def create_mcp(invoke):
         'OmniDownloader Agent Edition',
         version=__version__,
         middleware=[ToolBoundary()],
-        instructions='No authorization token is required for local access. You may read and update service settings, bot configurations, cache cleanup and approvals. '
+        instructions='No authorization token is required for local access. You may read, update and reset service settings, manage bot configurations, cache cleanup and approvals. '
+                     'URL prefixes supported by analyze_media/download_media: "/us" (download collection, multi-part videos or all images) and "/zip" (send as a ZIP archive). '
                      'For platform cookies, you can only inspect non-sensitive status (list_cookie_statuses), disable cookies (disable_platform_cookie) or remove cookies (remove_platform_cookie); '
                      'you cannot read cookie values, import/log in cookies, or re-enable disabled cookies. '
                      'Downloads are asynchronous: poll get_task_status, then call deliver_media for bot delivery.',
     )
 
-    @server.tool(structured_output=True, description='Analyze a supported public share/post/collection link. Returns only observed metadata and real formats; no source URLs or credentials.')
+    @server.tool(structured_output=True, description='Analyze a supported public share/post/collection link (supports /us and /zip prefixes). Returns only observed metadata and real formats.')
     async def analyze_media(url: Annotated[str, Field(min_length=1, max_length=8192)], media_type: Literal['video', 'images'] = 'video') -> dict[str, Any]:
         return await invoke('analyze_media', {'url': url, 'media_type': media_type})
 
-    @server.tool(structured_output=True, description='Create an asynchronous download and return a unique task ID. Omit options to use service defaults; set use_defaults=false for explicit options. request_key makes retries idempotent.')
+    @server.tool(structured_output=True, description='Create an asynchronous download and return a task ID. Supports "/us" (collection/episodes/all images) and "/zip" (ZIP archive) URL prefixes. Omit options to use defaults; set use_defaults=false for explicit options.')
     async def download_media(url: Annotated[str, Field(min_length=1, max_length=8192)], options: DownloadOptions | None = None,
                              request_key: Annotated[str | None, Field(max_length=128)] = None,
                              approval_id: str | None = None) -> dict[str, Any]:
@@ -73,7 +74,7 @@ def create_mcp(invoke):
     async def get_service_capabilities() -> dict[str, Any]:
         return await invoke('get_service_capabilities', {})
 
-    @server.tool(structured_output=True, description='Queue delivery of all completed task files to an allowed Telegram or QQ target. Returns delivery ID immediately.')
+    @server.tool(structured_output=True, description='Queue delivery of all completed task files to an allowed Telegram or QQ target. Honors QQ video/image message/file and forward collection settings.')
     async def deliver_media(task_id: str, adapter: Literal['telegram', 'onebot'], target: str,
                             request_key: Annotated[str, Field(min_length=1, max_length=128)],
                             kind: Literal['auto', 'video', 'audio', 'photo', 'document'] = 'auto') -> dict[str, Any]:
@@ -83,15 +84,19 @@ def create_mcp(invoke):
     async def get_delivery_status(delivery_id: str) -> dict[str, Any]:
         return await invoke('get_delivery_status', {'delivery_id': delivery_id})
 
-    @server.tool(structured_output=True, description='Read all current download, feature, proxy, cache and theme settings.')
+    @server.tool(structured_output=True, description='Read all current download, ZIP packing, storage directories, QQ delivery mode, feature, proxy, cache and theme settings.')
     async def get_settings() -> dict[str, Any]:
         return await invoke('get_settings', {})
 
-    @server.tool(structured_output=True, description='Update one or more service settings (defaults, quality limits, feature switches, proxy, cache_dir, concurrency, theme). Does not touch cookies.')
+    @server.tool(structured_output=True, description='Update one or more service settings (including pack_zip, download_dir, image_dir, cache_dir, qq_video_mode, qq_image_mode, qq_forward_collection, proxy, theme). Does not touch cookies.')
     async def update_settings(settings: SettingsUpdate) -> dict[str, Any]:
         return await invoke('update_settings', {'settings': settings.model_dump(exclude_none=True)})
 
-    @server.tool(structured_output=True, description='Read Telegram and OneBot delivery adapter configurations without exposing secret bot tokens.')
+    @server.tool(structured_output=True, description='Reset service settings to defaults (preserves custom cache_dir if old cache still contains files unless reset_cache_dir=true).')
+    async def reset_settings(reset_cache_dir: bool = False) -> dict[str, Any]:
+        return await invoke('reset_settings', {'reset_cache_dir': reset_cache_dir})
+
+    @server.tool(structured_output=True, description='Read Telegram and OneBot delivery adapter configurations and live connection info without exposing secret bot tokens.')
     async def get_bot_configs() -> dict[str, Any]:
         return await invoke('get_bot_configs', {})
 

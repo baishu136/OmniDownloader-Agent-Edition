@@ -274,3 +274,75 @@ async def test_single_zip_confirmation_round_trip_uses_public_tool_schema(servic
     service.store.db.execute('UPDATE approvals SET approved=1 WHERE id=?', (approval,))
     result = await invoke(service, 'alice', 'download_media', dict(arguments, approval_id=approval))
     assert result['ok'] and result['result']['state'] == 'QUEUED'
+
+
+def test_patch_and_reset_settings_and_storage_directories(service, tmp_path):
+    dl_dir = tmp_path / 'downloads'
+    img_dir = tmp_path / 'images'
+    service.runner = FakeRunner(service.config, service.store)
+    with TestClient(create_app(service)) as client:
+        # PATCH 部分更新（自动保存用）
+        res = client.patch('/api/admin/config', json={
+            'theme': 'dark',
+            'download_dir': str(dl_dir),
+            'image_dir': str(img_dir),
+            'qq_video_mode': 'message',
+            'qq_image_mode': 'file',
+            'qq_forward_collection': True,
+            'pack_zip': True,
+        })
+        assert res.status_code == 200 and res.json()['settings']['theme'] == 'dark'
+        assert res.json()['settings']['qq_forward_collection'] is True
+
+        # 不合法的相对路径或内部目录重叠须拒绝
+        bad = client.patch('/api/admin/config', json={'download_dir': 'relative/path'})
+        assert bad.status_code == 400
+        overlap = client.patch('/api/admin/config', json={'download_dir': str(service.config.directory)})
+        assert overlap.status_code == 400
+
+        # 状态接口回传存储目录与 bot 连接信息
+        st = client.get('/api/admin/status').json()
+        assert st['download_dir'] == str(dl_dir) and st['image_dir'] == str(img_dir)
+        assert len(st['bots']) == 2 and 'status' in st['bots'][0]
+
+        # 执行一次下载：验证永久文件确实导出到 download_dir / image_dir，且清理缓存不会删掉它
+        dl = client.post('/api/tools/download_media', json={'url': 'https://youtube.com/watch?v=test', 'options': {'use_defaults': False, 'download_type': 'VIDEO_WITH_AUDIO', 'pack_zip': False}}).json()
+        assert dl['ok']
+        import time
+        for _ in range(100):
+            job_st = client.post('/api/tools/get_task_status', json={'task_id': dl['result']['id']}).json()['result']
+            if job_st['state'] == 'READY':
+                break
+            time.sleep(.02)
+        assert job_st['state'] == 'READY'
+        assert (dl_dir / 'fixture.png').is_file()
+
+        # 重置默认设置
+        reset = client.post('/api/admin/config/reset', json={'reset_cache_dir': False})
+        assert reset.status_code == 200
+        reset_cfg = reset.json()['settings']
+        assert reset_cfg['theme'] == 'auto'
+        assert reset_cfg['download_dir'] == ''
+        assert reset_cfg['qq_video_mode'] == 'file'
+        assert reset_cfg['qq_forward_collection'] is False
+        assert reset_cfg['pack_zip'] is False
+
+
+async def test_download_command_prefixes_us_and_zip(service):
+    from omni_agent.security import parse_download_command
+
+    assert parse_download_command('/us https://www.bilibili.com/video/BV1xx') == ('https://www.bilibili.com/video/BV1xx', True, False)
+    assert parse_download_command('/zip https://www.xiaohongshu.com/explore/1') == ('https://www.xiaohongshu.com/explore/1', False, True)
+    assert parse_download_command('/us /zip 看看 https://x.com/u/status/1') == ('看看 https://x.com/u/status/1', True, True)
+    assert parse_download_command('/zip/us https://youtube.com/watch?v=1') == ('/zip/us https://youtube.com/watch?v=1', False, False)
+    assert parse_download_command('/ushttps://youtube.com/watch?v=1') == ('https://youtube.com/watch?v=1', True, False)
+
+    # 通过服务层调用，/us + /zip 能正确写入 payload 的 all_items 与 pack_zip
+    service.update_settings({'confirmation_threshold': 50})
+    job = await service.download('agent', '/us /zip https://www.bilibili.com/video/BV17x411w7KC', DownloadOptions())
+    stored = service.store.payload(service.store.job(job['id']))
+    assert stored['all_items'] is True
+    assert stored['cmd_all'] is True and stored['cmd_zip'] is True
+    assert stored['options']['pack_zip'] is True
+    assert stored['url'] == 'https://www.bilibili.com/video/BV17x411w7KC'
+

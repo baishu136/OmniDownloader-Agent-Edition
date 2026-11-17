@@ -13,8 +13,8 @@ EXPECTED_TOOLS = {
     'analyze_media', 'download_media', 'download_collection', 'get_task_status',
     'list_tasks', 'cancel_task', 'get_media_file', 'get_service_capabilities',
     'deliver_media', 'get_delivery_status', 'get_settings', 'update_settings',
-    'get_bot_configs', 'update_bot_config', 'probe_bot', 'list_approvals',
-    'approve_request', 'cleanup_cache', 'list_cookie_statuses',
+    'reset_settings', 'get_bot_configs', 'update_bot_config', 'probe_bot',
+    'list_approvals', 'approve_request', 'cleanup_cache', 'list_cookie_statuses',
     'disable_platform_cookie', 'remove_platform_cookie',
 }
 
@@ -95,7 +95,10 @@ async def test_streamable_http_initialize_discovery_and_settings_and_cookie_tool
                 assert removed.structured_content['result']['platforms'][0]['state'] == 'MISSING'
 
                 # 恢复默认设置供后续检查
-                await session.call_tool('update_settings', {'settings': {'default_height': 1080, 'theme': 'auto'}})
+                reset_res = await session.call_tool('reset_settings', {})
+                assert reset_res.structured_content['ok'] is True
+                assert reset_res.structured_content['result']['settings']['default_height'] == 1080
+                assert reset_res.structured_content['result']['settings']['theme'] == 'auto'
 
                 result = await session.call_tool('get_task_status', {'task_id': 'missing'})
                 assert result.structured_content['error']['code'] == 'NOT_FOUND'

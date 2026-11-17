@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 import sys
-import time
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -74,6 +73,10 @@ class UpdateSettingsArgs(Input):
     settings: SettingsUpdate
 
 
+class ResetSettingsArgs(Input):
+    reset_cache_dir: bool = False
+
+
 class UpdateBotConfigArgs(Input):
     config: BotConfigUpdate
 
@@ -112,6 +115,7 @@ SCHEMAS = {
     'get_delivery_status': DeliveryID,
     'get_settings': Input,
     'update_settings': UpdateSettingsArgs,
+    'reset_settings': ResetSettingsArgs,
     'get_bot_configs': Input,
     'update_bot_config': UpdateBotConfigArgs,
     'probe_bot': ProbeBotArgs,
@@ -159,6 +163,8 @@ async def invoke(service, owner, name, arguments):
             result = service.get_settings()
         elif name == 'update_settings':
             result = service.update_settings(args.settings.model_dump(exclude_none=True))
+        elif name == 'reset_settings':
+            result = service.reset_settings(reset_cache_dir=args.reset_cache_dir)
         elif name == 'get_bot_configs':
             result = {'bots': service.get_bot_configs()}
         elif name == 'update_bot_config':
@@ -304,12 +310,21 @@ def create_app(service=None):
         service.update_settings(settings.model_dump())
         return {'ok': True}
 
+    @app.patch('/api/admin/config')
+    async def patch_settings(patch: SettingsUpdate):
+        return {'ok': True, 'settings': service.update_settings(patch.model_dump(exclude_none=True))}
+
+    @app.post('/api/admin/config/reset')
+    async def reset_settings(body: ResetSettingsArgs | None = None):
+        return {'ok': True, **service.reset_settings(reset_cache_dir=bool(body and body.reset_cache_dir))}
+
     @app.get('/api/admin/status')
     async def status():
         recent = service.store.db.execute("SELECT id,error,updated FROM jobs WHERE error!='' ORDER BY updated DESC LIMIT 10").fetchall()
         counts = {r['state']: r['count'] for r in service.store.db.execute('SELECT state,COUNT(*) count FROM jobs GROUP BY state')}
         deliveries = [dict(r) for r in service.store.db.execute('SELECT id,task_id,adapter,target,state,error FROM deliveries ORDER BY created DESC LIMIT 50')]
         cleanup = [dict(r) for r in service.store.db.execute('SELECT * FROM cleanup_log ORDER BY created DESC LIMIT 5')]
+        s = service.config.settings
         return {
             'capabilities': service.capabilities(),
             'cache_bytes': service.store.usage(),
@@ -322,6 +337,9 @@ def create_app(service=None):
             'mcp_path': '/mcp',
             'cache_path': str(service.config.cache),
             'data_path': str(service.config.directory),
+            'download_dir': s.download_dir,
+            'image_dir': s.image_dir or s.download_dir,
+            'bots': service.get_bot_configs(),
         }
 
     @app.post('/api/admin/cleanup')
@@ -422,6 +440,10 @@ def create_app(service=None):
                 'Referrer-Policy': 'no-referrer',
             },
         )
+
+    @app.get('/favicon.ico')
+    async def favicon():
+        return FileResponse(static / 'favicon.svg', media_type='image/svg+xml')
 
     app.mount('/static', StaticFiles(directory=static), name='static')
     app.mount('/', mcp_app)

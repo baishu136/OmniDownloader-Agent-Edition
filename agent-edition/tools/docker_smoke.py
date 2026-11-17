@@ -121,7 +121,7 @@ async def mcp_check():
         async with streamable_http_client('http://127.0.0.1:58080/mcp', http_client=client) as streams:
             async with ClientSession(streams[0], streams[1]) as session:
                 await session.initialize()
-                assert len((await session.list_tools()).tools) == 21
+                assert len((await session.list_tools()).tools) == 22
 
 
 if __name__ == '__main__':

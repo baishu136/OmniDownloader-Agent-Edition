@@ -18,7 +18,6 @@ class OmniAgentPlugin(Star):
         self.identities = Path(os.environ.get('OMNI_AGENT_CHAT_IDENTITIES', 'data/omni-agent-chats.json'))
 
     def route(self, event):
-        # 仅映射聊天会话到固定机器人适配器与目标，无需配置令牌
         rows = json.loads(self.identities.read_text('utf-8'))
         route = rows.get(event.unified_msg_origin)
         if not route:
@@ -64,13 +63,33 @@ class OmniAgentPlugin(Star):
             result = str(error) if isinstance(error, RuntimeError) else '连接或配置失败，请检查服务与会话路由配置'
         yield event.plain_result(result)
 
+    @filter.command('us')
+    async def download_all_command(self, event: AstrMessageEvent, url: str, approval_id: str = ''):
+        """下载合集、分集视频或全部图片。"""
+        try:
+            prefixed = url if url.lstrip().lower().startswith('/us') else f'/us {url}'
+            result = await self.process(event, prefixed, 'default', approval_id or None)
+        except (RuntimeError, OSError, ValueError, httpx.HTTPError) as error:
+            result = str(error) if isinstance(error, RuntimeError) else '连接或配置失败，请检查服务与会话路由配置'
+        yield event.plain_result(result)
+
+    @filter.command('zip')
+    async def download_zip_command(self, event: AstrMessageEvent, url: str, approval_id: str = ''):
+        """以 ZIP 压缩包形式下载并发送。"""
+        try:
+            prefixed = url if url.lstrip().lower().startswith('/zip') else f'/zip {url}'
+            result = await self.process(event, prefixed, 'default', approval_id or None)
+        except (RuntimeError, OSError, ValueError, httpx.HTTPError) as error:
+            result = str(error) if isinstance(error, RuntimeError) else '连接或配置失败，请检查服务与会话路由配置'
+        yield event.plain_result(result)
+
     @filter.llm_tool(name='omni_download_and_deliver')
     async def media_tool(self, event: AstrMessageEvent, url: str, download_type: str = 'default', approval_id: str = '') -> str:
-        """下载媒体并由服务发送到当前聊天。
+        """下载媒体并由服务发送到当前聊天。支持在链接前加 /us（下载合集/分集/全部图片）和 /zip（打包压缩包发送）。
 
         Args:
-            url(string): 作品或视频分享链接。
-            download_type(string): default 或 VIDEO_WITH_AUDIO、VIDEO_ONLY、AUDIO_ONLY、GIF、COVER、IMAGE、IMAGE_ZIP。
+            url(string): 作品或视频分享链接（可附带 /us 或 /zip 前缀指令）。
+            download_type(string): default 或 VIDEO_WITH_AUDIO、VIDEO_ONLY、AUDIO_ONLY、GIF、COVER、IMAGE。
             approval_id(string): 高消耗请求批准后返回的确认ID，普通请求留空。
         """
         try:

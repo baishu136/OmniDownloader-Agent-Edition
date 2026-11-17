@@ -4,11 +4,51 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
+import zipfile
 
 from .credentials import Vault
 from .errors import AgentError, safe_text
-from .security import install_network_guard, is_profile, source_url, validate_url
+from .security import controlled, install_network_guard, is_profile, source_url, validate_url
+
+
+def _safe_archive_name(title, fallback='omni_archive'):
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', str(title or '')).strip(' .')
+    return (cleaned[:80] or fallback)
+
+
+def pack_paths_to_zip(paths, output_dir, title, max_file_bytes):
+    """将输出文件列表打包为 ZIP 压缩包并校验大小及完整性。"""
+    output_dir = Path(output_dir)
+    archive_name = _safe_archive_name(title)
+    target = output_dir / f'{archive_name}.zip'
+    index = 1
+    while target.exists():
+        target = output_dir / f'{archive_name}_{index}.zip'
+        index += 1
+    temporary = target.with_suffix('.zip.part')
+    try:
+        with zipfile.ZipFile(temporary, 'w', zipfile.ZIP_STORED) as bundle:
+            used_names = set()
+            for idx, item in enumerate(paths):
+                src = controlled(output_dir, item)
+                arcname = src.name
+                if arcname in used_names:
+                    arcname = f'{idx + 1}_{arcname}'
+                used_names.add(arcname)
+                bundle.write(src, arcname)
+        if not temporary.is_file() or not 0 < temporary.stat().st_size <= max_file_bytes:
+            raise AgentError('FILE_TOO_LARGE', '打包后的压缩包为空或超出单文件大小上限')
+        with zipfile.ZipFile(temporary) as bundle:
+            if bundle.testzip():
+                raise AgentError('FILE_INVALID', '打包压缩包完整性校验失败')
+        temporary.replace(target)
+        for item in paths:
+            Path(item).unlink(missing_ok=True)
+        return str(target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 async def execute(request, emit):
@@ -20,8 +60,6 @@ async def execute(request, emit):
         os.environ.pop(key, None)
     vault = Vault(request['data'])
     sessions, domains = vault.bind_core()
-    # The Agent boundary removes ALL upstream URLs, including unfamiliar signed
-    # parameter names, from legacy error logs as well as protocol responses.
     from engine import media_errors
     media_errors.sanitize = safe_text
     install_network_guard(request.get('proxy', ''))
@@ -32,8 +70,6 @@ async def execute(request, emit):
     config.max_concurrent_tasks = 1
     from engine.url_sniffer import UrlSniffer
     from engine.ytdlp_engine import YtDlpEngine
-    # Bound extraction before the core materializes playlist entries; disable
-    # external media downloaders, unavailable browser fallback and DRM formats.
     original_opts = YtDlpEngine._build_ydl_opts.__func__
 
     @classmethod
@@ -44,8 +80,9 @@ async def execute(request, emit):
                      hls_prefer_native=True, allowed_extractors=['default'],
                      external_downloader=None, allow_unplayable_formats=False)
         from .credentials import native_runtime
-        deno=native_runtime('deno')
-        if deno: value['js_runtimes'] = {'deno': {'path':deno}}
+        deno = native_runtime('deno')
+        if deno:
+            value['js_runtimes'] = {'deno': {'path': deno}}
         return value
 
     YtDlpEngine._build_ydl_opts = opts
@@ -67,39 +104,46 @@ async def execute(request, emit):
             valid = bool(data.get('data', {}).get('isLogin')) if site == '哔哩哔哩' else data.get('error') is False
             emit({'kind': 'result', 'result': {'state': 'VALID' if valid else 'INVALID'}})
             return
-        finally: client.close()
+        finally:
+            client.close()
     url = source_url(request['url'])
     validate_url(url, initial=True)
     url = await UrlSniffer.sanitize_and_resolve_url(url, config.proxy_url)
     validate_url(url, initial=True)
     profile = is_profile(url)
     if profile and not request.get('allow_profiles'):
-        raise AgentError('FEATURE_DISABLED', '管理员未允许用户主页解析')
+        raise AgentError('FEATURE_DISABLED', '当前设置未允许用户主页解析')
     site = UrlSniffer.identify_site(url)
     options = request.get('options') or {}
+    all_items = bool(request.get('all_items'))
+    pack_zip = bool(options.get('pack_zip') or options.get('download_type') == 'IMAGE_ZIP')
     image_request = options.get('download_type') in ('IMAGE', 'IMAGE_ZIP') or request.get('media_type') == 'images'
     if image_request:
         from engine.images import ImageEngine
         if profile:
-            if site != 'X (Twitter)': raise AgentError('CAPABILITY_UNAVAILABLE','当前主页图文适配器仅提供X首个图片分页')
+            if site != 'X (Twitter)':
+                raise AgentError('CAPABILITY_UNAVAILABLE', '当前主页图文适配器仅提供X首个图片分页')
             from engine.media_resolver import resolve_x_profile_page
             def profile_page():
-                with sessions.cookie_file(site) as cookie: return resolve_x_profile_page(url,cookie,config.proxy_url)
+                with sessions.cookie_file(site) as cookie:
+                    return resolve_x_profile_page(url, cookie, config.proxy_url)
             post = await asyncio.to_thread(profile_page)
-            post['resources'] = post['resources'][:request.get('max_items',10)]
+            post['resources'] = post['resources'][:request.get('max_items', 10)]
             url = post['url']
             ImageEngine.remember(post)
-        else: post = await ImageEngine.extract(url, site)
-        if len(post['resources']) > request.get('max_items', 20):
-            raise AgentError('LIMIT_EXCEEDED', '图文数量超过管理员限制')
+        else:
+            post = await ImageEngine.extract(url, site)
+        if len(post['resources']) > request.get('max_items', 20) and action != 'analyze' and not (action == 'collection' or all_items):
+            raise AgentError('LIMIT_EXCEEDED', '图文数量超过限制')
         metadata = {'platform': site, 'title': safe_text(post['title']), 'author': safe_text(post.get('author', '')),
                     'media_type': 'images', 'file_count': len(post['resources']),
-                    'options': ['IMAGE', 'IMAGE_ZIP']}
+                    'options': ['IMAGE']}
         if action == 'analyze':
             emit({'kind': 'result', 'result': metadata})
             return
     else:
-        if profile and site != 'YouTube': raise AgentError('CAPABILITY_UNAVAILABLE','当前主页视频适配器仅提供有界的YouTube列表')
+        if profile and site != 'YouTube':
+            raise AgentError('CAPABILITY_UNAVAILABLE', '当前主页视频适配器仅提供有界的YouTube列表')
         if site in ('抖音', '小红书', '快手', '小黑盒', 'Pixiv'):
             from engine.platforms import PlatformEngine
             meta = await PlatformEngine.extract(url, site)
@@ -109,9 +153,10 @@ async def execute(request, emit):
         elif site == 'TikTok':
             from engine.tiktok_extractor import TikTokDirectExtractor
             meta = await TikTokDirectExtractor.extract(url)
-        else: meta = await YtDlpEngine.extract(url, site)
+        else:
+            meta = await YtDlpEngine.extract(url, site)
         children = meta.multi_media_list
-        children = children[:request.get('max_items',20)]
+        children = children[:request.get('max_items', 20)]
         metadata = {'platform': site, 'title': safe_text(meta.title), 'author': safe_text(meta.author),
                     'media_type': 'video', 'file_count': len(children) or 1,
                     'formats': [{'id': str(f.format_id) if not str(f.format_id).startswith('http') else 'source',
@@ -127,31 +172,52 @@ async def execute(request, emit):
             return
     from core.models import AudioFormat, DownloadType, QualitySelection, TaskStatus
     from core.task_manager import task_manager
+    max_items = request.get('max_items', 20)
     if image_request:
         available = post['resources']
-        if action == 'collection': available = available[request['start']-1:request['start']-1+request['count']]
-        selected = available if options['download_type'] == 'IMAGE_ZIP' or action=='collection' else available[:1]
-        if not selected: raise AgentError('INVALID_RANGE','指定范围没有图片')
-        if options['download_type']=='IMAGE_ZIP':items=[(url,post['title'],[r['id'] for r in selected])]
-        else:items=[(url,post['title'],[resource['id']]) for resource in selected]
+        if action == 'collection':
+            selected = available[request['start'] - 1:request['start'] - 1 + request['count']]
+        elif all_items or options.get('download_type') == 'IMAGE_ZIP':
+            selected = available[:max_items]
+        else:
+            selected = available[:1]
+        if not selected:
+            raise AgentError('INVALID_RANGE', '指定范围没有图片')
+        core_download_type = DownloadType.IMAGE_ZIP if pack_zip else DownloadType.IMAGE
+        if pack_zip:
+            items = [(url, post['title'], [r['id'] for r in selected])]
+        else:
+            items = [(url, f'{post["title"]}_{idx + 1}' if len(selected) > 1 else post['title'], [resource['id']])
+                     for idx, resource in enumerate(selected)]
     else:
         if action == 'collection':
             start, count = request['start'], request['count']
-            if not children: raise AgentError('NO_COLLECTION', '未取得可定位的合集内容')
+            if not children:
+                raise AgentError('NO_COLLECTION', '未取得可定位的合集内容')
             chosen = children[start - 1:start - 1 + count]
-            if not chosen: raise AgentError('INVALID_RANGE', '指定范围没有可下载内容')
+            if not chosen:
+                raise AgentError('INVALID_RANGE', '指定范围没有可下载内容')
+        elif all_items and children:
+            chosen = children[:max_items]
         else:
-            if children: raise AgentError('COLLECTION_REQUIRED', '此链接包含多个媒体，请使用 download_collection 明确指定范围')
+            if children:
+                raise AgentError('COLLECTION_REQUIRED', '此链接包含多个媒体，请使用 download_collection 或在链接前加 /us 指令')
             chosen = [meta]
+        core_download_type = DownloadType(options['download_type'])
         items = [(item.url, item.title, []) for item in chosen]
     paths = []
     for index, (item_url, title, image_ids) in enumerate(items):
         validate_url(item_url, initial=True)
-        task = await task_manager.add_task(url=item_url, title='media-' + str(index + 1),
-            download_type=DownloadType(options['download_type']), audio_format=AudioFormat(options['audio_format']),
+        task = await task_manager.add_task(
+            url=item_url,
+            title=title or ('media-' + str(index + 1)),
+            download_type=core_download_type,
+            audio_format=AudioFormat(options['audio_format']),
             quality_selection=QualitySelection(mode='MAX_HEIGHT', maxHeight=options['height'],
                                                container=options['container'], allowLowerQuality=True),
-            image_platform=site if image_request else '', selected_image_ids=image_ids)
+            image_platform=site if image_request else '',
+            selected_image_ids=image_ids,
+        )
         while task.status in (TaskStatus.PENDING, TaskStatus.DOWNLOADING, TaskStatus.PROCESSING):
             emit({'kind': 'progress', 'state': task.status.value, 'progress': (index * 100 + task.progress) / len(items),
                   'speed': task.speed_text, 'files': len(paths)})
@@ -160,6 +226,10 @@ async def execute(request, emit):
             raise AgentError(task.error_code or task.status.value, safe_text(task.error_message or '核心下载未完成'))
         validate_output(task.local_file_path, root, options, request['max_file_bytes'])
         paths.append(task.local_file_path)
+    if pack_zip and not (len(paths) == 1 and Path(paths[0]).suffix.lower() == '.zip'):
+        zip_path = pack_paths_to_zip(paths, root / 'output', metadata.get('title') or 'omni_media', request['max_file_bytes'])
+        validate_output(zip_path, root, options, request['max_file_bytes'])
+        paths = [zip_path]
     emit({'kind': 'result', 'result': {'paths': paths, 'metadata': metadata}})
 
 
@@ -167,54 +237,57 @@ def validate_output(name, root, options, maximum):
     from .security import controlled
     path = controlled(root / 'output', name)
     if not path.is_file() or not 0 < path.stat().st_size <= maximum:
-        raise AgentError('FILE_INVALID','成品为空或超出管理员大小限制')
+        raise AgentError('FILE_INVALID', '成品为空或超出大小限制')
     suffix = path.suffix.lower()
     if suffix == '.zip':
-        import zipfile
         with zipfile.ZipFile(path) as archive:
             if sum(i.file_size for i in archive.infolist()) > maximum * 4 or archive.testzip():
-                raise AgentError('FILE_INVALID','图片归档超过限制或校验失败')
-    elif suffix in ('.jpg','.jpeg','.png','.webp','.gif','.avif'):
+                raise AgentError('FILE_INVALID', '压缩包超过限制或校验失败')
+    elif suffix in ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif'):
         from PIL import Image
-        with Image.open(path) as image: image.verify()
+        with Image.open(path) as image:
+            image.verify()
     else:
         from engine.media_verifier import probe
         actual = probe(path)
         if not actual['width'] and not actual['audio']:
-            raise AgentError('FILE_INVALID','成品未包含可验证的媒体流')
-        if min(actual['width'],actual['height']) > options['height']:
-            raise AgentError('LIMIT_EXCEEDED','实际成品画质超过管理员/请求限制')
+            raise AgentError('FILE_INVALID', '成品未包含可验证的媒体流')
+        if min(actual['width'], actual['height']) > options['height']:
+            raise AgentError('LIMIT_EXCEEDED', '实际成品画质超过请求或上限设置')
 
 
 def main():
     if os.name != 'nt' and os.environ.get('OMNI_AGENT_WORKER_PARENT'):
         import threading
-        threading.Thread(target=watch_parent,args=(int(os.environ['OMNI_AGENT_WORKER_PARENT']),),daemon=True).start()
+        threading.Thread(target=watch_parent, args=(int(os.environ['OMNI_AGENT_WORKER_PARENT']),), daemon=True).start()
     output = sys.stdout
+
     def emit(value):
         output.write(json.dumps(value, ensure_ascii=True) + '\n')
         output.flush()
+
     request = json.loads(sys.stdin.readline())
-    # Core prints and third-party logs must never corrupt the protocol or expose
-    # cookies/signed URLs. Worker errors leave only structured, sanitized events.
     with open(os.devnull, 'w') as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-        try: asyncio.run(execute(request, emit))
-        except AgentError as error: emit({'kind': 'error', **error.result()['error']})
+        try:
+            asyncio.run(execute(request, emit))
+        except AgentError as error:
+            emit({'kind': 'error', **error.result()['error']})
         except Exception as error:
-            import re
             match = re.search(r'\[([A-Z_]+)\]', str(error))
             emit({'kind': 'error', 'code': match[1] if match else 'ENGINE_ERROR', 'message': safe_text(error)})
 
 
 def watch_parent(expected):
-    """Linux standalone workers must not outlive a crashed service process."""
+    """Linux 独立工作进程防止在服务崩溃后遗留孤儿进程。"""
     import signal
     import time
     while True:
         if os.getppid() != expected:
-            if os.getpgrp()==os.getpid():os.killpg(os.getpgrp(),signal.SIGKILL)
+            if os.getpgrp() == os.getpid():
+                os.killpg(os.getpgrp(), signal.SIGKILL)
             os._exit(70)
         time.sleep(.5)
 
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    main()

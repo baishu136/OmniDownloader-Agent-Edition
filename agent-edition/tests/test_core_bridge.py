@@ -78,3 +78,79 @@ async def test_collection_of_images_creates_one_core_task_per_selected_image(tmp
         'options':{'download_type':'IMAGE','height':1080,'container':'mp4','audio_format':'mp3'}},events.append)
     assert selected==['i2','i3']
     assert len(events[-1]['result']['paths'])==2
+
+
+async def test_all_items_separate_images_and_zip_packing_for_video_collection(tmp_path, monkeypatch):
+    import zipfile
+    monkeypatch.setattr('omni_agent.worker.install_network_guard', lambda *args: None)
+    monkeypatch.setattr('omni_agent.worker.validate_url', lambda url, **kw: url)
+    from core.config import config
+    from core.models import FormatOption, VideoMetadata
+    from engine.bilibili_extractor import BilibiliDirectExtractor
+    from engine.images import ImageEngine
+    from engine.url_sniffer import UrlSniffer
+
+    # 1. /us（all_items=True）且 pack_zip=False 时，下载全部独立图片而非打压缩包
+    img_url = 'https://www.xiaohongshu.com/explore/all-imgs'
+    post = {'url': img_url, 'platform': '小红书', 'title': 'pics', 'resources': [{'id': 'p1'}, {'id': 'p2'}, {'id': 'p3'}]}
+    monkeypatch.setattr(UrlSniffer, 'sanitize_and_resolve_url', AsyncMock(return_value=img_url))
+    monkeypatch.setattr(ImageEngine, 'extract', AsyncMock(return_value=post))
+    dl_calls = []
+
+    async def img_dl(task, progress, cancel):
+        from PIL import Image
+        dl_calls.append((task.download_type.value, list(task.selected_image_ids)))
+        p = Path(config.download_dir) / (task.id + '.png')
+        Image.new('RGB', (4, 4), 'yellow').save(p)
+        return str(p)
+
+    monkeypatch.setattr(ImageEngine, 'download', img_dl)
+    events = []
+    await execute({
+        'action': 'download',
+        'url': '/us ' + img_url,
+        'all_items': True,
+        'state': str(tmp_path / 'work_img'),
+        'data': str(tmp_path / 'data_img'),
+        'max_file_bytes': 1024**2,
+        'options': {'download_type': 'IMAGE', 'height': 1080, 'container': 'mp4', 'audio_format': 'mp3', 'pack_zip': False},
+    }, events.append)
+    assert len(dl_calls) == 3 and all(dt == 'IMAGE' for dt, _ in dl_calls)
+    assert len(events[-1]['result']['paths']) == 3
+
+    # 2. /us + /zip 对合集视频下载全部子集并打包成一个 ZIP 文件
+    vid_url = 'https://www.bilibili.com/video/BV1multi'
+    child1 = VideoMetadata(url=vid_url + '?p=1', title='ep1', siteName='哔哩哔哩')
+    child2 = VideoMetadata(url=vid_url + '?p=2', title='ep2', siteName='哔哩哔哩')
+    parent = VideoMetadata(
+        url=vid_url,
+        title='合集作品',
+        siteName='哔哩哔哩',
+        availableVideoFormats=[FormatOption(formatId='f1', resolutionLabel='720p', width=1280, height=720)],
+        multiMediaList=[child1, child2],
+    )
+    monkeypatch.setattr(UrlSniffer, 'sanitize_and_resolve_url', AsyncMock(return_value=vid_url))
+    monkeypatch.setattr(BilibiliDirectExtractor, 'extract', AsyncMock(return_value=parent))
+
+    async def vid_dl(task, progress, cancel):
+        from PIL import Image
+        p = Path(config.download_dir) / f'{task.title}_{task.id[:6]}.png'
+        Image.new('RGB', (8, 8), 'red').save(p)
+        return str(p)
+
+    monkeypatch.setattr(BilibiliDirectExtractor, 'download', vid_dl)
+    monkeypatch.setattr('engine.media_verifier.probe', lambda p: {'width': 8, 'height': 8, 'audio': False})
+    events2 = []
+    await execute({
+        'action': 'download',
+        'url': '/us /zip ' + vid_url,
+        'all_items': True,
+        'state': str(tmp_path / 'work_vid'),
+        'data': str(tmp_path / 'data_vid'),
+        'max_file_bytes': 1024**2,
+        'options': {'download_type': 'VIDEO_WITH_AUDIO', 'height': 1080, 'container': 'mp4', 'audio_format': 'mp3', 'pack_zip': True},
+    }, events2.append)
+    out_paths = events2[-1]['result']['paths']
+    assert len(out_paths) == 1 and out_paths[0].endswith('.zip')
+    with zipfile.ZipFile(out_paths[0]) as zf:
+        assert zf.testzip() is None and len(zf.namelist()) == 2

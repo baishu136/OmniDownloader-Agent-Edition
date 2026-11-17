@@ -14,6 +14,7 @@ class Settings(BaseModel):
     max_height: int = Field(2160, ge=144, le=8640)
     container: Literal['mp4', 'mkv', 'auto'] = 'mp4'
     audio_format: Literal['mp3', 'm4a', 'flac', 'opus'] = 'mp3'
+    pack_zip: bool = False
     autonomous: bool = True
     max_file_bytes: int = Field(500 * 1024**2, ge=1024, le=20 * 1024**3)
     max_cache_bytes: int = Field(4 * 1024**3, ge=1024**2, le=1024**4)
@@ -21,6 +22,8 @@ class Settings(BaseModel):
     max_queue: int = Field(100, ge=1, le=1000)
     task_timeout: int = Field(1800, ge=10, le=7200)
     cache_ttl: int = Field(86400, ge=60, le=2592000)
+    download_dir: str = ''
+    image_dir: str = ''
     cache_dir: str = ''
     proxy: str = ''
     video: bool = True
@@ -34,6 +37,9 @@ class Settings(BaseModel):
     confirmation_threshold: int = Field(5, ge=1, le=200)
     auto_delete: bool = True
     reuse_cache: bool = True
+    qq_video_mode: Literal['message', 'file'] = 'file'
+    qq_image_mode: Literal['message', 'file'] = 'message'
+    qq_forward_collection: bool = False
     theme: Literal['auto', 'light', 'dark'] = 'auto'
 
     @model_validator(mode='after')
@@ -42,6 +48,15 @@ class Settings(BaseModel):
             raise ValueError('默认画质不得高于最高允许画质')
         if self.max_file_bytes > self.max_cache_bytes:
             raise ValueError('单文件上限不得大于缓存总上限')
+        for label, value in (('下载目录', self.download_dir), ('图文目录', self.image_dir), ('缓存目录', self.cache_dir)):
+            if value:
+                if '\x00' in value or any(c in value for c in '\r\n'):
+                    raise ValueError(f'{label}路径包含非法字符')
+                p = Path(value)
+                if not p.is_absolute():
+                    raise ValueError(f'{label}必须填写绝对路径')
+                if p.resolve() == Path(p.resolve().anchor):
+                    raise ValueError(f'{label}不能直接使用磁盘或系统根目录')
         if self.proxy:
             from urllib.parse import urlsplit
             p = urlsplit(self.proxy)

@@ -105,3 +105,68 @@ async def test_onebot_unimplemented_action_is_rejected(media):
 async def test_target_allowlist(media):
     with pytest.raises(AgentError) as error:await TelegramAdapter(telegram()).send(media,'999','document')
     assert error.value.code=='TARGET_DENIED'
+
+
+async def test_onebot_video_and_image_message_vs_file_and_zip_modes(tmp_path):
+    video = tmp_path / 'clip.mp4'
+    video.write_bytes(b'vid')
+    image = tmp_path / 'pic.png'
+    image.write_bytes(b'img')
+    archive = tmp_path / 'bundle.zip'
+    archive.write_bytes(b'zip')
+    calls = []
+
+    def handler(request):
+        import json
+        calls.append((request.url.path, json.loads(request.content or b'{}')))
+        if request.url.path == '/get_version_info':
+            data = {'app_name': 'NapCat', 'app_version': '4.0.0'}
+        elif request.url.path == '/get_status':
+            data = {'online': True}
+        elif request.url.path == '/get_login_info':
+            data = {'user_id': 10086, 'nickname': 'OmniBot'}
+        elif request.url.path.startswith('/send_'):
+            data = {'message_id': 888}
+        elif request.url.path.startswith('/upload_'):
+            data = {'file_id': 'f99'}
+        else:
+            data = {}
+        return httpx.Response(200, json={'status': 'ok', 'retcode': 0, 'data': data})
+
+    bot = OneBotAdapter(onebot(tmp_path), httpx.MockTransport(handler))
+    probe = await bot.probe()
+    assert probe['implementation'] == 'NapCat' and probe['bot_id'] == '10086' and probe['nickname'] == 'OmniBot'
+
+    # 视频/图片消息模式走 send_group_msg
+    r1 = await bot.send(video, 'group:1', 'auto', video_mode='message', image_mode='message')
+    assert r1['mode'] == 'message' and r1['message_id'] == 888
+    assert any(p == '/send_group_msg' and body['message'][0]['type'] == 'video' for p, body in calls)
+
+    calls.clear()
+    r2 = await bot.send(image, 'private:2', 'auto', video_mode='file', image_mode='message')
+    assert r2['mode'] == 'message'
+    assert any(p == '/send_private_msg' and body['message'][0]['type'] == 'image' for p, body in calls)
+
+    # 压缩包即使在消息模式下也强制以群文件/私聊文件上传
+    calls.clear()
+    r3 = await bot.send(archive, 'group:1', 'auto', video_mode='message', image_mode='message')
+    assert r3['mode'] == 'file' and r3['file_id'] == 'f99'
+    assert any(p == '/upload_group_file' for p, _ in calls)
+
+    # 合并转发聊天记录
+    calls.clear()
+    r4 = await bot.send_forward([image, video], 'group:1', title='合集测试')
+    assert r4['mode'] == 'forward' and r4['count'] == 2 and r4['message_id'] == 888
+    fwd_call = next(body for p, body in calls if p == '/send_group_forward_msg')
+    assert len(fwd_call['messages']) == 3
+    assert fwd_call['messages'][0]['data']['content'][0]['type'] == 'text'
+    assert fwd_call['messages'][1]['data']['content'][0]['type'] == 'image'
+    assert fwd_call['messages'][2]['data']['content'][0]['type'] == 'video'
+
+
+async def test_telegram_probe_returns_bot_identity():
+    bot = TelegramAdapter(telegram(), httpx.MockTransport(lambda r: httpx.Response(200, json={
+        'ok': True, 'result': {'id': 555, 'username': 'omni_dl_bot', 'first_name': 'Omni'}
+    })))
+    info = await bot.probe()
+    assert info['connected'] is True and info['username'] == 'omni_dl_bot' and info['bot_id'] == 555

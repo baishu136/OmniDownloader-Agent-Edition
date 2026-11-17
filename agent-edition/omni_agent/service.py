@@ -16,7 +16,7 @@ from .credentials import Vault
 from .delivery import BotConfig, make_adapter
 from .errors import AgentError, safe_text
 from .runner import Runner
-from .security import is_profile, source_url
+from .security import is_profile, parse_download_command, source_url
 from .store import ACTIVE, Store
 
 
@@ -27,6 +27,8 @@ class DownloadOptions(BaseModel):
     height: int | None = Field(None, ge=144, le=8640)
     container: Literal['mp4', 'mkv', 'auto'] | None = None
     audio_format: Literal['mp3', 'm4a', 'flac', 'opus'] | None = None
+    pack_zip: bool | None = None
+    all_items: bool | None = None
     preserve_original: bool = True
 
 
@@ -38,6 +40,7 @@ class SettingsUpdate(BaseModel):
     max_height: int | None = Field(None, ge=144, le=8640)
     container: Literal['mp4', 'mkv', 'auto'] | None = None
     audio_format: Literal['mp3', 'm4a', 'flac', 'opus'] | None = None
+    pack_zip: bool | None = None
     autonomous: bool | None = None
     max_file_bytes: int | None = Field(None, ge=1024, le=20 * 1024**3)
     max_cache_bytes: int | None = Field(None, ge=1024**2, le=1024**4)
@@ -45,6 +48,8 @@ class SettingsUpdate(BaseModel):
     max_queue: int | None = Field(None, ge=1, le=1000)
     task_timeout: int | None = Field(None, ge=10, le=7200)
     cache_ttl: int | None = Field(None, ge=60, le=2592000)
+    download_dir: str | None = None
+    image_dir: str | None = None
     cache_dir: str | None = None
     proxy: str | None = None
     video: bool | None = None
@@ -58,6 +63,9 @@ class SettingsUpdate(BaseModel):
     confirmation_threshold: int | None = Field(None, ge=1, le=200)
     auto_delete: bool | None = None
     reuse_cache: bool | None = None
+    qq_video_mode: Literal['message', 'file'] | None = None
+    qq_image_mode: Literal['message', 'file'] | None = None
+    qq_forward_collection: bool | None = None
     theme: Literal['auto', 'light', 'dark'] | None = None
 
 
@@ -134,6 +142,18 @@ class Service:
     def get_settings(self):
         return self.config.settings.model_dump()
 
+    def _validate_and_prepare_dirs(self, settings):
+        for label, path_str in (('下载目录', settings.download_dir), ('图文目录', settings.image_dir)):
+            if not path_str:
+                continue
+            target = Path(path_str).resolve()
+            if target == self.config.directory.resolve() or target.is_relative_to(self.config.cache.resolve()):
+                raise AgentError('INVALID_PARAMETER', f'{label}不能与服务内部状态或缓存目录重叠')
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                raise AgentError('INVALID_PARAMETER', f'无法创建或访问{label}') from None
+
     def update_settings(self, patch):
         merged = self.config.settings.model_dump() | patch
         try:
@@ -141,6 +161,7 @@ class Service:
         except ValidationError as exc:
             detail = exc.errors()[0].get('msg', '参数无效') if exc.errors() else '参数无效'
             raise AgentError('INVALID_PARAMETER', f'设置参数无效：{detail}') from None
+        self._validate_and_prepare_dirs(settings)
         if settings.cache_dir != self.config.settings.cache_dir:
             active = self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('QUEUED','DOWNLOADING','PROCESSING','SENDING')").fetchone()[0]
             if active:
@@ -149,9 +170,31 @@ class Service:
         self.config.save(settings)
         return settings.model_dump()
 
+    def reset_settings(self, *, reset_cache_dir=False):
+        defaults = Settings()
+        preserved_cache = False
+        if not reset_cache_dir and self.config.settings.cache_dir:
+            has_files = any((p.is_file() and p.name != '.owner') or p.is_symlink() or p.is_junction() for p in self.config.cache.rglob('*'))
+            if has_files:
+                defaults = defaults.model_copy(update={'cache_dir': self.config.settings.cache_dir})
+                preserved_cache = True
+        if defaults.cache_dir != self.config.settings.cache_dir:
+            active = self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('QUEUED','DOWNLOADING','PROCESSING','SENDING')").fetchone()[0]
+            if active:
+                defaults = defaults.model_copy(update={'cache_dir': self.config.settings.cache_dir})
+                preserved_cache = True
+            else:
+                self.prune_workspaces()
+        self.config.save(defaults)
+        return {'settings': defaults.model_dump(), 'cache_dir_preserved': preserved_cache}
+
     def get_bot_configs(self):
         return [
-            self.bot_config(name).model_dump(exclude={'token'}) | {'has_token': bool(self.bot_config(name).token)}
+            self.bot_config(name).model_dump(exclude={'token'})
+            | {
+                'has_token': bool(self.bot_config(name).token),
+                'status': self.bot_status.get(name, {'connected': None}),
+            }
             for name in ('telegram', 'onebot')
         ]
 
@@ -178,13 +221,21 @@ class Service:
             raise AgentError('INVALID_PARAMETER', '机器人参数无效；启用时需填写令牌、目标名单及共享目录') from None
         self.vault.put('bot-' + body.adapter, body.model_dump_json())
         self.bot_status.pop(body.adapter, None)
-        return body.model_dump(exclude={'token'}) | {'has_token': bool(body.token)}
+        return body.model_dump(exclude={'token'}) | {
+            'has_token': bool(body.token),
+            'status': self.bot_status.get(body.adapter, {'connected': None}),
+        }
 
     async def probe_bot(self, name):
         try:
             result = await make_adapter(self.bot_config(name)).probe()
         except AgentError as error:
-            self.bot_status[name] = {'connected': False, 'error': error.code}
+            self.bot_status[name] = {
+                'connected': False,
+                'error': error.code,
+                'message': error.message,
+                'checked_at': time.time(),
+            }
             raise
         self.bot_status[name] = result
         return result
@@ -286,7 +337,7 @@ class Service:
 
     # -------------------- 媒体解析、下载与交付调度 --------------------
 
-    def resolve_options(self, options):
+    def resolve_options(self, options, *, cmd_all=False, cmd_zip=False):
         s = self.config.settings
         overrides = options.model_dump(exclude_none=True, exclude={'use_defaults', 'preserve_original'})
         if options.use_defaults and overrides:
@@ -295,24 +346,42 @@ class Service:
             raise AgentError('FEATURE_DISABLED', '当前设置关闭了 Agent 自主参数选择')
         if not options.preserve_original:
             raise AgentError('CAPABILITY_UNAVAILABLE', '当前核心支持保留原编码及音频/GIF转换，不提供任意视频重编码')
-        result = dict(download_type=s.default_type, height=s.default_height, container=s.container, audio_format=s.audio_format)
+
+        default_type = 'IMAGE' if s.default_type == 'IMAGE_ZIP' else s.default_type
+        default_pack_zip = s.pack_zip or (s.default_type == 'IMAGE_ZIP')
+        result = dict(
+            download_type=default_type,
+            height=s.default_height,
+            container=s.container,
+            audio_format=s.audio_format,
+            pack_zip=default_pack_zip,
+            all_items=False,
+        )
         result.update(overrides)
+        if result['download_type'] == 'IMAGE_ZIP':
+            result['download_type'] = 'IMAGE'
+            result['pack_zip'] = True
+        if cmd_all:
+            result['all_items'] = True
+        if cmd_zip:
+            result['pack_zip'] = True
         if result['height'] > s.max_height:
             raise AgentError('LIMIT_EXCEEDED', '请求画质超过最高允许画质')
         feature = {'VIDEO_WITH_AUDIO': 'video', 'VIDEO_ONLY': 'video', 'GIF': 'video', 'AUDIO_ONLY': 'audio',
-                   'IMAGE': 'images', 'IMAGE_ZIP': 'images', 'COVER': 'covers'}[result['download_type']]
+                   'IMAGE': 'images', 'COVER': 'covers'}[result['download_type']]
         if not getattr(s, feature):
             raise AgentError('FEATURE_DISABLED', '当前设置关闭了所请求的下载能力')
         return result
 
     def check_url(self, raw):
-        url = source_url(raw)
+        clean, cmd_all, cmd_zip = parse_download_command(raw)
+        url = source_url(clean)
         if is_profile(url) and not self.config.settings.profiles:
             raise AgentError('FEATURE_DISABLED', '当前设置未允许用户主页解析与批量下载')
-        return url
+        return url, cmd_all, cmd_zip
 
-    async def analyze(self, owner, url, media_type='video'):
-        url = self.check_url(url)
+    async def analyze(self, owner, raw_url, media_type='video'):
+        url, _, _ = self.check_url(raw_url)
         s = self.config.settings
         if media_type == 'images' and not s.images:
             raise AgentError('FEATURE_DISABLED', '当前设置关闭了图文能力')
@@ -324,17 +393,26 @@ class Service:
             'GIF': 'video', 'AUDIO_ONLY': 'audio', 'COVER': 'covers', 'IMAGE': 'images', 'IMAGE_ZIP': 'images'}[o])]
         return result
 
-    async def download(self, owner, url, options, request_key=None, *, collection=False, start=1, count=1, approval_id=None):
-        url = self.check_url(url)
+    async def download(self, owner, raw_url, options, request_key=None, *, collection=False, start=1, count=1, approval_id=None):
+        url, cmd_all, cmd_zip = self.check_url(raw_url)
         s = self.config.settings
-        resolved = self.resolve_options(options)
-        if collection and not s.collections:
+        resolved = self.resolve_options(options, cmd_all=cmd_all, cmd_zip=cmd_zip)
+        if (collection or resolved['all_items']) and not s.collections and resolved['download_type'] != 'IMAGE':
             raise AgentError('FEATURE_DISABLED', '当前设置关闭了合集下载')
         limit = s.max_profile if is_profile(url) else s.max_collection
         if start < 1 or count < 1 or count > limit or start + count - 1 > limit:
             raise AgentError('LIMIT_EXCEEDED', '下载范围超过当前数量上限')
-        payload = dict(action='collection' if collection else 'download', url=url, options=resolved,
-                       start=start, count=count, profile=is_profile(url))
+        payload = dict(
+            action='collection' if collection else 'download',
+            url=url,
+            options=resolved,
+            start=start,
+            count=count,
+            all_items=resolved['all_items'],
+            cmd_all=cmd_all,
+            cmd_zip=cmd_zip,
+            profile=is_profile(url),
+        )
         generations = {p: self.sessions.status(p)['generation'] for p in self.domains}
         key = hashlib.sha256(json.dumps([payload, s.model_dump(), generations], sort_keys=True).encode()).hexdigest()
         request_key = request_key or uuid.uuid4().hex
@@ -344,17 +422,31 @@ class Service:
                 raise AgentError('IDEMPOTENCY_CONFLICT', '请求键与现有任务参数不匹配')
             return self.store.public_job(existing['id'], owner)
         approval = None
-        if (count > s.confirmation_threshold or is_profile(url) or resolved['download_type'] == 'IMAGE_ZIP'
-                or resolved['height'] > 2160 or s.max_file_bytes * count > 1024**3):
-            approval = self.store.db.execute('SELECT * FROM approvals WHERE id=? AND owner=? AND fingerprint=? AND approved=1 AND used=0 AND expires>?',
-                (approval_id or '', owner, key, time.time())).fetchone()
+        needs_confirm = (
+            count > s.confirmation_threshold
+            or is_profile(url)
+            or (resolved['download_type'] == 'IMAGE' and resolved['pack_zip'])
+            or (resolved['all_items'] and limit > s.confirmation_threshold)
+            or resolved['height'] > 2160
+            or s.max_file_bytes * count > 1024**3
+        )
+        if needs_confirm:
+            approval = self.store.db.execute(
+                'SELECT * FROM approvals WHERE id=? AND owner=? AND fingerprint=? AND approved=1 AND used=0 AND expires>?',
+                (approval_id or '', owner, key, time.time()),
+            ).fetchone()
             if not approval:
-                existing_approval = self.store.db.execute('SELECT id FROM approvals WHERE owner=? AND fingerprint=? AND used=0 AND expires>?',
-                    (owner, key, time.time())).fetchone()
+                existing_approval = self.store.db.execute(
+                    'SELECT id FROM approvals WHERE owner=? AND fingerprint=? AND used=0 AND expires>?',
+                    (owner, key, time.time()),
+                ).fetchone()
                 identifier = existing_approval['id'] if existing_approval else uuid.uuid4().hex
                 if not existing_approval:
-                    self.store.db.execute('INSERT INTO approvals(id,owner,fingerprint,expires,summary) VALUES(?,?,?,?,?)',
-                        (identifier, owner, key, time.time() + 600, f'{owner}: 最多{limit if resolved["download_type"]=="IMAGE_ZIP" else count} 个媒体，起始 {start}，类型 {resolved["download_type"]}'))
+                    est = limit if (resolved['all_items'] or (resolved['download_type'] == 'IMAGE' and resolved['pack_zip'])) else count
+                    self.store.db.execute(
+                        'INSERT INTO approvals(id,owner,fingerprint,expires,summary) VALUES(?,?,?,?,?)',
+                        (identifier, owner, key, time.time() + 600, f'{owner}: 最多{est} 个媒体，起始 {start}，类型 {resolved["download_type"]}'),
+                    )
                 raise AgentError('CONFIRMATION_REQUIRED', '此批量操作需要确认后重新调用（可在管理页或通过 approve_request 批准）', approval_id=identifier, expires_in=600)
         queued = self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('QUEUED','DOWNLOADING','PROCESSING')").fetchone()[0]
         if queued >= s.max_queue:
@@ -365,6 +457,34 @@ class Service:
         if approval:
             self.store.db.execute('UPDATE approvals SET used=1 WHERE id=?', (approval['id'],))
         return self.store.public_job(row['id'], owner)
+
+    def _export_to_storage(self, payload, paths):
+        """若用户配置了永久下载或图文存储目录，则安全导出成品副本，不受自动缓存清理影响。"""
+        s = self.config.settings
+        dtype = (payload.get('options') or {}).get('download_type')
+        is_image_job = dtype in ('IMAGE', 'IMAGE_ZIP')
+        target_str = (s.image_dir or s.download_dir) if is_image_job else s.download_dir
+        if not target_str:
+            return
+        dest_dir = Path(target_str)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for src_item in paths:
+            src = Path(src_item)
+            if not src.is_file():
+                continue
+            target = dest_dir / src.name
+            index = 1
+            while target.exists():
+                target = dest_dir / f'{src.stem}_{index}{src.suffix}'
+                index += 1
+            partial = dest_dir / f'.{target.name}.{uuid.uuid4().hex[:8]}.part'
+            try:
+                shutil.copyfile(src, partial)
+                if partial.stat().st_size != src.stat().st_size:
+                    raise OSError('导出文件大小不一致')
+                partial.replace(target)
+            finally:
+                partial.unlink(missing_ok=True)
 
     async def dispatch(self):
         last_cleanup = 0
@@ -402,11 +522,16 @@ class Service:
         identifier = row['id']
         try:
             payload = self.store.payload(row)
-            options = DownloadOptions(use_defaults=False, **payload['options'])
+            saved_opts = payload['options']
+            options = DownloadOptions(use_defaults=False, **saved_opts)
             if not self.config.settings.autonomous:
                 options = DownloadOptions()
-            current = self.resolve_options(options)
-            if current != payload['options']:
+            current = self.resolve_options(
+                options,
+                cmd_all=bool(payload.get('cmd_all')),
+                cmd_zip=bool(payload.get('cmd_zip')),
+            )
+            if current != saved_opts:
                 raise AgentError('POLICY_CHANGED', '排队期间默认参数或权限已变化，请重新提交')
             self.check_url(payload['url'])
             if payload['action'] == 'collection' and not self.config.settings.collections:
@@ -419,6 +544,7 @@ class Service:
                 self.store.update_job(identifier, 'PROCESSING' if event['state'] == 'PROCESSING' else 'DOWNLOADING',
                                       progress=event['progress'], speed=safe_text(event.get('speed', '')))
             result = await self.runner.call(payload, identifier, progress)
+            self._export_to_storage(payload, result['paths'])
             self.store.finish(identifier, result['paths'])
         except asyncio.CancelledError:
             self.store.fail(identifier, 'CANCELLED', 'CANCELLED')
@@ -467,14 +593,35 @@ class Service:
         self.store.db.execute("UPDATE deliveries SET state='SENDING',updated=? WHERE id=? AND state='QUEUED'", (time.time(), identifier))
         try:
             adapter = make_adapter(self.bot_config(row['adapter']))
+            s = self.config.settings
+            pending = []
             for file in self.store.files(row['task_id']):
                 if self.store.db.execute('SELECT 1 FROM receipts WHERE delivery_id=? AND file_id=?', (identifier, file['id'])).fetchone():
                     continue
                 record, path = self.store.file(file['id'], row['owner'])
-                receipt = await adapter.send(path, row['target'], row['kind'])
-                self.store.receipt(identifier, file['id'], receipt)
+                pending.append((record, path))
+
+            if row['adapter'] == 'onebot' and s.qq_forward_collection:
+                forwardable = [(rec, p) for rec, p in pending if p.suffix.lower() != '.zip' and adapter.media_category(p) in ('image', 'video')]
+                others = [(rec, p) for rec, p in pending if (rec, p) not in forwardable]
+                if len(forwardable) >= 2:
+                    receipt = await adapter.send_forward([p for _, p in forwardable], row['target'])
+                    for rec, _ in forwardable:
+                        self.store.receipt(identifier, rec['id'], receipt)
+                    pending = others
+
+            for record, path in pending:
+                receipt = await adapter.send(
+                    path,
+                    row['target'],
+                    row['kind'],
+                    video_mode=s.qq_video_mode,
+                    image_mode=s.qq_image_mode,
+                )
+                self.store.receipt(identifier, record['id'], receipt)
+
             self.store.sent(identifier)
-            if self.config.settings.auto_delete:
+            if s.auto_delete:
                 try:
                     self.store.cleanup()
                 except (AgentError, OSError):
@@ -517,17 +664,29 @@ class Service:
         except (ImportError, RuntimeError):
             pass
         s = self.config.settings
-        return {'edition': 'OmniDownloader Agent Edition', 'version': __version__, 'mcp_sdk': version('mcp'),
-            'transports': ['stdio_bridge', 'streamable-http'], 'platforms': list(self.domains),
+        return {
+            'edition': 'OmniDownloader Agent Edition',
+            'version': __version__,
+            'mcp_sdk': version('mcp'),
+            'transports': ['stdio_bridge', 'streamable-http'],
+            'platforms': list(self.domains),
             'platform_availability': 'Actual extraction is verified per link and account; not every platform supports every media type.',
-            'ffmpeg': ffmpeg, 'deno': bool(native_runtime('deno')), 'headless': True, 'browser_assisted_login': False,
-            'arbitrary_video_reencode': False, 'drm_bypass': False, 'auth_required': False,
+            'ffmpeg': ffmpeg,
+            'deno': bool(native_runtime('deno')),
+            'headless': True,
+            'browser_assisted_login': False,
+            'arbitrary_video_reencode': False,
+            'drm_bypass': False,
+            'auth_required': False,
+            'download_commands': {'/us': '下载合集、分集视频或全部图片', '/zip': '将输出打包为 ZIP 压缩包发送'},
             'cookie_agent_permissions': ['read_status', 'disable', 'remove'],
             'login_validation': ['哔哩哔哩', 'Pixiv'],
-            'features': {k: getattr(s, k) for k in ('video', 'audio', 'images', 'collections', 'profiles', 'covers', 'autonomous', 'reuse_cache', 'auto_delete')},
+            'features': {k: getattr(s, k) for k in ('video', 'audio', 'images', 'collections', 'profiles', 'covers', 'autonomous', 'reuse_cache', 'auto_delete', 'pack_zip', 'qq_forward_collection')},
+            'qq_delivery': {'video_mode': s.qq_video_mode, 'image_mode': s.qq_image_mode, 'forward_collection': s.qq_forward_collection},
             'profile_adapters': {'YouTube': 'bounded video playlists', 'X (Twitter)': 'bounded first photo page'},
             'limits': {k: getattr(s, k) for k in ('max_height', 'max_file_bytes', 'max_cache_bytes', 'max_collection', 'max_profile', 'concurrency', 'task_timeout', 'confirmation_threshold')},
-            'bots': {name: {'enabled': self.bot_config(name).enabled, 'status': self.bot_status.get(name, {'connected': None})} for name in ('telegram', 'onebot')}}
+            'bots': {name: {'enabled': self.bot_config(name).enabled, 'status': self.bot_status.get(name, {'connected': None})} for name in ('telegram', 'onebot')},
+        }
 
     def prune_workspaces(self):
         from .security import controlled
