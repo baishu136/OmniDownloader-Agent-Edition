@@ -10,7 +10,19 @@ from .service import BotConfigUpdate, DownloadOptions, SettingsUpdate
 
 
 class ToolBoundary:
+    def __init__(self, on_session=None):
+        self.on_session = on_session
+
     async def __call__(self, context, call_next):
+        if self.on_session and context.method in ('initialize', 'tools/call'):
+            session = getattr(context, 'session', None)
+            params = getattr(session, 'client_params', None)
+            info = getattr(params, 'clientInfo', None)
+            if info and getattr(info, 'name', None):
+                try:
+                    await self.on_session(str(info.name), str(getattr(info, 'version', '') or ''))
+                except Exception:
+                    pass
         result = await call_next(context)
         if context.method == 'tools/call' and isinstance(result, (types.CallToolResult, dict)):
             wire = result.model_dump(by_alias=True) if isinstance(result, types.CallToolResult) else result
@@ -24,13 +36,16 @@ class ToolBoundary:
         return result
 
 
-def create_mcp(invoke):
+def create_mcp(invoke, on_session=None):
     server = MCPServer(
         'OmniDownloader Agent Edition',
         version=__version__,
-        middleware=[ToolBoundary()],
-        instructions='No authorization token is required for local access. You may read, update and reset service settings, manage bot configurations, cache cleanup and approvals. '
+        middleware=[ToolBoundary(on_session=on_session)],
+        instructions='No authorization token is required for local access. You may read, update and reset service settings, manage bot configurations, inspect auto-detected bridges (list_bridges), cache cleanup and approvals. '
                      'URL prefixes supported by analyze_media/download_media: "/us" (download collection, multi-part videos or all images) and "/zip" (send as a ZIP archive). '
+                     'Download visualization: task and delivery results include a "visualization" object reflecting user settings (visual_enabled, visual_on_receive, visual_on_start, visual_on_complete, visual_mode, custom templates). '
+                     'When visualization.should_reply is true: if mode=="custom", use visualization.message directly; if mode=="agent", craft an informative update from stage and metadata. When should_reply is false, omit intermediate notices for disabled stages. '
+                     'Errors: whenever any tool returns ok=false or task/delivery reaches FAILED/UNCERTAIN, ALWAYS output error_message / error.message directly to the user without hiding the failure cause. '
                      'For platform cookies, you can only inspect non-sensitive status (list_cookie_statuses), disable cookies (disable_platform_cookie) or remove cookies (remove_platform_cookie); '
                      'you cannot read cookie values, import/log in cookies, or re-enable disabled cookies. '
                      'Downloads are asynchronous: poll get_task_status, then call deliver_media for bot delivery.',
@@ -70,9 +85,13 @@ def create_mcp(invoke):
     async def get_media_file(file_id: str) -> dict[str, Any]:
         return await invoke('get_media_file', {'file_id': file_id})
 
-    @server.tool(structured_output=True, description='Report observed runtime components, candidate platforms, enabled features, bot status and limits.')
+    @server.tool(structured_output=True, description='Report observed runtime components, candidate platforms, enabled features, bot status, connected bridges and limits.')
     async def get_service_capabilities() -> dict[str, Any]:
         return await invoke('get_service_capabilities', {})
+
+    @server.tool(structured_output=True, description='List auto-detected connected client bridges (MCP stdio, Streamable HTTP, AstrBot, bot clients) and configured bot adapter connection statuses without exposing secrets.')
+    async def list_bridges() -> dict[str, Any]:
+        return await invoke('list_bridges', {})
 
     @server.tool(structured_output=True, description='Queue delivery of all completed task files to an allowed Telegram or QQ target. Honors QQ video/image message/file and forward collection settings.')
     async def deliver_media(task_id: str, adapter: Literal['telegram', 'onebot'], target: str,
@@ -84,11 +103,11 @@ def create_mcp(invoke):
     async def get_delivery_status(delivery_id: str) -> dict[str, Any]:
         return await invoke('get_delivery_status', {'delivery_id': delivery_id})
 
-    @server.tool(structured_output=True, description='Read all current download, ZIP packing, storage directories, QQ delivery mode, feature, proxy, cache and theme settings.')
+    @server.tool(structured_output=True, description='Read all current download, ZIP packing, storage directories, QQ delivery mode, download visualization notification settings, feature, proxy, cache and theme settings.')
     async def get_settings() -> dict[str, Any]:
         return await invoke('get_settings', {})
 
-    @server.tool(structured_output=True, description='Update one or more service settings (including pack_zip, download_dir, image_dir, cache_dir, qq_video_mode, qq_image_mode, qq_forward_collection, proxy, theme). Does not touch cookies.')
+    @server.tool(structured_output=True, description='Update one or more service settings (including download_dir, image_dir, cache_dir, qq_*, visual_enabled, visual_on_receive, visual_on_start, visual_on_complete, visual_mode, visual_*_template, proxy, theme). Does not touch cookies.')
     async def update_settings(settings: SettingsUpdate) -> dict[str, Any]:
         return await invoke('update_settings', {'settings': settings.model_dump(exclude_none=True)})
 

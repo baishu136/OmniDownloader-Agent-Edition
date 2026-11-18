@@ -159,33 +159,12 @@ def install_network_guard(proxy=''):
 
     socket.socket.connect, socket.socket.connect_ex = connect, connect_ex
 
-    import requests
-    if not getattr(requests.Session.send, '_omni_guarded', False):
-        orig_send = requests.Session.send
-    else:
-        orig_send = requests.Session.send._omni_orig
-
-    def send(session, request, **kwargs):
-        validate_url(request.url, using_proxy=has_proxy or bool(getattr(session, 'proxies', None)))
-        return orig_send(session, request, **kwargs)
-
-    send._omni_guarded = True
-    send._omni_orig = orig_send
-    requests.Session.send = send
-
-    import yt_dlp
-    if not getattr(yt_dlp.YoutubeDL.urlopen, '_omni_guarded', False):
-        orig_open = yt_dlp.YoutubeDL.urlopen
-    else:
-        orig_open = yt_dlp.YoutubeDL.urlopen._omni_orig
-
-    def urlopen(engine, request):
-        validate_url(request if isinstance(request, str) else request.url, using_proxy=has_proxy)
-        return orig_open(engine, request)
-
-    urlopen._omni_guarded = True
-    urlopen._omni_orig = orig_open
-    yt_dlp.YoutubeDL.urlopen = urlopen
+    # 本地补丁：不再逐请求校验 URL。
+    # worker.execute 已在任务入口用 validate_url(initial=True) 校验用户提交的链接；
+    # 之后 yt-dlp / requests 访问的是平台接口返回的 CDN 地址（如 B 站
+    # *.mcdn.bilivideo.cn:8082），它们合法地使用非默认端口并会跳转到其它 CDN 域名，
+    # 逐请求校验会把正常下载判成 INVALID_URL（最终表现为 EXTRACTOR_CHANGED）。
+    # SSRF 防护仍由上面的 socket 层承担：只放行公网 / Fake-IP / 显式代理地址。
 
     class GuardedPopen(_ORIG_POPEN):
         def __init__(self, args, *positional, **kwargs):

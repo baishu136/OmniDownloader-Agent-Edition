@@ -2,8 +2,10 @@ import asyncio
 import hashlib
 import json
 import mimetypes
+import os
 from pathlib import Path
 import shutil
+import sys
 import time
 from typing import Literal
 import uuid
@@ -11,7 +13,15 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import __version__
+from .bridges import BridgeRegistry
 from .config import Config, Settings
+from .cookie_login import (
+    BilibiliQRLoginManager,
+    WebViewLoginManager,
+    inspect_cookie_meta,
+    normalize_cookie_text,
+    webview_available,
+)
 from .credentials import Vault
 from .delivery import BotConfig, make_adapter
 from .errors import AgentError, safe_text
@@ -66,6 +76,15 @@ class SettingsUpdate(BaseModel):
     qq_video_mode: Literal['message', 'file'] | None = None
     qq_image_mode: Literal['message', 'file'] | None = None
     qq_forward_collection: bool | None = None
+    visual_enabled: bool | None = None
+    visual_on_receive: bool | None = None
+    visual_on_start: bool | None = None
+    visual_on_complete: bool | None = None
+    visual_mode: Literal['agent', 'custom'] | None = None
+    visual_receive_template: str | None = Field(None, max_length=500)
+    visual_start_template: str | None = Field(None, max_length=500)
+    visual_complete_template: str | None = Field(None, max_length=500)
+    visual_error_template: str | None = Field(None, max_length=500)
     theme: Literal['auto', 'light', 'dark'] | None = None
 
 
@@ -97,12 +116,16 @@ class Service:
         self.last_cleanup_error = ''
         self.lock_handle = None
         self.analysis_slots = asyncio.Semaphore(2)
+        self.bridges = BridgeRegistry()
+        self.qr_logins = BilibiliQRLoginManager()
+        self.webview_logins = WebViewLoginManager()
+        self._startup_probe = None
 
     async def start(self):
         # 同一状态目录同时只允许运行一个服务实例，避免损坏任务与文件账本
         self.lock_handle = open(self.config.directory / 'service.lock', 'a+b')
         try:
-            if __import__('os').name == 'nt':
+            if os.name == 'nt':
                 import msvcrt
                 self.lock_handle.seek(0)
                 if not self.lock_handle.read(1):
@@ -119,9 +142,14 @@ class Service:
             raise AgentError('SERVICE_ALREADY_RUNNING', '同一状态目录已经有服务运行') from None
         self.store.recover()
         self.dispatcher = asyncio.create_task(self.dispatch())
+        if any(self.bot_config(name).enabled for name in ('telegram', 'onebot')):
+            self._startup_probe = asyncio.create_task(self.scan_bridges(probe_bots=True))
 
     async def close(self):
         self.stopping = True
+        if self._startup_probe:
+            self._startup_probe.cancel()
+            await asyncio.gather(self._startup_probe, return_exceptions=True)
         if self.dispatcher:
             self.dispatcher.cancel()
             await asyncio.gather(self.dispatcher, return_exceptions=True)
@@ -131,7 +159,7 @@ class Service:
         await self.runner.close()
         self.store.db.close()
         if self.lock_handle:
-            if __import__('os').name == 'nt':
+            if os.name == 'nt':
                 import msvcrt
                 self.lock_handle.seek(0)
                 msvcrt.locking(self.lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
@@ -258,7 +286,7 @@ class Service:
     def _validation_key(self, platform):
         return 'validation-' + str(list(self.domains).index(platform))
 
-    def _session_info(self, platform):
+    def _session_info(self, platform, *, include_ui=False):
         raw = self.vault.get(self._validation_key(platform))
         validation = json.loads(raw) if raw else {'state': 'UNVERIFIED'}
         status = self.sessions.status(platform)
@@ -266,12 +294,17 @@ class Service:
         clean_validation = {'state': validation.get('state', 'UNVERIFIED')}
         if 'checked_at' in validation:
             clean_validation['checked_at'] = validation['checked_at']
-        return {
+        info = {
             'platform': status['platform'],
             'state': status['state'],
             'enabled': status['enabled'],
             'validation': clean_validation,
         }
+        if include_ui:
+            info['ui'] = inspect_cookie_meta(self.sessions, platform)
+            info['webview_available'] = webview_available()
+            info['has_qr'] = platform == '哔哩哔哩'
+        return info
 
     def _resolve_cookie_targets(self, platform):
         if platform == 'all':
@@ -280,8 +313,8 @@ class Service:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
         return [platform]
 
-    def list_cookie_statuses(self):
-        return [self._session_info(site) for site in self.domains]
+    def list_cookie_statuses(self, *, include_ui=False):
+        return [self._session_info(site, include_ui=include_ui) for site in self.domains]
 
     def disable_cookie(self, platform):
         targets = self._resolve_cookie_targets(platform)
@@ -300,29 +333,21 @@ class Service:
         """仅限用户管理页调用：加密导入或更新平台 Cookie 并默认启用。"""
         if platform not in self.domains:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
-        text = text.strip()
-        if not text.startswith(('# Netscape HTTP Cookie File', '# HTTP Cookie File')):
-            rows = []
-            for part in text.split(';'):
-                name, sep, value = part.strip().partition('=')
-                if not sep or not name or any(c in part for c in '\r\n\t'):
-                    raise AgentError('INVALID_COOKIE', 'Cookie格式无效')
-                rows.append('.' + self.domains[platform][0] + '\tTRUE\t/\tTRUE\t0\t' + name + '\t' + value)
-            text = '# Netscape HTTP Cookie File\n' + '\n'.join(rows)
+        normalized = normalize_cookie_text(platform, text, self.domains)
         try:
-            self.sessions.import_text(platform, text)
+            self.sessions.import_text(platform, normalized)
         except (ValueError, OSError):
             raise AgentError('INVALID_COOKIE', 'Cookie文件无效或不包含此平台有效凭据') from None
         self.sessions.set_enabled(platform, True)
         self.vault.put(self._validation_key(platform), '{"state":"UNVERIFIED"}')
-        return self._session_info(platform)
+        return self._session_info(platform, include_ui=True)
 
     def set_cookie_enabled(self, platform, enabled):
         """仅限用户管理页调用：手动启用或禁用平台 Cookie。"""
         if platform not in self.domains:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
         self.sessions.set_enabled(platform, enabled)
-        return self._session_info(platform)
+        return self._session_info(platform, include_ui=True)
 
     async def verify_cookie(self, platform):
         """仅限用户管理页调用：在线验证平台 Cookie 有效性。"""
@@ -334,6 +359,70 @@ class Service:
         result['checked_at'] = time.time()
         self.vault.put(self._validation_key(platform), json.dumps(result))
         return result
+
+    # -------------------- 扫码 / 桌面 WebView 登录与桥接自动发现 --------------------
+
+    async def start_bilibili_qr(self):
+        return await asyncio.to_thread(self.qr_logins.generate, self.config.settings.proxy)
+
+    async def poll_bilibili_qr(self, qr_id: str):
+        res = await asyncio.to_thread(self.qr_logins.poll, qr_id)
+        if res.get('status') != 'confirmed':
+            return res
+        session = self.import_cookie('哔哩哔哩', res['netscape'])
+        try:
+            await self.verify_cookie('哔哩哔哩')
+            session = self._session_info('哔哩哔哩', include_ui=True)
+        except AgentError:
+            pass
+        return {'status': 'confirmed', 'message': '哔哩哔哩扫码登录成功并已加密保存', 'session': session}
+
+    async def start_webview_login(self, platform: str, server_url: str):
+        attempt = self.webview_logins.create(platform, self.config.settings.proxy)
+        if getattr(sys, 'frozen', False):
+            cmd = [str(Path(sys.executable).with_name('OmniDownloaderAgent.exe'))]
+        else:
+            cmd = [sys.executable, '-m', 'omni_agent']
+        cmd += ['--webview-login', '--server', server_url.rstrip('/'), '--attempt', attempt.attempt_id]
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]), OMNI_WEBVIEW_NONCE=attempt.nonce)
+        kwargs = {'creationflags': 0x08000000} if os.name == 'nt' else {}
+        attempt.process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=env,
+            **kwargs,
+        )
+        return self.webview_logins.public_status(attempt.attempt_id)
+
+    async def complete_webview_capture(self, attempt_id: str, nonce: str, netscape: str):
+        attempt = self.webview_logins.verify_internal(attempt_id, nonce)
+        self.import_cookie(attempt.platform, netscape)
+        if attempt.platform in ('哔哩哔哩', 'Pixiv'):
+            try:
+                await self.verify_cookie(attempt.platform)
+            except AgentError:
+                pass
+        attempt.state = 'COMPLETED'
+        attempt.message = f'{attempt.platform} Cookie 已通过内置浏览器加密保存并启用'
+        attempt.updated_at = time.time()
+        return {'ok': True, 'session': self._session_info(attempt.platform, include_ui=True)}
+
+    async def scan_bridges(self, *, probe_bots: bool = True):
+        if probe_bots:
+            for name in ('telegram', 'onebot'):
+                if self.bot_config(name).enabled:
+                    try:
+                        await self.probe_bot(name)
+                    except AgentError:
+                        pass
+        hints = await asyncio.to_thread(self.bridges.scan_local_endpoints, self.bot_config('onebot'), self.bot_status)
+        return {
+            'bridges': self.bridges.list_bridges(),
+            'hints': hints,
+            'bots': self.get_bot_configs(),
+        }
 
     # -------------------- 媒体解析、下载与交付调度 --------------------
 
@@ -536,23 +625,32 @@ class Service:
             self.check_url(payload['url'])
             if payload['action'] == 'collection' and not self.config.settings.collections:
                 raise AgentError('FEATURE_DISABLED', '当前设置关闭了合集下载')
-            self.store.update_job(identifier, 'DOWNLOADING')
+            self.store.update_job(identifier, 'DOWNLOADING', visual_stage='start')
 
             def progress(event):
                 if self.store.job(identifier)['state'] == 'CANCELLED':
                     return
-                self.store.update_job(identifier, 'PROCESSING' if event['state'] == 'PROCESSING' else 'DOWNLOADING',
-                                      progress=event['progress'], speed=safe_text(event.get('speed', '')))
+                if event.get('kind') == 'metadata':
+                    self.store.merge_job_metadata(identifier, event.get('metadata') or {})
+                    return
+                self.store.update_job(
+                    identifier,
+                    'PROCESSING' if event['state'] == 'PROCESSING' else 'DOWNLOADING',
+                    progress=event['progress'],
+                    speed=safe_text(event.get('speed', '')),
+                    visual_stage='start',
+                )
+
             result = await self.runner.call(payload, identifier, progress)
             self._export_to_storage(payload, result['paths'])
-            self.store.finish(identifier, result['paths'])
+            self.store.finish(identifier, result['paths'], metadata=result.get('metadata'))
         except asyncio.CancelledError:
-            self.store.fail(identifier, 'CANCELLED', 'CANCELLED')
+            self.store.fail(identifier, 'CANCELLED', 'CANCELLED', error_message='任务已取消')
             raise
         except AgentError as error:
-            self.store.fail(identifier, error.code)
+            self.store.fail(identifier, error.code, error_message=safe_text(error.message))
         except Exception:
-            self.store.fail(identifier, 'INTERNAL_ERROR')
+            self.store.fail(identifier, 'INTERNAL_ERROR', error_message='下载核心发生内部错误，请查看服务日志或重试')
 
     async def cancel(self, owner, identifier):
         job = self.store.job(identifier, owner)
@@ -560,13 +658,13 @@ class Service:
             raise AgentError('INVALID_STATE', '仅可取消排队或处理中的任务')
         followers = self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE source_id=? AND state='QUEUED'", (identifier,)).fetchone()[0]
         if followers:
-            self.store.update_job(identifier, 'CANCELLED', error='REFERENCE_CANCELLED')
+            self.store.update_job(identifier, 'CANCELLED', error='REFERENCE_CANCELLED', error_message='参考任务已取消', visual_stage='error')
             return self.store.public_job(identifier, owner)
         task = self.work.get(identifier)
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        self.store.fail(identifier, 'CANCELLED', 'CANCELLED')
+        self.store.fail(identifier, 'CANCELLED', 'CANCELLED', error_message='任务已取消')
         if job['source_id']:
             source = self.store.job(job['source_id'])
             remaining = self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE source_id=? AND state='QUEUED'", (source['id'],)).fetchone()[0]
@@ -586,7 +684,7 @@ class Service:
         bot = make_adapter(config)
         bot.check_target(target)
         row, new = self.store.create_delivery(identifier, owner, adapter, target, kind, request_key)
-        return {k: row[k] for k in ('id', 'task_id', 'state', 'error')}
+        return self.store.public_delivery(row['id'], owner, include_receipts=False)
 
     async def run_delivery(self, row):
         identifier = row['id']
@@ -627,16 +725,19 @@ class Service:
                 except (AgentError, OSError):
                     self.last_cleanup_error = 'CLEANUP_DEFERRED'
         except asyncio.CancelledError:
-            self.store.db.execute("UPDATE deliveries SET state='UNCERTAIN',error='SEND_INTERRUPTED' WHERE id=?", (identifier,))
-            self.store.update_job(row['task_id'], 'FAILED', error='DELIVERY_UNCERTAIN')
+            msg = '发送任务已中断，请核对平台消息记录'
+            self.store.db.execute("UPDATE deliveries SET state='UNCERTAIN',error='SEND_INTERRUPTED',error_message=? WHERE id=?", (msg, identifier))
+            self.store.update_job(row['task_id'], 'FAILED', error='DELIVERY_UNCERTAIN', error_message=msg, visual_stage='error')
             raise
         except AgentError as error:
             state = 'UNCERTAIN' if error.code == 'DELIVERY_UNCERTAIN' else 'FAILED'
-            self.store.db.execute('UPDATE deliveries SET state=?,error=?,updated=? WHERE id=?', (state, error.code, time.time(), identifier))
-            self.store.update_job(row['task_id'], 'FAILED', error=error.code)
+            msg = safe_text(error.message)
+            self.store.db.execute('UPDATE deliveries SET state=?,error=?,error_message=?,updated=? WHERE id=?', (state, error.code, msg, time.time(), identifier))
+            self.store.update_job(row['task_id'], 'FAILED', error=error.code, error_message=msg, visual_stage='error')
         except Exception:
-            self.store.db.execute("UPDATE deliveries SET state='UNCERTAIN',error='SEND_ERROR' WHERE id=?", (identifier,))
-            self.store.update_job(row['task_id'], 'FAILED', error='DELIVERY_UNCERTAIN')
+            msg = '发送阶段出现未预期异常，请核对平台记录'
+            self.store.db.execute("UPDATE deliveries SET state='UNCERTAIN',error='SEND_ERROR',error_message=? WHERE id=?", (msg, identifier))
+            self.store.update_job(row['task_id'], 'FAILED', error='DELIVERY_UNCERTAIN', error_message=msg, visual_stage='error')
 
     def retry_delivery(self, identifier, *, reconcile=False):
         row = self.store.delivery(identifier)
@@ -644,8 +745,8 @@ class Service:
             raise AgentError('RECONCILIATION_REQUIRED', '发送结果不确定，须核对平台后显式允许重试')
         if row['state'] not in ('FAILED', 'UNCERTAIN'):
             raise AgentError('INVALID_STATE', '此交付不需要重试')
-        self.store.db.execute("UPDATE deliveries SET state='QUEUED',error='' WHERE id=?", (identifier,))
-        self.store.update_job(row['task_id'], 'SENDING')
+        self.store.db.execute("UPDATE deliveries SET state='QUEUED',error='',error_message='' WHERE id=?", (identifier,))
+        self.store.update_job(row['task_id'], 'SENDING', error='', error_message='', visual_stage='complete')
         return {'id': identifier, 'state': 'QUEUED'}
 
     def file_reference(self, owner, identifier):
@@ -674,18 +775,26 @@ class Service:
             'ffmpeg': ffmpeg,
             'deno': bool(native_runtime('deno')),
             'headless': True,
-            'browser_assisted_login': False,
+            'browser_assisted_login': webview_available(),
             'arbitrary_video_reencode': False,
             'drm_bypass': False,
             'auth_required': False,
             'download_commands': {'/us': '下载合集、分集视频或全部图片', '/zip': '将输出打包为 ZIP 压缩包发送'},
             'cookie_agent_permissions': ['read_status', 'disable', 'remove'],
             'login_validation': ['哔哩哔哩', 'Pixiv'],
-            'features': {k: getattr(s, k) for k in ('video', 'audio', 'images', 'collections', 'profiles', 'covers', 'autonomous', 'reuse_cache', 'auto_delete', 'pack_zip', 'qq_forward_collection')},
+            'features': {k: getattr(s, k) for k in ('video', 'audio', 'images', 'collections', 'profiles', 'covers', 'autonomous', 'reuse_cache', 'auto_delete', 'pack_zip', 'qq_forward_collection', 'visual_enabled')},
             'qq_delivery': {'video_mode': s.qq_video_mode, 'image_mode': s.qq_image_mode, 'forward_collection': s.qq_forward_collection},
+            'visualization': {
+                'enabled': s.visual_enabled,
+                'mode': s.visual_mode,
+                'on_receive': s.visual_on_receive,
+                'on_start': s.visual_on_start,
+                'on_complete': s.visual_on_complete,
+            },
             'profile_adapters': {'YouTube': 'bounded video playlists', 'X (Twitter)': 'bounded first photo page'},
             'limits': {k: getattr(s, k) for k in ('max_height', 'max_file_bytes', 'max_cache_bytes', 'max_collection', 'max_profile', 'concurrency', 'task_timeout', 'confirmation_threshold')},
             'bots': {name: {'enabled': self.bot_config(name).enabled, 'status': self.bot_status.get(name, {'connected': None})} for name in ('telegram', 'onebot')},
+            'bridges': self.bridges.list_bridges(),
         }
 
     def prune_workspaces(self):

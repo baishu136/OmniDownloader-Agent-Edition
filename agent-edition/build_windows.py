@@ -35,11 +35,13 @@ def main():
             '--collect-submodules','mcp.server','--collect-submodules','mcp.client',
             '--collect-all','mcp_types','--collect-all','yt_dlp',
             '--collect-all','yt_dlp_ejs','--collect-all','cryptography','--collect-all','imageio_ffmpeg',
-            '--collect-all','gallery_dl',
+            '--collect-all','gallery_dl','--collect-all','webview','--collect-all','qrcode',
             '--collect-submodules','engine','--collect-submodules','core',
             '--hidden-import','uvicorn.logging','--hidden-import','uvicorn.loops.auto',
             '--hidden-import','uvicorn.protocols.http.auto','--hidden-import','uvicorn.protocols.websockets.auto',
             '--hidden-import','pystray._win32','--hidden-import','PIL._tkinter_finder',
+            '--hidden-import','tkinter','--hidden-import','tkinter.filedialog',
+            '--hidden-import','clr_loader','--hidden-import','pythonnet',
             '--copy-metadata','mcp','--copy-metadata','mcp-types','--copy-metadata','yt-dlp','--copy-metadata','yt-dlp-ejs']
         if windowed:command+=['--windowed']
         command += [str(BASE/'launcher.py')]
@@ -56,15 +58,17 @@ def main():
     shutil.copytree(ROOT/'windows'/'licenses',output/'licenses',dirs_exist_ok=True)
     (output/'THIRD_PARTY_NOTICES.md').write_text(
         '# Components\n\nOmniDownloader core: MIT (LICENSE).\nFFmpeg 7.1 Gyan GPL v3 build; license included. Source and exact runtime hashes: runtime-lock.json and https://github.com/GyanD/codexffmpeg/releases/tag/7.1 .\n'
-        'Deno 2.9.8: MIT, license included; https://github.com/denoland/deno/tree/v2.9.8 .\nPython component versions and hashes: requirements.lock. Installed package license/metadata files are included where supplied by their packages.\n'
-        'This distribution does not ship pywebview or the original desktop GUI.\n',encoding='utf-8')
+        'Deno 2.9.8: MIT, license included; https://github.com/denoland/deno/tree/v2.9.8 .\n'
+        'pywebview / pythonnet / qrcode: open-source licenses included where supplied by packages. Built-in Edge WebView2 runtime is used on Windows for optional desktop cookie login.\n'
+        'Python component versions and hashes: requirements.lock. Installed package license/metadata files are included where supplied by their packages.\n',encoding='utf-8')
     (output/'使用说明.txt').write_text(
         '双击 OmniDownloaderAgent.exe 启动后台服务。首次自动打开 http://127.0.0.1:58080/ 。\n'
         '本版本已取消令牌授权设定，用户与 Agent 可免令牌本机直连并直接管理设置。\n'
         '工作与数据目录优先使用独立工作区根目录下的 data/（独立便携复制时使用同级 data/），不再写入 %LOCALAPPDATA%。\n'
-        '平台 Cookie 仅可由用户在管理页导入与启用；Agent 仅可查看非敏感状态、禁用与移除 Cookie。\n'
+        '支持在管理页选择文件夹与保存目录、测试网络代理连通性、配置下载阶段可视化通知与自动识别已接入桥接。\n'
+        '平台 Cookie 支持官方扫码、桌面内置 WebView 浏览器登录及多格式加密导入；Agent 仅可查看非敏感状态、禁用与移除 Cookie。\n'
         '右下角托盘菜单可打开管理页或安全退出。MCP stdio 请使用 OmniDownloaderAgentMCP.exe --stdio 。\n'
-        '无需安装 Python、FFmpeg 或浏览器运行时。未提供平台测试账号，平台登录和真实发送请按 docs/OPERATIONS.md 验证。\n',encoding='utf-8')
+        '无需安装 Python、FFmpeg 或第三方浏览扩展。未提供平台测试账号，平台登录和真实发送请按 docs/OPERATIONS.md 验证。\n',encoding='utf-8')
     release=BASE/'dist'/f'OmniDownloader-Agent-Edition-{VERSION}-windows-x64.zip'
     with zipfile.ZipFile(release,'w',zipfile.ZIP_DEFLATED) as archive:
         for file in output.rglob('*'):

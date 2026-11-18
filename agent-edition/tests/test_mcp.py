@@ -11,7 +11,7 @@ import pytest
 
 EXPECTED_TOOLS = {
     'analyze_media', 'download_media', 'download_collection', 'get_task_status',
-    'list_tasks', 'cancel_task', 'get_media_file', 'get_service_capabilities',
+    'list_tasks', 'cancel_task', 'get_media_file', 'get_service_capabilities', 'list_bridges',
     'deliver_media', 'get_delivery_status', 'get_settings', 'update_settings',
     'reset_settings', 'get_bot_configs', 'update_bot_config', 'probe_bot',
     'list_approvals', 'approve_request', 'cleanup_cache', 'list_cookie_statuses',
@@ -123,6 +123,10 @@ async def test_stdio_initialize_discovery_and_api_bridge(live_server):
             assert result.structured_content['ok'] is True
             settings = await session.call_tool('get_settings', {})
             assert settings.structured_content['ok'] is True
+            bridges = await session.call_tool('list_bridges', {})
+            assert bridges.structured_content['ok'] is True
+            detected = bridges.structured_content['result']['bridges']
+            assert any(b['kind'] in ('mcp_stdio', 'mcp_http') for b in detected), detected
 
 
 def test_http_mcp_is_tokenless_but_keeps_host_and_origin_guards(live_server):

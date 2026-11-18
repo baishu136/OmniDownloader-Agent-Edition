@@ -7,6 +7,17 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+def validate_proxy_url(proxy: str) -> str:
+    """校验代理地址格式（支持无内嵌凭据的 http/https/socks5 地址）。"""
+    if not proxy:
+        return ''
+    from urllib.parse import urlsplit
+    p = urlsplit(proxy)
+    if p.scheme not in ('http', 'https', 'socks5') or not p.hostname or not p.port or p.username or p.password or p.query or p.fragment or p.path not in ('', '/'):
+        raise ValueError('代理需为带端口的 http/https/socks5 地址，不接受嵌入凭据')
+    return proxy
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     default_type: Literal['VIDEO_WITH_AUDIO', 'VIDEO_ONLY', 'AUDIO_ONLY', 'GIF', 'COVER', 'IMAGE', 'IMAGE_ZIP'] = 'VIDEO_WITH_AUDIO'
@@ -40,6 +51,15 @@ class Settings(BaseModel):
     qq_video_mode: Literal['message', 'file'] = 'file'
     qq_image_mode: Literal['message', 'file'] = 'message'
     qq_forward_collection: bool = False
+    visual_enabled: bool = True
+    visual_on_receive: bool = True
+    visual_on_start: bool = True
+    visual_on_complete: bool = True
+    visual_mode: Literal['agent', 'custom'] = 'agent'
+    visual_receive_template: str = Field('已收到链接（{command_summary}），正在准备解析与下载...', max_length=500)
+    visual_start_template: str = Field('开始下载：{platform} · {title}', max_length=500)
+    visual_complete_template: str = Field('下载完成（共 {file_count} 个文件），正在发送至 {target}...', max_length=500)
+    visual_error_template: str = Field('下载或发送失败：{error}', max_length=500)
     theme: Literal['auto', 'light', 'dark'] = 'auto'
 
     @model_validator(mode='after')
@@ -57,11 +77,7 @@ class Settings(BaseModel):
                     raise ValueError(f'{label}必须填写绝对路径')
                 if p.resolve() == Path(p.resolve().anchor):
                     raise ValueError(f'{label}不能直接使用磁盘或系统根目录')
-        if self.proxy:
-            from urllib.parse import urlsplit
-            p = urlsplit(self.proxy)
-            if p.scheme not in ('http', 'https', 'socks5') or not p.hostname or not p.port or p.username or p.password or p.query or p.fragment or p.path not in ('', '/'):
-                raise ValueError('代理需为带端口的 http/https/socks5 地址，不接受嵌入凭据')
+        validate_proxy_url(self.proxy)
         return self
 
 

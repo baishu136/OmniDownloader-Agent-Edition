@@ -23,15 +23,16 @@
     <a href="#downloads">下载与存储</a>
     <a href="#features">功能权限</a>
     <a href="#qq-policy">QQ 发送</a>
+    <a href="#visual-policy">下载可视化</a>
     <a href="#sessions">平台 Cookie</a>
-    <a href="#service">服务与 Bot</a>
-    <p>所有更改自动保存。支持链接前缀指令：<code>/us</code>（合集/分集/全图）与 <code>/zip</code>（压缩包发送）。</p>
+    <a href="#service">服务与桥接</a>
+    <p>所有更改支持自动或点击保存。链接前缀指令：<code>/us</code>（合集/分集/全图）与 <code>/zip</code>（压缩包发送）。</p>
   </aside>
   <main class="settings">
     <div class="page-title">
       <div>
         <h1>服务设置</h1>
-        <p>用户与 Agent 可同步管理设置；更改后自动保存生效。</p>
+        <p>用户与 Agent 可同步管理设置；更改后自动或即时保存生效。</p>
       </div>
       <div class="actions title-actions">
         <button id="reset-settings" type="button">重置默认设置</button>
@@ -40,7 +41,7 @@
 
     <form id="settings-form">
       <section id="downloads">
-        <div class="section-heading"><span>01</span><div><h2>下载与存储设置</h2><p>设置默认下载类型、压缩包打包、存储目录与网络代理。</p></div></div>
+        <div class="section-heading"><span>01</span><div><h2>下载与存储设置</h2><p>设置默认下载类型、压缩包打包、可视化文件夹选择与网络代理诊断。</p></div></div>
         <div class="field-grid">
           <label>默认下载类型
             <select name="default_type">
@@ -102,6 +103,8 @@
           <label class="wide">媒体下载保存目录
             <div class="input-row">
               <input name="download_dir" placeholder="留空仅保留在服务受控缓存，例如 F:\Downloads\Omni">
+              <button type="button" class="pick-dir" data-target="download_dir">选择文件夹</button>
+              <button type="button" class="save-field primary" data-target="download_dir">保存</button>
               <button type="button" class="clear-dir" data-target="download_dir">清空</button>
             </div>
             <small>设置绝对路径后，下载完成的音视频与文件会自动导出保存至此目录，不受缓存自动清理影响。</small>
@@ -109,6 +112,8 @@
           <label class="wide">图文保存目录
             <div class="input-row">
               <input name="image_dir" placeholder="留空跟随媒体下载保存目录">
+              <button type="button" class="pick-dir" data-target="image_dir">选择文件夹</button>
+              <button type="button" class="save-field primary" data-target="image_dir">保存</button>
               <button type="button" class="clear-dir" data-target="image_dir">跟随默认</button>
             </div>
             <small>单独指定图文原图与图集压缩包的本地保存目录；留空则与上方媒体下载保存目录一致。</small>
@@ -116,11 +121,22 @@
           <label class="wide">服务缓存父目录
             <div class="input-row">
               <input name="cache_dir" placeholder="留空使用独立服务数据目录（data/cache）">
+              <button type="button" class="pick-dir" data-target="cache_dir">选择文件夹</button>
+              <button type="button" class="save-field primary" data-target="cache_dir">保存</button>
               <button type="button" class="clear-dir" data-target="cache_dir">恢复默认</button>
             </div>
             <small>服务只管理其下的 omni-agent-managed 子目录。更换前须完成交付并清空缓存。</small>
           </label>
-          <label class="wide">网络代理<input name="proxy" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"><small>不接受 URL 中的账号密码；代理服务器须自行限制对内网的访问。</small></label>
+          <label class="wide">网络代理
+            <div class="input-row">
+              <input name="proxy" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080">
+              <button type="button" id="test-proxy">测试连通性</button>
+              <button type="button" class="save-field primary" data-target="proxy">保存</button>
+              <button type="button" class="clear-dir" data-target="proxy">清空</button>
+            </div>
+            <div id="proxy-test-result" class="probe-result" hidden></div>
+            <small>不接受 URL 中的账号密码；内置 WebView 登录与下载核心都会自动遵循此代理配置（兼容 Fake-IP / TUN）。</small>
+          </label>
         </div>
       </section>
 
@@ -170,15 +186,61 @@
           </label>
         </div>
       </section>
+
+      <section id="visual-policy">
+        <div class="section-heading"><span>04</span><div><h2>下载可视化与消息反馈设置</h2><p>配置通过机器人桥接或 MCP 发送链接时返回给对话的状态节点；支持自定义内容或交由 Agent 自主决定。</p></div></div>
+        <div class="switches">
+          <label>
+            <span>启用下载阶段状态通知<small>关闭后，收到/开始/完成阶段均保持静默不返回；报错时仍直接输出完整报错原因</small></span>
+            <input type="checkbox" name="visual_enabled" role="switch">
+          </label>
+          <label>
+            <span>收到链接时返回状态<small>链接成功进入队列或准备解析时立即反馈对话</small></span>
+            <input type="checkbox" name="visual_on_receive" role="switch">
+          </label>
+          <label>
+            <span>下载开始时返回状态<small>解析到平台/标题并开始拉取媒体时发送提示</small></span>
+            <input type="checkbox" name="visual_on_start" role="switch">
+          </label>
+          <label>
+            <span>下载完成时返回状态（正在发送）<small>媒体下载就绪并开始向 QQ / Telegram 发送时发送提示</small></span>
+            <input type="checkbox" name="visual_on_complete" role="switch">
+          </label>
+        </div>
+        <div class="field-grid limits">
+          <label class="wide">状态内容生成方式
+            <select name="visual_mode">
+              <option value="agent">由 Agent 决定（AI / 机器人结合阶段与媒体信息自由组织反馈）</option>
+              <option value="custom">自定义返回内容（严格按下方模板渲染并输出文字状态）</option>
+            </select>
+          </label>
+          <label class="wide">收到链接时模板
+            <input name="visual_receive_template" placeholder="已收到链接（{command_summary}），正在准备解析与下载...">
+          </label>
+          <label class="wide">下载开始时模板
+            <input name="visual_start_template" placeholder="开始下载：{platform} · {title}">
+          </label>
+          <label class="wide">下载完成时（正在发送）模板
+            <input name="visual_complete_template" placeholder="下载完成（共 {file_count} 个文件），正在发送至 {target}...">
+          </label>
+          <label class="wide">报错时直接输出模板（始终包含真实报错详情）
+            <input name="visual_error_template" placeholder="下载或发送失败：{error}">
+            <small>支持变量：<code>{platform}</code>、<code>{title}</code>、<code>{author}</code>、<code>{file_count}</code>、<code>{target}</code>、<code>{command_summary}</code>、<code>{error}</code>、<code>{task_id}</code>。任意错误发生时都会直接输出脱敏后的真实报错原因。</small>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="button" id="save-visual" class="primary">保存可视化规则</button>
+        </div>
+      </section>
     </form>
 
     <section id="sessions">
-      <div class="section-heading"><span>04</span><div><h2>平台 Cookie 与会话</h2><p>参照加密会话设计：凭据仅本地加密存放且不回显明文；Agent 仅可查看非敏感状态、禁用或移除，不可填写或重新启用。</p></div></div>
+      <div class="section-heading"><span>05</span><div><h2>平台 Cookie 与会话登录</h2><p>支持官方扫码、桌面内置 WebView 浏览器自动捕获以及多格式加密导入；Agent 仅可查看非敏感状态、禁用或移除。</p></div></div>
       <div class="session-card">
         <div class="session-picker-row">
           <div>
             <strong>选择平台</strong>
-            <small id="session-platform-hint">选择需要管理的媒体平台账号会话</small>
+            <small id="session-platform-hint">选择需要登录或管理的媒体平台账号会话</small>
           </div>
           <select id="cookie-platform" aria-label="选择平台"></select>
         </div>
@@ -190,32 +252,67 @@
           </label>
         </div>
         <div class="session-status-row">
-          <span id="session-pill" class="status-pill">未导入</span>
+          <div>
+            <span id="session-pill" class="status-pill">未导入</span>
+            <small id="session-meta-hint" class="session-meta-hint"></small>
+          </div>
           <div class="actions tight">
-            <button id="session-clear" type="button">清除</button>
+            <button id="session-webview-login" type="button" class="primary">内置浏览器登录</button>
+            <button id="session-qr-login" type="button" hidden>B站扫码登录</button>
             <button id="session-verify" type="button">检测</button>
-            <label class="file-button">导入 cookies.txt<input type="file" id="cookie-file" accept=".txt,.cookies"></label>
+            <button id="session-clear" type="button">清除</button>
+            <label class="file-button">导入文件<input type="file" id="cookie-file" accept=".txt,.cookies,.json"></label>
           </div>
         </div>
+
+        <div id="webview-panel" class="login-subpanel" hidden>
+          <div class="login-subpanel-head">
+            <strong id="webview-status-title">内置浏览器登录窗口已打开</strong>
+            <div class="actions tight">
+              <button id="webview-manual-capture" type="button" class="primary">我已登录，抓取保存</button>
+              <button id="webview-cancel" type="button">关闭窗口</button>
+            </div>
+          </div>
+          <p id="webview-status-text" class="hint">请在弹出的内置浏览器窗口中完成登录；具备明确登录标记的平台会在登录完成后自动保存并关闭窗口。</p>
+        </div>
+
+        <div id="qr-login-panel" class="login-subpanel qr-panel" hidden>
+          <canvas id="qr-canvas" width="180" height="180" aria-label="哔哩哔哩登录二维码"></canvas>
+          <div class="qr-meta">
+            <strong>哔哩哔哩官方扫码登录</strong>
+            <p id="qr-status-text">请使用手机哔哩哔哩 App 扫描二维码</p>
+            <div class="actions tight">
+              <button id="qr-refresh" type="button">刷新二维码</button>
+              <button id="qr-cancel" type="button">取消扫码</button>
+            </div>
+          </div>
+        </div>
+
         <div class="import-box">
-          <label>粘贴 Cookie 请求头或 Netscape 内容<textarea id="cookie-text" rows="4" placeholder="粘贴 Cookie 请求头（例如 SESSDATA=...; bili_jct=...）或 Netscape cookies.txt 文本"></textarea></label>
+          <label>手动粘贴 Cookie 请求头、Netscape 或浏览器 JSON 数组<textarea id="cookie-text" rows="4" placeholder="粘贴 Cookie 请求头（SESSDATA=...; ...）、Netscape cookies.txt 或 Cookie-Editor 导出的 JSON 数组"></textarea></label>
           <div class="actions">
             <button id="import-cookie" type="button" class="primary">加密保存凭据</button>
           </div>
-          <p class="hint" id="session-extra-hint">导入成功不代表账号已登录。仅支持实际可验证的平台检测（哔哩哔哩、Pixiv）；需要验证码或浏览器登录的平台请在外部浏览器完成后导入。</p>
+          <p class="hint" id="session-extra-hint">凭据在本地加密保存，不会回显明文；哔哩哔哩与 Pixiv 支持点击“检测”验证账号有效性。</p>
         </div>
       </div>
     </section>
 
     <section id="service">
-      <div class="section-heading"><span>05</span><div><h2>服务状态与 Bot 连接</h2><p>免令牌本机直连；实时查看运行路径、Bot 连接信息与交付记录。</p></div></div>
+      <div class="section-heading"><span>06</span><div><h2>服务状态、接入桥接与 Bot 连接</h2><p>免令牌本机直连；自动识别已接入的 MCP / AstrBot / 机器人桥接并管理发送适配器。</p></div></div>
       <dl id="service-status"></dl>
       <div class="actions">
         <button id="copy-stdio" type="button">复制 stdio 配置</button>
         <button id="copy-http" type="button">复制 HTTP 配置</button>
+        <button id="scan-bridges" type="button" class="primary">扫描已接入桥接</button>
         <button id="cleanup" type="button">清理已发送缓存</button>
         <button id="refresh" type="button">刷新状态</button>
       </div>
+      <h3>已自动识别的接入桥接</h3>
+      <p class="hint">自动识别通过 Streamable HTTP (<code>/mcp</code>)、MCP stdio (<code>--stdio</code>)、AstrBot 插件及本地接口接入的客户端。</p>
+      <div id="bridge-list" class="bridge-grid"></div>
+      <div id="bridge-hints" class="compact-list"></div>
+
       <h3>机器人连接</h3>
       <p class="hint">修改后自动保存（必填项齐全时）或手动点击保存连接；点击“检测连接”可实时拉取 Bot 账号及在线详情。</p>
       <div id="bot-status-summary" class="bot-summary-grid"></div>
@@ -228,6 +325,25 @@
 
     <footer>OmniDownloader Agent Edition <span id="version"></span><span>独立工作目录 · 复用 OmniDownloader 核心</span></footer>
   </main>
+</div>
+
+<div id="dir-browser-modal" class="modal-backdrop" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="dir-modal-title">
+    <div class="modal-head">
+      <strong id="dir-modal-title">选择服务端文件夹</strong>
+      <button type="button" id="dir-modal-close">关闭</button>
+    </div>
+    <div class="dir-modal-bar">
+      <button type="button" id="dir-modal-up">上一级</button>
+      <input id="dir-modal-path" readonly>
+      <button type="button" id="dir-modal-new">新建文件夹</button>
+    </div>
+    <div id="dir-modal-list" class="dir-modal-list"></div>
+    <div class="modal-foot">
+      <button type="button" id="dir-modal-cancel">取消</button>
+      <button type="button" id="dir-modal-confirm" class="primary">选择当前目录</button>
+    </div>
+  </div>
 </div>
 </body>
 </html>

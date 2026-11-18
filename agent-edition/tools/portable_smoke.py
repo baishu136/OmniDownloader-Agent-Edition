@@ -14,7 +14,7 @@ import httpx
 
 EXPECTED_TOOLS = {
     'analyze_media', 'download_media', 'download_collection', 'get_task_status',
-    'list_tasks', 'cancel_task', 'get_media_file', 'get_service_capabilities',
+    'list_tasks', 'cancel_task', 'get_media_file', 'get_service_capabilities', 'list_bridges',
     'deliver_media', 'get_delivery_status', 'get_settings', 'update_settings',
     'reset_settings', 'get_bot_configs', 'update_bot_config', 'probe_bot',
     'list_approvals', 'approve_request', 'cleanup_cache', 'list_cookie_statuses',

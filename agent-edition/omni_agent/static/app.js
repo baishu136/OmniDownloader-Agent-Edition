@@ -2,7 +2,9 @@
 const $ = id => document.getElementById(id);
 let settings = {}, bots = [], mcpConfig = {}, sessionsData = [];
 let selectedPlatform = '';
-let noticeTimer, refreshTimer, autoSaveTimer;
+let noticeTimer, refreshTimer, autoSaveTimer, qrTimer, webviewTimer;
+let activeQrId = '', activeWebviewAttempt = '', activeWebviewPlatform = '';
+let dirModalTargetEl = null, dirModalCurrent = '', dirModalParent = '';
 let savingPromise = Promise.resolve();
 const bytes = v => `${(v / 1024 / 1024).toFixed(1)} MiB`;
 
@@ -43,7 +45,7 @@ async function action(button, fn) {
   }
 }
 
-// -------------------- 深浅色主题（确保即时生效并自动持久化） --------------------
+// -------------------- 深浅色主题 --------------------
 
 function isCurrentlyDark() {
   const explicit = document.documentElement.dataset.theme;
@@ -64,7 +66,7 @@ function setTheme(value) {
   }
 }
 
-// -------------------- 美化动画下拉组件（参照 Android OmniOptionMenu） --------------------
+// -------------------- 美化动画下拉组件 --------------------
 
 const chevronSvg = '<svg class="omni-select-chevron" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M5 7.5L10 12.5L15 7.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const checkSvg = '<svg class="omni-select-check" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4.5 10.5L8.2 14.2L15.5 6.8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -168,12 +170,11 @@ function initAllSelects() {
   document.querySelectorAll('select').forEach(sel => enhanceSelect(sel, sel.id === 'cookie-platform'));
 }
 
-// -------------------- 设置表单序列化、填充与自动保存 --------------------
+// -------------------- 设置表单序列化、保存与文件夹选择器 --------------------
 
 function populate() {
   const form = $('settings-form');
   const displaySettings = {...settings};
-  // 历史 IMAGE_ZIP 映射为分离后的“图文原图 + 打包压缩包”状态
   if (displaySettings.default_type === 'IMAGE_ZIP') {
     displaySettings.default_type = 'IMAGE';
     displaySettings.pack_zip = true;
@@ -203,7 +204,7 @@ function collectSettings() {
   return next;
 }
 
-async function saveSettingsNow(showErrorNotice = true) {
+async function saveSettingsNow(showSuccessNotice = false, showErrorNotice = true, successText = '设置已保存') {
   const form = $('settings-form');
   if (!form.checkValidity()) {
     setSaveStatus('error', '请检查输入值范围');
@@ -212,23 +213,98 @@ async function saveSettingsNow(showErrorNotice = true) {
   }
   const next = collectSettings();
   setSaveStatus('saving', '正在保存...');
+  let ok = false;
   savingPromise = savingPromise.then(async () => {
     await api('config', 'PUT', next);
     settings = next;
-    setSaveStatus('saved', '已自动保存');
+    setSaveStatus('saved', '已保存');
+    ok = true;
     await refresh(false);
+    if (showSuccessNotice) notify(successText);
   }).catch(err => {
     setSaveStatus('error', '保存失败');
     if (showErrorNotice) notify(err.message, true);
   });
   await savingPromise;
-  return true;
+  return ok;
 }
 
 function scheduleAutoSave(delay = 150, showError = false) {
   clearTimeout(autoSaveTimer);
   setSaveStatus('saving', '准备保存...');
-  autoSaveTimer = setTimeout(() => { saveSettingsNow(showError); }, delay);
+  autoSaveTimer = setTimeout(() => { saveSettingsNow(false, showError); }, delay);
+}
+
+async function loadDirModalPath(path = '') {
+  const res = await api('fs/list', 'POST', {path});
+  dirModalCurrent = res.current || '';
+  dirModalParent = res.parent ?? '';
+  $('dir-modal-path').value = dirModalCurrent || '此电脑（驱动器列表）';
+  $('dir-modal-new').disabled = !res.can_create;
+  $('dir-modal-confirm').disabled = !dirModalCurrent;
+
+  const list = $('dir-modal-list');
+  list.replaceChildren();
+  for (const item of res.entries || []) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'dir-item';
+    btn.textContent = item.name;
+    btn.addEventListener('click', () => { loadDirModalPath(item.path).catch(e => notify(e.message, true)); });
+    list.append(btn);
+  }
+  if (!list.children.length) {
+    const emptyMsg = document.createElement('p');
+    emptyMsg.textContent = '此目录下没有子文件夹';
+    emptyMsg.className = 'hint';
+    list.append(emptyMsg);
+  }
+}
+
+function closeDirModal() {
+  $('dir-browser-modal').hidden = true;
+  dirModalTargetEl = null;
+}
+
+async function openDirectoryPicker(inputEl, titleText = '选择文件夹', onPicked = null) {
+  const initial = inputEl?.value?.trim() || '';
+  const picked = await api('pick-directory', 'POST', {initial_dir: initial, title: titleText});
+  if (picked.supported) {
+    if (!picked.cancelled && picked.path && inputEl) {
+      inputEl.value = picked.path;
+      if (onPicked) await onPicked(picked.path);
+    }
+    return;
+  }
+  dirModalTargetEl = {inputEl, onPicked};
+  $('dir-modal-title').textContent = titleText;
+  $('dir-browser-modal').hidden = false;
+  await loadDirModalPath(initial).catch(() => loadDirModalPath(''));
+}
+
+// -------------------- 代理连通性测试 --------------------
+
+function renderProxyTestResult(res) {
+  const box = $('proxy-test-result');
+  box.hidden = false;
+  box.className = 'probe-result ' + (res.ok ? 'ok' : 'err');
+  box.replaceChildren();
+  const title = document.createElement('div');
+  title.textContent = res.message;
+  box.append(title);
+  if (Array.isArray(res.targets) && res.targets.length) {
+    const chips = document.createElement('div');
+    chips.className = 'probe-chips';
+    for (const item of res.targets) {
+      const chip = document.createElement('span');
+      chip.className = 'probe-chip ' + (item.ok ? 'ok' : 'err');
+      chip.textContent = item.ok
+        ? `${item.name} · HTTP ${item.status_code} · ${item.latency_ms} ms`
+        : `${item.name} · ${item.error || '不可达'}`;
+      chips.append(chip);
+    }
+    box.append(chips);
+  }
 }
 
 // -------------------- 辅助渲染 --------------------
@@ -257,7 +333,91 @@ function empty(container, text) {
   }
 }
 
-// -------------------- Cookie 管理（参照源项目 Android 版聚焦卡片） --------------------
+// -------------------- Cookie 登录与会话管理 --------------------
+
+function stopQrLogin() {
+  clearInterval(qrTimer);
+  activeQrId = '';
+  $('qr-login-panel').hidden = true;
+}
+
+function stopWebviewPoll() {
+  clearInterval(webviewTimer);
+  activeWebviewAttempt = '';
+  activeWebviewPlatform = '';
+  $('webview-panel').hidden = true;
+}
+
+function drawQrMatrix(matrix) {
+  const canvas = $('qr-canvas');
+  if (!canvas || !Array.isArray(matrix) || !matrix.length) return;
+  const ctx = canvas.getContext('2d');
+  const size = canvas.width;
+  const n = matrix.length;
+  const cell = size / n;
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = '#111827';
+  for (let r = 0; r < n; r++) {
+    for (let c = 0; c < n; c++) {
+      if (matrix[r][c]) ctx.fillRect(Math.floor(c * cell), Math.floor(r * cell), Math.ceil(cell), Math.ceil(cell));
+    }
+  }
+}
+
+async function startBilibiliQrLogin() {
+  stopQrLogin();
+  const res = await api('sessions/bilibili/qr', 'POST');
+  activeQrId = res.qr_id;
+  drawQrMatrix(res.matrix);
+  $('qr-status-text').textContent = '请使用手机哔哩哔哩 App 扫描二维码';
+  $('qr-login-panel').hidden = false;
+  qrTimer = setInterval(async () => {
+    if (!activeQrId) return;
+    try {
+      const poll = await api('sessions/bilibili/qr/' + encodeURIComponent(activeQrId) + '/poll', 'POST');
+      if (poll.message) $('qr-status-text').textContent = poll.message;
+      if (poll.status === 'confirmed') {
+        stopQrLogin();
+        notify('哔哩哔哩扫码登录成功，凭据已加密保存并启用');
+        await loadSessions();
+      } else if (poll.status === 'expired' || poll.status === 'error') {
+        clearInterval(qrTimer);
+      }
+    } catch (err) {
+      $('qr-status-text').textContent = err.message;
+      clearInterval(qrTimer);
+    }
+  }, 1500);
+}
+
+async function startWebviewLogin(platform) {
+  stopWebviewPoll();
+  const res = await api('sessions/' + encodeURIComponent(platform) + '/webview-login', 'POST');
+  activeWebviewAttempt = res.attempt_id;
+  activeWebviewPlatform = platform;
+  $('webview-status-title').textContent = `${platform} · 内置浏览器已启动`;
+  $('webview-status-text').textContent = res.message || '请在打开的内置浏览器窗口中完成登录...';
+  $('webview-panel').hidden = false;
+
+  webviewTimer = setInterval(async () => {
+    if (!activeWebviewAttempt) return;
+    try {
+      const st = await api('sessions/webview-status/' + encodeURIComponent(activeWebviewAttempt));
+      $('webview-status-text').textContent = st.message || '';
+      if (st.state === 'COMPLETED') {
+        stopWebviewPoll();
+        notify(st.message || `${platform} Cookie 已通过内置浏览器保存`);
+        await loadSessions();
+      } else if (st.state === 'CANCELLED' || st.state === 'FAILED') {
+        stopWebviewPoll();
+        if (st.state === 'FAILED') notify(st.error || st.message || '内置浏览器登录失败', true);
+      }
+    } catch {
+      stopWebviewPoll();
+    }
+  }, 900);
+}
 
 function renderSessionCard() {
   if (!sessionsData.length) return;
@@ -278,7 +438,6 @@ function renderSessionCard() {
   sel.value = current.platform;
   sel._syncSelect?.();
 
-  // 状态概览快捷芯片：展示所有已导入或已禁用的平台，方便快速切换
   const overview = $('session-overview');
   overview.replaceChildren();
   const notable = sessionsData.filter(s => s.state === 'IMPORTED' || !s.enabled);
@@ -308,22 +467,41 @@ function renderSessionCard() {
     pill.textContent = '已导入 · 账号有效';
     pill.className = 'status-pill ok';
   } else if (current.validation.state === 'INVALID') {
-    pill.textContent = '凭据失效 · 请重新导入';
+    pill.textContent = '凭据失效 · 请重新登录或导入';
     pill.className = 'status-pill err';
   } else {
     pill.textContent = '已导入 · ' + (labels[current.validation.state] || '未检测');
     pill.className = 'status-pill info';
   }
 
+  const meta = current.ui || {};
+  const metaParts = [];
+  if (meta.cookie_count) {
+    metaParts.push(`共 ${meta.cookie_count} 项会话条目`);
+    metaParts.push(meta.marker_present ? '包含核心登录标记' : '暂未检测到登录态标记');
+    if (meta.earliest_expiry) {
+      metaParts.push('最早有效期至 ' + new Date(meta.earliest_expiry * 1000).toLocaleDateString());
+    }
+  }
+  $('session-meta-hint').textContent = metaParts.join(' · ');
+
   $('session-clear').disabled = current.state === 'MISSING' && current.enabled;
   $('session-verify').disabled = current.state === 'MISSING' || !current.enabled;
+  $('session-qr-login').hidden = !current.has_qr;
+  const wvBtn = $('session-webview-login');
+  wvBtn.disabled = current.webview_available === false;
+  wvBtn.title = current.webview_available === false ? '当前为无桌面环境（如 Docker），请使用扫码或导入' : '打开桌面内置 WebView 浏览器完成登录';
+
+  if (current.platform !== '哔哩哔哩' && activeQrId) stopQrLogin();
 
   if (current.platform === 'YouTube') {
-    $('session-extra-hint').textContent = 'YouTube 建议通过浏览器插件导出 cookies.txt 文件后直接导入，以获得完整域名凭证。';
-  } else if (current.platform === '哔哩哔哩' || current.platform === 'Pixiv') {
-    $('session-extra-hint').textContent = `${current.platform} 支持点击上方“检测”执行真实账号有效性校验；可粘贴请求头（如 SESSDATA=...）或 Netscape 文件导入。`;
+    $('session-extra-hint').textContent = 'YouTube 可尝试“内置浏览器登录”；如 Google 限制嵌入式登录，请通过浏览器插件导出 cookies.txt 或 JSON 导入。';
+  } else if (current.platform === '哔哩哔哩') {
+    $('session-extra-hint').textContent = '哔哩哔哩支持“B站扫码登录”、“内置浏览器登录”及导入 Cookie；获取凭据后可点击“检测”验证登录有效性。';
+  } else if (current.platform === 'Pixiv') {
+    $('session-extra-hint').textContent = 'Pixiv 推荐通过“内置浏览器登录”登录后点击“我已登录，抓取保存”，再点“检测”确认账号状态。';
   } else {
-    $('session-extra-hint').textContent = '凭据在本地加密保存，不会返回给 Agent；需要验证码或浏览器登录的平台请在外部浏览器完成后导入。';
+    $('session-extra-hint').textContent = '推荐使用“内置浏览器登录”，也可粘贴请求头、Netscape 文件或 Cookie-Editor JSON 数组；凭据仅本地加密保存。';
   }
 }
 
@@ -332,7 +510,58 @@ async function loadSessions() {
   renderSessionCard();
 }
 
-// -------------------- Bot 连接信息摘要与配置表单 --------------------
+// -------------------- 已识别桥接与 Bot 摘要 --------------------
+
+function renderBridges(bridges = [], hints = []) {
+  const list = $('bridge-list');
+  list.replaceChildren();
+  const kindLabel = {
+    mcp_stdio: 'MCP stdio 桥接',
+    mcp_http: 'Streamable HTTP MCP',
+    astrbot: 'AstrBot 机器人插件',
+    bot_client: 'Bot 客户端桥接',
+    http_api: 'HTTP API 桥接',
+  };
+  const statusLabel = {online: ['在线', 'ok'], idle: ['空闲', 'info'], offline: ['已离线', '']};
+  for (const b of bridges) {
+    const card = document.createElement('div');
+    card.className = 'bridge-card';
+    const head = document.createElement('div');
+    head.className = 'bot-summary-head';
+    const title = document.createElement('strong');
+    title.textContent = b.name || kindLabel[b.kind] || b.id;
+    const badge = document.createElement('span');
+    const [stText, stCls] = statusLabel[b.status] || ['未知', ''];
+    badge.className = 'status-pill ' + stCls;
+    badge.textContent = stText;
+    head.append(title, badge);
+    card.append(head);
+
+    const meta = document.createElement('div');
+    meta.className = 'bot-summary-meta';
+    const lines = [
+      `类型：${kindLabel[b.kind] || b.kind}（${b.transport || 'http'}）${b.client_name ? ' · 客户端 ' + b.client_name + (b.client_version ? ' ' + b.client_version : '') : ''}`,
+      `调用次数：${b.call_count || 0} · 最近活跃：${new Date(b.last_seen * 1000).toLocaleTimeString()}`,
+    ];
+    if (Array.isArray(b.routes) && b.routes.length) {
+      lines.push(`已配置投递路由：${b.routes.join(', ')}`);
+    }
+    for (const line of lines) {
+      const div = document.createElement('div');
+      div.textContent = line;
+      meta.append(div);
+    }
+    card.append(meta);
+    list.append(card);
+  }
+  empty(list, '暂未检测到接入的 MCP 或机器人插件客户端（启动 Agent、stdio 桥或插件调用后会自动出现在这里）');
+
+  const hintsBox = $('bridge-hints');
+  hintsBox.replaceChildren();
+  for (const h of hints) {
+    row(hintsBox, `${h.name} · ${h.hint}`);
+  }
+}
 
 function renderBotSummary(list) {
   const container = $('bot-status-summary');
@@ -427,7 +656,22 @@ async function loadBots() {
     field(grid, 'max_upload_bytes', '此发送端上传上限（MiB）', bot.max_upload_bytes / 1024**2, 'number');
     field(grid, 'allowed_targets', '允许目标（每行一个）', bot.allowed_targets.join('\n'), 'textarea');
     if (bot.adapter === 'onebot') {
-      field(grid, 'shared_root', '服务端共享目录', bot.shared_root);
+      const sharedLabel = document.createElement('label');
+      sharedLabel.textContent = '服务端共享目录';
+      const rowWrap = document.createElement('div');
+      rowWrap.className = 'input-row';
+      const sharedInput = document.createElement('input');
+      sharedInput.name = 'shared_root';
+      sharedInput.value = bot.shared_root ?? '';
+      const pickBtn = document.createElement('button');
+      pickBtn.type = 'button';
+      pickBtn.textContent = '选择文件夹';
+      pickBtn.addEventListener('click', () => action(pickBtn, () =>
+        openDirectoryPicker(sharedInput, '选择服务端共享目录', async () => { await saveBotForm(true); })
+      ));
+      rowWrap.append(sharedInput, pickBtn);
+      sharedLabel.append(rowWrap);
+      grid.append(sharedLabel);
       field(grid, 'remote_root', 'NapCat 中对应目录', bot.remote_root);
     }
     const buttons = document.createElement('div');
@@ -493,9 +737,10 @@ async function refresh(syncBots = true) {
   $('version').textContent = cap.version;
   $('connection').textContent = '服务已连接';
   if (syncBots && Array.isArray(status.bots)) renderBotSummary(status.bots);
+  renderBridges(status.bridges || [], status.bridge_hints || []);
 
   const entries = [
-    ['MCP 服务', '运行中 · 免令牌直连（Streamable HTTP 与 stdio · 22 工具）'],
+    ['MCP 服务', '运行中 · 免令牌直连（Streamable HTTP 与 stdio · 23 工具）'],
     ['HTTP 地址', location.origin + '/mcp'],
     ['下载指令前缀', '/us（合集、分集视频、全部图片）· /zip（打包压缩包发送）'],
     ['服务数据目录', status.data_path],
@@ -505,7 +750,7 @@ async function refresh(syncBots = true) {
     ['下载中的任务', String((status.tasks.DOWNLOADING || 0) + (status.tasks.PROCESSING || 0))],
     ['等待交付的任务', String(status.tasks.READY || 0)],
     ['缓存占用', bytes(status.cache_bytes) + ' / ' + bytes(settings.max_cache_bytes || 1)],
-    ['FFmpeg', cap.ffmpeg ? '可用' : '不可用'],
+    ['FFmpeg / WebView', `${cap.ffmpeg ? 'FFmpeg 可用' : 'FFmpeg 不可用'} · ${cap.browser_assisted_login ? '支持桌面 WebView 登录' : '无桌面 WebView'}`],
   ];
   $('service-status').replaceChildren();
   for (const [key, value] of entries) {
@@ -525,14 +770,15 @@ async function refresh(syncBots = true) {
   }
   empty($('approvals'), '没有待确认的大批量请求');
   for (const delivery of status.deliveries) {
-    row($('deliveries'), `${delivery.adapter} → ${delivery.target} · ${delivery.state}${delivery.error ? ' · ' + delivery.error : ''}`, ['FAILED', 'UNCERTAIN'].includes(delivery.state) ? '重试' : '', async () => {
+    const errText = delivery.error_message || delivery.error || '';
+    row($('deliveries'), `${delivery.adapter} → ${delivery.target} · ${delivery.state}${errText ? ' · ' + errText : ''}`, ['FAILED', 'UNCERTAIN'].includes(delivery.state) ? '重试' : '', async () => {
       if (delivery.state === 'UNCERTAIN' && !confirm('平台可能已收到文件。请先核对机器人端记录，确认允许再次发送后继续。')) return;
       await api('deliveries/' + delivery.id + '/retry', 'POST', {reconciled_allow_retry: delivery.state === 'UNCERTAIN'});
       await refresh();
     });
   }
   empty($('deliveries'), '没有交付记录');
-  for (const error of status.errors) row($('errors'), `${error.id.slice(0, 8)} · ${error.error}`);
+  for (const error of status.errors) row($('errors'), `${error.id.slice(0, 8)} · ${error.error_message || error.error}`);
   empty($('errors'), '暂无错误');
   if (status.cleanup_error) row($('errors'), status.cleanup_error + ' · 文件清理已延后，平台发送状态不受影响');
   for (const entry of status.cleanup) row($('cleanup-log'), `${new Date(entry.created * 1000).toLocaleString()} · 清理 ${entry.files} 个文件 · ${bytes(entry.bytes)}`);
@@ -543,7 +789,7 @@ async function init() {
   initAllSelects();
   settings = await api('config');
   populate();
-  setSaveStatus('saved', '已自动保存');
+  setSaveStatus('saved', '已保存');
   await Promise.all([loadSessions(), loadBots(), refresh()]);
   mcpConfig = await api('mcp-config');
   clearInterval(refreshTimer);
@@ -557,6 +803,7 @@ async function init() {
 // -------------------- 事件绑定 --------------------
 
 const formEl = $('settings-form');
+const manualSaveFields = new Set(['download_dir', 'image_dir', 'cache_dir', 'proxy']);
 formEl.addEventListener('change', e => {
   const t = e.target;
   if (!t || !t.name) return;
@@ -566,17 +813,77 @@ formEl.addEventListener('change', e => {
 formEl.addEventListener('input', e => {
   const t = e.target;
   if (!t || !t.name || t.tagName === 'SELECT' || t.type === 'checkbox') return;
+  if (manualSaveFields.has(t.name)) {
+    setSaveStatus('saving', '未保存（请点击保存）');
+    clearTimeout(autoSaveTimer);
+    return;
+  }
   scheduleAutoSave(600, false);
 });
 
+document.querySelectorAll('.pick-dir').forEach(btn => {
+  btn.addEventListener('click', () => action(btn, async () => {
+    const fieldEl = formEl.elements[btn.dataset.target];
+    if (!fieldEl) return;
+    await openDirectoryPicker(fieldEl, '选择文件夹', async () => {
+      await saveSettingsNow(true, true, '目录已选择并保存');
+    });
+  }));
+});
+
+document.querySelectorAll('.save-field').forEach(btn => {
+  btn.addEventListener('click', () => action(btn, async () => {
+    clearTimeout(autoSaveTimer);
+    await saveSettingsNow(true, true, '设置已保存');
+  }));
+});
+
 document.querySelectorAll('.clear-dir').forEach(btn => {
-  btn.addEventListener('click', () => {
+  btn.addEventListener('click', () => action(btn, async () => {
     const fieldEl = formEl.elements[btn.dataset.target];
     if (fieldEl) {
       fieldEl.value = '';
-      scheduleAutoSave(80, true);
+      clearTimeout(autoSaveTimer);
+      await saveSettingsNow(true, true, '已清空并保存');
     }
-  });
+  }));
+});
+
+$('save-visual').addEventListener('click', () => action($('save-visual'), async () => {
+  clearTimeout(autoSaveTimer);
+  await saveSettingsNow(true, true, '下载可视化通知规则已保存');
+}));
+
+$('test-proxy').addEventListener('click', () => action($('test-proxy'), async () => {
+  const proxyVal = formEl.elements['proxy'].value.trim();
+  const res = await api('proxy/test', 'POST', {proxy: proxyVal});
+  renderProxyTestResult(res);
+  notify(res.ok ? '代理连通性测试通过' : '代理连通性测试存在失败目标，请查看下方详情', !res.ok);
+}));
+
+$('dir-modal-close').addEventListener('click', closeDirModal);
+$('dir-modal-cancel').addEventListener('click', closeDirModal);
+$('dir-modal-up').addEventListener('click', () => loadDirModalPath(dirModalParent).catch(e => notify(e.message, true)));
+$('dir-modal-new').addEventListener('click', async () => {
+  if (!dirModalCurrent) return;
+  const folder = prompt('请输入新建文件夹名称：');
+  if (!folder || !folder.trim()) return;
+  try {
+    const res = await api('fs/mkdir', 'POST', {parent: dirModalCurrent, name: folder.trim()});
+    await loadDirModalPath(res.path);
+  } catch (e) {
+    notify(e.message, true);
+  }
+});
+$('dir-modal-confirm').addEventListener('click', async () => {
+  if (!dirModalCurrent || !dirModalTargetEl) return;
+  const {inputEl, onPicked} = dirModalTargetEl;
+  const chosen = dirModalCurrent;
+  closeDirModal();
+  if (inputEl) {
+    inputEl.value = chosen;
+    if (onPicked) await onPicked(chosen).catch(e => notify(e.message, true));
+  }
 });
 
 $('theme').addEventListener('click', () => {
@@ -628,9 +935,29 @@ $('session-clear').addEventListener('click', () => action($('session-clear'), as
 
 $('session-verify').addEventListener('click', () => action($('session-verify'), async () => {
   const result = await api('sessions/' + encodeURIComponent(selectedPlatform) + '/verify', 'POST');
-  notify(result.state === 'INVALID' ? '凭据已失效，请重新导入' : `${selectedPlatform} 账号状态有效`);
+  notify(result.state === 'INVALID' ? '凭据已失效，请重新登录或导入' : `${selectedPlatform} 账号状态有效`);
   await loadSessions();
 }));
+
+$('session-webview-login').addEventListener('click', () => action($('session-webview-login'), async () => {
+  await startWebviewLogin(selectedPlatform);
+}));
+
+$('webview-manual-capture').addEventListener('click', () => action($('webview-manual-capture'), async () => {
+  if (!activeWebviewPlatform) return;
+  await api('sessions/' + encodeURIComponent(activeWebviewPlatform) + '/webview-capture', 'POST');
+  $('webview-status-text').textContent = '已发送抓取保存指令，正在保存 Cookie...';
+}));
+
+$('webview-cancel').addEventListener('click', () => action($('webview-cancel'), async () => {
+  const target = activeWebviewPlatform || selectedPlatform;
+  await api('sessions/' + encodeURIComponent(target) + '/webview-cancel', 'POST');
+  stopWebviewPoll();
+}));
+
+$('session-qr-login').addEventListener('click', () => action($('session-qr-login'), startBilibiliQrLogin));
+$('qr-refresh').addEventListener('click', () => action($('qr-refresh'), startBilibiliQrLogin));
+$('qr-cancel').addEventListener('click', () => { stopQrLogin(); });
 
 $('cookie-file').addEventListener('change', async e => {
   const file = e.target.files[0];
@@ -639,7 +966,7 @@ $('cookie-file').addEventListener('change', async e => {
     const text = await file.text();
     await api('sessions', 'POST', {platform: selectedPlatform, text});
     e.target.value = '';
-    notify(`${selectedPlatform} cookies.txt 已加密导入并启用`);
+    notify(`${selectedPlatform} Cookie 文件已加密导入并启用`);
     await loadSessions();
   } catch (err) {
     e.target.value = '';
@@ -652,6 +979,13 @@ $('import-cookie').addEventListener('click', () => action($('import-cookie'), as
   $('cookie-text').value = '';
   notify(`${selectedPlatform} 凭据已加密保存并启用`);
   await loadSessions();
+}));
+
+$('scan-bridges').addEventListener('click', () => action($('scan-bridges'), async () => {
+  const res = await api('bridges/scan', 'POST');
+  renderBridges(res.bridges || [], res.hints || []);
+  if (Array.isArray(res.bots)) renderBotSummary(res.bots);
+  notify('桥接扫描与机器人探测已完成');
 }));
 
 $('refresh').addEventListener('click', () => action($('refresh'), async () => {

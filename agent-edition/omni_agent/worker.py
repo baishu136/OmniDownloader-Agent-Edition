@@ -206,6 +206,7 @@ async def execute(request, emit):
             chosen = [meta]
         core_download_type = DownloadType(options['download_type'])
         items = [(item.url, item.title, []) for item in chosen]
+    emit({'kind': 'metadata', 'metadata': metadata})
     paths = []
     for index, (item_url, title, image_ids) in enumerate(items):
         validate_url(item_url, initial=True, using_proxy=using_proxy)

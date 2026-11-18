@@ -507,15 +507,69 @@ input[type=checkbox]:checked:after { background: #fff; transform: translateX(18p
 .import-box > label { margin-bottom: 12px; }
 .file-button { display: inline-flex; align-items: center; font-weight: 500; }
 .actions { margin: 16px 0; }
+.session-meta-hint { display: block; font-size: 12px; color: var(--muted); margin-top: 6px; }
 
-/* Bot 连接信息摘要与详情卡片 */
-.bot-summary-grid {
+.probe-result {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  font-size: 12.5px;
+  display: grid;
+  gap: 8px;
+}
+.probe-result.ok { border-color: var(--success); background: var(--success-bg); }
+.probe-result.err { border-color: var(--error); background: var(--error-bg); }
+.probe-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.probe-chip {
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+.probe-chip.ok { color: var(--success); border-color: var(--success); }
+.probe-chip.err { color: var(--error); border-color: var(--error); }
+
+.login-subpanel {
+  margin-top: 14px;
+  padding: 16px;
+  border-radius: 10px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+}
+.login-subpanel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.qr-panel {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.qr-panel canvas {
+  background: #ffffff;
+  border-radius: 10px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.qr-meta { flex: 1 1 240px; }
+.qr-meta strong { display: block; font-size: 15px; margin-bottom: 6px; }
+
+/* 已识别桥接与 Bot 连接信息摘要卡片 */
+.bridge-grid, .bot-summary-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px;
   margin: 14px 0 18px;
 }
-.bot-summary-card {
+.bridge-card, .bot-summary-card {
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 14px 16px;
@@ -536,6 +590,66 @@ input[type=checkbox]:checked:after { background: #fff; transform: translateX(18p
   gap: 4px;
   overflow-wrap: anywhere;
 }
+
+/* 服务端文件夹浏览弹窗 */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: rgba(15, 23, 42, 0.52);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+.modal-card {
+  width: min(640px, 100%);
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 18px 20px;
+  box-shadow: var(--menu-shadow);
+}
+.modal-head, .modal-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+.modal-foot { justify-content: flex-end; }
+.dir-modal-bar {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.dir-modal-bar input { margin-top: 0; flex: 1 1 auto; }
+.dir-modal-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 6px;
+  min-height: 220px;
+  max-height: 360px;
+  background: var(--surface-2);
+  display: grid;
+  gap: 4px;
+  align-content: start;
+}
+.dir-item {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 12px;
+  text-align: left;
+  border: 0;
+  background: var(--surface);
+  border-radius: 8px;
+  font-size: 13.5px;
+}
+.dir-item:hover { background: var(--hover); color: var(--accent); }
 
 dl {
   display: grid;
@@ -580,7 +694,7 @@ footer {
   aside p { display: none; }
   header { padding: 0 16px; }
   .settings section { padding: 20px; }
-  .bot-summary-grid { grid-template-columns: 1fr; }
+  .bridge-grid, .bot-summary-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 500px) {

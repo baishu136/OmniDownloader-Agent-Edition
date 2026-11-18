@@ -5,7 +5,7 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 import webbrowser
 
 
@@ -24,10 +24,15 @@ def stdio(server_url, directory):
     if parts.scheme == 'http' and parts.hostname not in ('127.0.0.1', 'localhost', '::1'):
         raise ValueError('远程stdio桥必须使用HTTPS')
 
+    base_url = server_url.rstrip('/')
+    bridge_id = f'mcp-stdio-{os.getpid()}'
+    bridge_state = {'name': 'MCP stdio 桥接', 'client_name': '', 'client_version': ''}
+    stop_heartbeat = threading.Event()
+
     def ready():
         try:
             with httpx.Client(trust_env=False, timeout=2) as client:
-                return client.get(server_url + '/health').status_code == 200
+                return client.get(base_url + '/health').status_code == 200
         except httpx.HTTPError:
             return False
 
@@ -42,10 +47,51 @@ def stdio(server_url, directory):
         while not ready() and time.monotonic() < deadline:
             time.sleep(.2)
 
+    def bridge_headers():
+        return {
+            'X-Omni-Bridge-Id': bridge_id,
+            'X-Omni-Bridge-Type': 'mcp_stdio',
+            'X-Omni-Bridge-Name': quote(bridge_state['client_name'] or 'MCP stdio', safe=' -_.'),
+            'X-Omni-Bridge-Client': quote(bridge_state['client_name'], safe=' -_.'),
+            'X-Omni-Bridge-Version': quote(bridge_state['client_version'], safe=' -_.'),
+            'X-Omni-Bridge-Pid': str(os.getpid()),
+        }
+
+    def post_bridge(endpoint: str):
+        try:
+            payload = {
+                'bridge_id': bridge_id,
+                'kind': 'mcp_stdio',
+                'name': bridge_state['client_name'] or bridge_state['name'],
+                'transport': 'stdio',
+                'client_name': bridge_state['client_name'],
+                'client_version': bridge_state['client_version'],
+                'pid': os.getpid(),
+            } if endpoint != 'unregister' else {'bridge_id': bridge_id}
+            with httpx.Client(trust_env=False, timeout=2) as client:
+                client.post(f'{base_url}/api/bridges/{endpoint}', json=payload)
+        except Exception:
+            pass
+
+    def heartbeat_loop():
+        post_bridge('register')
+        while not stop_heartbeat.wait(30):
+            post_bridge('heartbeat')
+
+    hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    hb_thread.start()
+
+    async def on_mcp_session(client_name: str, client_version: str):
+        changed = (client_name != bridge_state['client_name']) or (client_version != bridge_state['client_version'])
+        bridge_state['client_name'] = client_name
+        bridge_state['client_version'] = client_version
+        if changed:
+            await asyncio.to_thread(post_bridge, 'register')
+
     async def invoke(name, arguments):
         try:
             async with httpx.AsyncClient(trust_env=False, timeout=1900, follow_redirects=False) as client:
-                response = await client.post(server_url + '/api/tools/' + name, json=arguments)
+                response = await client.post(base_url + '/api/tools/' + name, json=arguments, headers=bridge_headers())
                 if response.status_code != 200:
                     return AgentError('SERVICE_REJECTED', '服务接口调用失败').result()
                 return response.json()
@@ -53,7 +99,12 @@ def stdio(server_url, directory):
             return AgentError('SERVICE_UNAVAILABLE', '无法连接 Agent Edition 服务').result()
 
     # stdout 专用于 MCP JSON-RPC 通讯，不能打印任何杂散日志
-    create_mcp(invoke).run('stdio')
+    try:
+        import asyncio
+        create_mcp(invoke, on_session=on_mcp_session).run('stdio')
+    finally:
+        stop_heartbeat.set()
+        post_bridge('unregister')
 
 
 def serve(args):
@@ -112,6 +163,25 @@ def main():
     if '--worker' in sys.argv:
         from .worker import main as worker_main
         worker_main()
+        return
+    if '--pick-dir' in sys.argv:
+        p = argparse.ArgumentParser()
+        p.add_argument('--pick-dir', action='store_true')
+        p.add_argument('--initial', default='')
+        p.add_argument('--title', default='选择文件夹')
+        p.add_argument('--out', required=True)
+        pick_args = p.parse_args()
+        from .desktop_tools import run_pick_dir_cli
+        run_pick_dir_cli(pick_args.initial, pick_args.title, pick_args.out)
+        return
+    if '--webview-login' in sys.argv:
+        p = argparse.ArgumentParser()
+        p.add_argument('--webview-login', action='store_true')
+        p.add_argument('--server', required=True)
+        p.add_argument('--attempt', required=True)
+        wv_args = p.parse_args()
+        from .cookie_login import run_webview_login_cli
+        run_webview_login_cli(wv_args.server, wv_args.attempt, os.environ.get('OMNI_WEBVIEW_NONCE', ''))
         return
     parser = argparse.ArgumentParser(description='OmniDownloader Agent Edition')
     modes = parser.add_mutually_exclusive_group()

@@ -7,7 +7,7 @@ import sys
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -15,6 +15,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import Settings
+from .cookie_login import PLATFORM_LOGIN_POLICIES, webview_available
+from .desktop_tools import create_directory, list_directories, pick_directory, probe_proxy_connectivity
 from .errors import AgentError
 from .mcp_server import create_mcp
 from .service import BotConfigUpdate, DownloadOptions, Service, SettingsUpdate
@@ -102,6 +104,49 @@ class Retry(Input):
     reconciled_allow_retry: bool = False
 
 
+class PickDirArgs(Input):
+    initial_dir: str = ''
+    title: str = '选择文件夹'
+
+
+class BrowseDirArgs(Input):
+    path: str = ''
+
+
+class CreateDirArgs(Input):
+    parent: str = Field(min_length=1, max_length=1024)
+    name: str = Field(min_length=1, max_length=255)
+
+
+class ProxyTestArgs(Input):
+    proxy: str = ''
+    target: str = ''
+
+
+class BridgeRegisterArgs(Input):
+    bridge_id: str = Field(min_length=1, max_length=128)
+    kind: str = Field('http_api', min_length=1, max_length=40)
+    name: str = Field('', max_length=80)
+    transport: str = Field('http', max_length=40)
+    client_name: str = Field('', max_length=80)
+    client_version: str = Field('', max_length=40)
+    pid: int | None = Field(None, ge=1)
+    routes: list[str] | None = None
+
+
+class BridgeUnregisterArgs(Input):
+    bridge_id: str = Field(min_length=1, max_length=128)
+
+
+class WebViewCaptureArgs(Input):
+    netscape: str = Field(min_length=1, max_length=1024 * 1024)
+
+
+class WebViewHeartbeatArgs(Input):
+    state: str = Field('WAITING', max_length=32)
+    message: str = Field('', max_length=300)
+
+
 SCHEMAS = {
     'analyze_media': Analyze,
     'download_media': Download,
@@ -111,6 +156,7 @@ SCHEMAS = {
     'list_tasks': ListTasks,
     'get_media_file': FileID,
     'get_service_capabilities': Input,
+    'list_bridges': Input,
     'deliver_media': Deliver,
     'get_delivery_status': DeliveryID,
     'get_settings': Input,
@@ -153,12 +199,12 @@ async def invoke(service, owner, name, arguments):
             result = service.file_reference(owner, args.file_id)
         elif name == 'get_service_capabilities':
             result = service.capabilities()
+        elif name == 'list_bridges':
+            result = {'bridges': service.bridges.list_bridges(), 'hints': service.bridges.local_hints, 'bots': service.get_bot_configs()}
         elif name == 'deliver_media':
             result = await service.deliver(owner, args.task_id, args.adapter, args.target, args.kind, args.request_key)
         elif name == 'get_delivery_status':
-            row = service.store.delivery(args.delivery_id, owner)
-            result = {k: row[k] for k in ('id', 'task_id', 'state', 'error')}
-            result['receipts'] = [json.loads(r['receipt']) for r in service.store.db.execute('SELECT receipt FROM receipts WHERE delivery_id=?', (args.delivery_id,))]
+            result = service.store.public_delivery(args.delivery_id, owner)
         elif name == 'get_settings':
             result = service.get_settings()
         elif name == 'update_settings':
@@ -216,6 +262,9 @@ class SecurityBoundary:
             if origin not in valid_origins or p.scheme not in ('http', 'https'):
                 return await error('ORIGIN_DENIED', '跨站请求被拒绝', 403)
 
+        client_host = (scope.get('client') or ('', 0))[0]
+        self.service.bridges.observe_http_request(scope.get('path', ''), headers, str(client_host))
+
         # 限制流式请求体最大 2MiB；已取消本机令牌授权校验，直接以默认身份执行
         data = bytearray()
         while True:
@@ -249,7 +298,10 @@ def create_app(service=None):
     async def call(name, arguments):
         return await invoke(service, principal.get(), name, arguments)
 
-    mcp = create_mcp(call)
+    async def on_mcp_session(client_name, client_version):
+        service.bridges.observe_mcp_session(client_name, client_version, transport='streamable-http')
+
+    mcp = create_mcp(call, on_session=on_mcp_session)
     hosts = ['127.0.0.1:*', 'localhost:*', '[::1]:*', 'testserver'] + list(filter(None, os.environ.get('OMNI_AGENT_ALLOWED_HOSTS', '').split(',')))
     mcp_app = mcp.streamable_http_app(
         json_response=True,
@@ -318,11 +370,27 @@ def create_app(service=None):
     async def reset_settings(body: ResetSettingsArgs | None = None):
         return {'ok': True, **service.reset_settings(reset_cache_dir=bool(body and body.reset_cache_dir))}
 
+    @app.post('/api/admin/pick-directory')
+    async def admin_pick_directory(body: PickDirArgs):
+        return await pick_directory(body.initial_dir, body.title)
+
+    @app.post('/api/admin/fs/list')
+    async def admin_list_directories(body: BrowseDirArgs):
+        return list_directories(body.path)
+
+    @app.post('/api/admin/fs/mkdir')
+    async def admin_create_directory(body: CreateDirArgs):
+        return create_directory(body.parent, body.name)
+
+    @app.post('/api/admin/proxy/test')
+    async def admin_test_proxy(body: ProxyTestArgs):
+        return await probe_proxy_connectivity(body.proxy, body.target)
+
     @app.get('/api/admin/status')
     async def status():
-        recent = service.store.db.execute("SELECT id,error,updated FROM jobs WHERE error!='' ORDER BY updated DESC LIMIT 10").fetchall()
+        recent = service.store.db.execute("SELECT id,error,error_message,updated FROM jobs WHERE error!='' ORDER BY updated DESC LIMIT 10").fetchall()
         counts = {r['state']: r['count'] for r in service.store.db.execute('SELECT state,COUNT(*) count FROM jobs GROUP BY state')}
-        deliveries = [dict(r) for r in service.store.db.execute('SELECT id,task_id,adapter,target,state,error FROM deliveries ORDER BY created DESC LIMIT 50')]
+        deliveries = [dict(r) for r in service.store.db.execute('SELECT id,task_id,adapter,target,state,error,error_message FROM deliveries ORDER BY created DESC LIMIT 50')]
         cleanup = [dict(r) for r in service.store.db.execute('SELECT * FROM cleanup_log ORDER BY created DESC LIMIT 5')]
         s = service.config.settings
         return {
@@ -340,7 +408,39 @@ def create_app(service=None):
             'download_dir': s.download_dir,
             'image_dir': s.image_dir or s.download_dir,
             'bots': service.get_bot_configs(),
+            'bridges': service.bridges.list_bridges(),
+            'bridge_hints': service.bridges.local_hints,
+            'webview_available': webview_available(),
         }
+
+    @app.get('/api/admin/bridges')
+    async def admin_bridges():
+        return await service.scan_bridges(probe_bots=False)
+
+    @app.post('/api/admin/bridges/scan')
+    async def admin_scan_bridges():
+        return await service.scan_bridges(probe_bots=True)
+
+    @app.post('/api/bridges/register')
+    @app.post('/api/bridges/heartbeat')
+    async def register_bridge(body: BridgeRegisterArgs, request: Request):
+        entry = service.bridges.register(
+            bridge_id=body.bridge_id,
+            kind=body.kind,
+            name=body.name,
+            transport=body.transport,
+            client_name=body.client_name,
+            client_version=body.client_version,
+            pid=body.pid,
+            routes=body.routes,
+            user_agent=request.headers.get('user-agent', ''),
+        )
+        return {'ok': True, 'bridge': entry}
+
+    @app.post('/api/bridges/unregister')
+    async def unregister_bridge(body: BridgeUnregisterArgs):
+        service.bridges.unregister(body.bridge_id)
+        return {'ok': True}
 
     @app.post('/api/admin/cleanup')
     async def cleanup():
@@ -357,11 +457,78 @@ def create_app(service=None):
 
     @app.get('/api/admin/sessions')
     async def sessions():
-        return service.list_cookie_statuses()
+        return service.list_cookie_statuses(include_ui=True)
 
     @app.post('/api/admin/sessions')
     async def import_cookie(body: CookieImport):
         return service.import_cookie(body.platform, body.text)
+
+    @app.post('/api/admin/sessions/bilibili/qr')
+    async def bilibili_qr_start():
+        return await service.start_bilibili_qr()
+
+    @app.post('/api/admin/sessions/bilibili/qr/{qr_id}/poll')
+    async def bilibili_qr_poll(qr_id: str):
+        return await service.poll_bilibili_qr(qr_id)
+
+    @app.post('/api/admin/sessions/{platform}/webview-login')
+    async def webview_login_start(platform: str, request: Request):
+        return await service.start_webview_login(platform, str(request.base_url).rstrip('/'))
+
+    @app.get('/api/admin/sessions/webview-status/{attempt_id}')
+    async def webview_login_status(attempt_id: str):
+        return service.webview_logins.public_status(attempt_id)
+
+    @app.post('/api/admin/sessions/{platform}/webview-capture')
+    async def webview_login_manual_capture(platform: str):
+        return service.webview_logins.request_manual_capture(platform)
+
+    @app.post('/api/admin/sessions/{platform}/webview-cancel')
+    async def webview_login_cancel(platform: str):
+        return service.webview_logins.request_cancel(platform)
+
+    @app.get('/api/internal/webview-login/{attempt_id}')
+    async def internal_webview_config(attempt_id: str, x_omni_webview_nonce: str = Header(default='')):
+        attempt = service.webview_logins.verify_internal(attempt_id, x_omni_webview_nonce)
+        policy = PLATFORM_LOGIN_POLICIES[attempt.platform]
+        return {
+            'platform': attempt.platform,
+            'start_url': policy['start_url'],
+            'cookie_urls': list(policy['cookie_urls']),
+            'domains': list(service.domains[attempt.platform]),
+            'markers': list(policy['markers']),
+            'auto_capture': policy['auto_capture'],
+            'proxy': attempt.proxy,
+        }
+
+    @app.get('/api/internal/webview-login/{attempt_id}/commands')
+    async def internal_webview_commands(attempt_id: str, x_omni_webview_nonce: str = Header(default='')):
+        attempt = service.webview_logins.verify_internal(attempt_id, x_omni_webview_nonce)
+        capture = attempt.manual_capture_requested
+        attempt.manual_capture_requested = False
+        return {'capture': capture, 'cancel': attempt.cancel_requested}
+
+    @app.post('/api/internal/webview-login/{attempt_id}/heartbeat')
+    async def internal_webview_heartbeat(attempt_id: str, body: WebViewHeartbeatArgs, x_omni_webview_nonce: str = Header(default='')):
+        attempt = service.webview_logins.verify_internal(attempt_id, x_omni_webview_nonce)
+        if attempt.state in ('OPENING', 'WAITING'):
+            attempt.state = body.state
+            attempt.message = body.message
+            attempt.updated_at = __import__('time').time()
+        return {'ok': True}
+
+    @app.post('/api/internal/webview-login/{attempt_id}/capture')
+    async def internal_webview_capture(attempt_id: str, body: WebViewCaptureArgs, x_omni_webview_nonce: str = Header(default='')):
+        return await service.complete_webview_capture(attempt_id, x_omni_webview_nonce, body.netscape)
+
+    @app.post('/api/internal/webview-login/{attempt_id}/cancel')
+    async def internal_webview_cancel(attempt_id: str, x_omni_webview_nonce: str = Header(default='')):
+        attempt = service.webview_logins.verify_internal(attempt_id, x_omni_webview_nonce)
+        if attempt.state not in ('COMPLETED', 'FAILED'):
+            attempt.state = 'CANCELLED'
+            attempt.message = '内置登录窗口已关闭'
+            attempt.updated_at = __import__('time').time()
+        return {'ok': True}
 
     @app.post('/api/admin/sessions/{platform}/enable')
     async def enable_cookie(platform: str):
