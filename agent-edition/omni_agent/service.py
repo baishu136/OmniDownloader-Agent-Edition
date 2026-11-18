@@ -643,7 +643,10 @@ class Service:
             self._export_to_storage(payload, result['paths'])
             self.store.finish(identifier, result['paths'], metadata=result.get('metadata'))
         except asyncio.CancelledError:
-            self.store.fail(identifier, 'CANCELLED', 'CANCELLED', error_message='任务已取消')
+            if self.stopping:
+                self.store.fail(identifier, 'RESTART_INTERRUPTED', 'FAILED', error_message='服务重启导致下载任务中断，请重新发起下载')
+            else:
+                self.store.fail(identifier, 'CANCELLED', 'CANCELLED', error_message='任务已取消')
             raise
         except AgentError as error:
             self.store.fail(identifier, error.code, error_message=safe_text(error.message))

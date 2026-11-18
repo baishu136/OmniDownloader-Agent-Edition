@@ -23,10 +23,12 @@ def alive(pid):
         finally:kernel.CloseHandle(handle)
     try:
         status=Path(f'/proc/{pid}/stat')
-        if status.exists() and status.read_text().split()[2]=='Z':return False
+        if status.exists():
+            parts=status.read_text().split()
+            if len(parts)>2 and parts[2]=='Z':return False
         os.kill(pid,0)
         return True
-    except ProcessLookupError:return False
+    except (ProcessLookupError,FileNotFoundError):return False
 
 
 async def test_cancel_really_terminates_worker_and_child_process(service,monkeypatch):
@@ -64,3 +66,39 @@ def test_orphan_guard_targets_only_its_own_process_group(monkeypatch):
     monkeypatch.setattr(os,'killpg',kill,raising=False)
     with pytest.raises(RuntimeError):watch_parent(100)
     assert calls==[123]
+
+
+async def test_shutdown_marks_inflight_job_as_restart_interrupted_failed(tmp_path, monkeypatch):
+    from omni_agent.service import DownloadOptions, Service
+
+    started = asyncio.Event()
+
+    class BlockingRunner:
+        def __init__(self, config, store):
+            pass
+
+        async def call(self, payload, identifier=None, progress=None):
+            started.set()
+            await asyncio.sleep(30)
+            return {'paths': []}
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr('omni_agent.service.Service.check_url', lambda self, u: (u, False, False))
+    svc1 = Service(tmp_path, runner_factory=BlockingRunner)
+    await svc1.start()
+    try:
+        job = await svc1.download('agent', 'https://youtube.com/watch?v=restart-test', DownloadOptions(), request_key='shutdown-check')
+        await asyncio.wait_for(started.wait(), timeout=5)
+    finally:
+        await svc1.close()
+
+    svc2 = Service(tmp_path, runner_factory=BlockingRunner)
+    await svc2.start()
+    try:
+        persisted = svc2.store.job(job['id'])
+        assert persisted['state'] == 'FAILED'
+        assert persisted['error'] == 'RESTART_INTERRUPTED'
+    finally:
+        await svc2.close()

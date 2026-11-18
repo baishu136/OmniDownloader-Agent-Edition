@@ -3,7 +3,7 @@
 日期：2026-11-18。下列记录来自实际执行，模拟 API 和真实平台验收严格区分。
 
 - Windows 原核心：`python -m pytest windows/tests -q`，140 通过，存在既有 Pydantic 弃用警告。
-- Agent 独立测试：`python -m pytest agent-edition/tests -q`，96 通过，覆盖：
+- Agent 独立测试：`python -m pytest agent-edition/tests -q`，97 通过，覆盖：
   - 独立默认工作目录解析（`./data/` 及便携目录同级 `data/`）与无 `auth.json` 验证；
   - 免令牌 HTTP 管理接口与官方 MCP SDK 真实 `stdio` / Streamable HTTP 握手及 23 项工具（含 `list_bridges`）发现；
   - 设置读取/局部更新/自动保存/重置默认设置，以及 `download_dir`、`image_dir` 永久导出、页内目录浏览/创建与原生文件夹选择降级逻辑；
