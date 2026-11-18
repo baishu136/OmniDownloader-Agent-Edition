@@ -15,7 +15,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import Settings
-from .cookie_login import find_local_browser, local_browser_available
+from .cookie_login import MULTI_PLATFORM_KEY, find_local_browser, local_browser_available
 from .desktop_tools import create_directory, list_directories, pick_directory, probe_proxy_connectivity
 from .errors import AgentError
 from .mcp_server import create_mcp
@@ -98,6 +98,10 @@ class PlatformName(Input):
 class CookieImport(Input):
     platform: str
     text: str = Field(min_length=1, max_length=1024 * 1024)
+
+
+class SyncBrowserProfileArgs(Input):
+    include_manual: bool = False
 
 
 class Retry(Input):
@@ -461,6 +465,26 @@ def create_app(service=None):
     @app.post('/api/admin/sessions/bilibili/qr/{qr_id}/poll')
     async def bilibili_qr_poll(qr_id: str):
         return await service.poll_bilibili_qr(qr_id)
+
+    @app.post('/api/admin/sessions/browser-workspace/start')
+    async def browser_workspace_start():
+        return await service.start_multi_browser_login()
+
+    @app.post('/api/admin/sessions/browser-workspace/capture')
+    async def browser_workspace_capture():
+        return service.browser_logins.request_manual_capture(MULTI_PLATFORM_KEY)
+
+    @app.post('/api/admin/sessions/browser-workspace/cancel')
+    async def browser_workspace_cancel():
+        return service.browser_logins.request_cancel(MULTI_PLATFORM_KEY)
+
+    @app.post('/api/admin/sessions/browser-profile/sync')
+    async def browser_profile_sync(body: SyncBrowserProfileArgs | None = None):
+        return await service.sync_browser_profile(include_manual=bool(body and body.include_manual))
+
+    @app.post('/api/admin/sessions/browser-profile/reset')
+    async def browser_profile_reset():
+        return await service.reset_browser_profile()
 
     @app.post('/api/admin/sessions/{platform}/browser-login')
     async def browser_login_start(platform: str):

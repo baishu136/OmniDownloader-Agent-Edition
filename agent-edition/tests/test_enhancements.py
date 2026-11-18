@@ -355,6 +355,116 @@ async def test_cdp_snapshot_loopback_multi_source_and_host_extraction():
         assert names['SID']['httpOnly'] is True
 
 
+def test_persistent_managed_browser_workspace_sync_and_reset(service, monkeypatch):
+    profile_dir = service.browser_logins.profile_dir
+    assert profile_dir is not None and profile_dir.name == 'browser-profile'
+
+    fake_browser = {'name': 'Microsoft Edge', 'path': 'mock-edge'}
+    monkeypatch.setattr('omni_agent.cookie_login.find_local_browser', lambda: fake_browser)
+    monkeypatch.setattr('omni_agent.service.find_local_browser', lambda: fake_browser)
+    monkeypatch.setattr(service.browser_logins, 'POLL_INTERVAL_SEC', 0.01)
+    monkeypatch.setattr(service.browser_logins, 'CONFIRM_WINDOW_SEC', 0.01)
+    monkeypatch.setattr(service.browser_logins, 'PORT_WAIT_STEP_SEC', 0.005)
+    monkeypatch.setattr(service, 'verify_cookie', lambda p: asyncio.sleep(0, result={'state': 'VALID'}))
+
+    launched_cmds = []
+
+    class FakeProc:
+        def __init__(self):
+            self.returncode = None
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_exec(*cmd, **kwargs):
+        if cmd and str(cmd[0]) == 'mock-edge':
+            launched_cmds.append(list(cmd))
+            # 在持久 profile 内写入会话标记文件，模拟真实浏览器保存登录态档案
+            (profile_dir / 'Local State').write_text('{"os_crypt":{}}', encoding='utf-8')
+            (profile_dir / 'DevToolsActivePort').write_text('9333\n/devtools/browser/persist\n', encoding='utf-8')
+            return FakeProc()
+        return await asyncio.create_subprocess_exec(*cmd, **kwargs)
+
+    multi_cookies = [
+        {'name': 'auth_token', 'value': 'x-persist-secret', 'domain': '.x.com', 'path': '/', 'httpOnly': True, 'secure': True},
+        {'name': 'SESSDATA', 'value': 'bili-persist-secret', 'domain': '.bilibili.com', 'path': '/', 'httpOnly': True, 'secure': True},
+        # 匿名访问小红书/抖音可能带的未登录 Cookie，不应被后台免密自动同步误收
+        {'name': 'ttwid', 'value': 'dy-guest-cookie', 'domain': '.douyin.com', 'path': '/'},
+        {'name': 'PHPSESSID', 'value': 'px-guest-or-user', 'domain': '.pixiv.net', 'path': '/'},
+    ]
+
+    async def fake_snapshot(port, ws_path, cookie_urls=()):
+        assert port == 9333
+        return {'cdp_connected': True, 'current_host': 'x.com', 'cookies': multi_cookies}
+
+    monkeypatch.setattr('omni_agent.cookie_login.asyncio.create_subprocess_exec', fake_exec)
+    monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_snapshot', fake_snapshot)
+    monkeypatch.setattr('omni_agent.cookie_login.close_cdp_browser', lambda p, w: asyncio.sleep(0))
+
+    with TestClient(create_app(service)) as client:
+        # 1. 启动多平台托管工作窗，实时预览已抓到的平台矩阵并一键批量保存
+        ws = client.post('/api/admin/sessions/browser-workspace/start')
+        assert ws.status_code == 200 and ws.json()['multi_platform'] is True
+        attempt_id = ws.json()['attempt_id']
+
+        st = {}
+        for _ in range(40):
+            st = client.get(f'/api/admin/sessions/browser-status/{attempt_id}').json()
+            if st['ready_platforms']:
+                break
+            time.sleep(0.01)
+        ready_names = {r['platform'] for r in st['ready_platforms']}
+        assert {'X (Twitter)', '哔哩哔哩', 'Pixiv'}.issubset(ready_names)
+
+        # 验证打开后即使切走，持久化 profile 命令使用了 service.browser_logins.profile_dir
+        assert any(f'--user-data-dir={profile_dir}' in arg for arg in launched_cmds[0])
+
+        cap = client.post('/api/admin/sessions/browser-workspace/capture')
+        assert cap.status_code == 200 and cap.json()['requested'] is True
+        done = {}
+        for _ in range(40):
+            done = client.get(f'/api/admin/sessions/browser-status/{attempt_id}').json()
+            if done['state'] == 'COMPLETED':
+                break
+            time.sleep(0.01)
+        assert done['state'] == 'COMPLETED'
+        assert set(done['synced_platforms']) == {'X (Twitter)', '哔哩哔哩', 'Pixiv'}
+        assert profile_dir.exists() and (profile_dir / 'Local State').is_file()
+
+        # 2. 关闭窗口后，直接用 --headless=new 一键免密同步持久档案中的已登录平台（且不误入未登录抖音）
+        client.delete('/api/admin/sessions/X (Twitter)')
+        assert service.sessions.status('X (Twitter)')['state'] == 'MISSING'
+
+        sync_res = client.post('/api/admin/sessions/browser-profile/sync', json={'include_manual': False})
+        assert sync_res.status_code == 200
+        sync_body = sync_res.json()
+        assert sync_body['used_headless'] is True
+        assert '--headless=new' in launched_cmds[-1]
+        # 之前已在库确认过的 Pixiv 会跟着免密续签，可靠标记 X 和 B 站同步入库，未登录抖音不会误存
+        assert {'X (Twitter)', '哔哩哔哩', 'Pixiv'}.issubset(set(sync_body['synced_platforms']))
+        assert service.sessions.status('X (Twitter)')['state'] == 'IMPORTED'
+        assert service.sessions.status('抖音')['state'] == 'MISSING'
+
+        # 3. 验证 UI 暴露持久档案标志而 Agent API 严格不暴露
+        ui_item = next(s for s in client.get('/api/admin/sessions').json() if s['platform'] == 'X (Twitter)')
+        assert ui_item['browser_profile_persistent'] is True and ui_item['browser_profile_exists'] is True
+        assert ui_item['ui']['source'] in ('browser_sync', 'browser_manual')
+        agent_resp = client.post('/api/tools/list_cookie_statuses', json={}).json()
+        assert 'browser_profile' not in json.dumps(agent_resp) and 'x-persist-secret' not in json.dumps(agent_resp)
+
+        # 4. 清理托管浏览器档案只清空档案，绝不误删已加密保存到会话库中的凭据
+        reset_res = client.post('/api/admin/sessions/browser-profile/reset')
+        assert reset_res.status_code == 200 and reset_res.json()['cleared'] is True
+        assert not (profile_dir / 'Local State').exists()
+        assert service.sessions.status('X (Twitter)')['state'] == 'IMPORTED'
+
+
 def test_bridge_auto_discovery_and_scan(service):
     with TestClient(create_app(service)) as client:
         # 注册模拟 AstrBot 桥接心跳

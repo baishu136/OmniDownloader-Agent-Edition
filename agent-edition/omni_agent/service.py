@@ -14,8 +14,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import __version__
 from .bridges import BridgeRegistry
-from .config import Config, Settings
+from .config import Config, Settings, private_dir
 from .cookie_login import (
+    MULTI_PLATFORM_KEY,
     BilibiliQRLoginManager,
     LocalBrowserLoginManager,
     PLATFORM_LOGIN_POLICIES,
@@ -121,7 +122,7 @@ class Service:
         self.analysis_slots = asyncio.Semaphore(2)
         self.bridges = BridgeRegistry()
         self.qr_logins = BilibiliQRLoginManager()
-        self.browser_logins = LocalBrowserLoginManager()
+        self.browser_logins = LocalBrowserLoginManager(profile_dir=private_dir(self.config.directory / 'browser-profile'))
         self._startup_probe = None
 
     async def start(self):
@@ -317,6 +318,9 @@ class Service:
             info['login_hint'] = policy.get('hint', '')
             info['auto_capture'] = bool(policy.get('auto_capture'))
             info['has_qr'] = platform == '哔哩哔哩'
+            info['browser_profile_persistent'] = self.browser_logins.profile_dir is not None
+            info['browser_profile_exists'] = self.browser_logins.has_profile_data()
+            info['browser_profile_active'] = self.browser_logins.is_shared_browser_active()
         return info
 
     def _resolve_cookie_targets(self, platform):
@@ -411,14 +415,42 @@ class Service:
             'session': session,
         }
 
+    async def _save_captured_batch(self, targets: list[dict], *, mode: str = 'sync') -> list[str]:
+        """批量保存从持久化托管浏览器捕获的多平台 Cookie。"""
+        source_map = {
+            'auto': 'browser_auto',
+            'manual': 'browser_manual',
+            'salvaged': 'browser_salvage',
+            'sync': 'browser_sync',
+        }
+        source = source_map.get(mode, 'browser_sync')
+        saved = []
+        for item in targets:
+            plat = item.get('platform')
+            netscape = item.get('netscape')
+            if not plat or not netscape or plat not in self.domains:
+                continue
+            try:
+                self.import_cookie(plat, netscape, source=source)
+                saved.append(plat)
+            except AgentError:
+                continue
+            if plat in ('哔哩哔哩', 'Pixiv'):
+                try:
+                    await self.verify_cookie(plat)
+                except AgentError:
+                    pass
+        return saved
+
     async def start_browser_login(self, platform: str):
-        if platform not in self.domains:
+        if platform != MULTI_PLATFORM_KEY and platform not in self.domains:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
 
         source_map = {
             'auto': 'browser_auto',
             'manual': 'browser_manual',
             'salvaged': 'browser_salvage',
+            'sync': 'browser_sync',
         }
 
         async def _on_capture(target_platform: str, netscape: str, *, mode: str = 'auto', report=None):
@@ -433,12 +465,31 @@ class Service:
                     return '在线校验暂不可达，凭据已保存启用'
             return ''
 
+        allowed = () if platform == MULTI_PLATFORM_KEY else self.domains[platform]
         return await self.browser_logins.start(
             platform,
             self.config.settings.proxy,
-            self.domains[platform],
+            allowed,
             on_capture=_on_capture,
+            domains=self.domains,
+            on_capture_many=self._save_captured_batch,
         )
+
+    async def start_multi_browser_login(self):
+        return await self.start_browser_login(MULTI_PLATFORM_KEY)
+
+    async def sync_browser_profile(self, *, include_manual: bool = False):
+        existing_imported = {p for p in self.domains if self.sessions.status(p)['state'] == 'IMPORTED'}
+        return await self.browser_logins.sync_from_profile(
+            self.config.settings.proxy,
+            self.domains,
+            existing_imported,
+            include_manual=include_manual,
+            on_capture_many=self._save_captured_batch,
+        )
+
+    async def reset_browser_profile(self):
+        return await self.browser_logins.reset_profile()
 
     async def open_login_page(self, platform: str):
         return await asyncio.to_thread(open_in_default_browser, platform)

@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 let settings = {}, bots = [], mcpConfig = {}, sessionsData = [];
 let selectedPlatform = '';
 let noticeTimer, refreshTimer, autoSaveTimer, qrTimer, browserLoginTimer;
-let activeQrId = '', activeBrowserAttempt = '', activeBrowserPlatform = '';
+let activeQrId = '', activeBrowserAttempt = '', activeBrowserPlatform = '', activeBrowserMulti = false;
 let sessionActivityByPlatform = {};
 let dirModalTargetEl = null, dirModalCurrent = '', dirModalParent = '';
 let savingPromise = Promise.resolve();
@@ -368,7 +368,9 @@ function stopBrowserPoll() {
   clearInterval(browserLoginTimer);
   activeBrowserAttempt = '';
   activeBrowserPlatform = '';
+  activeBrowserMulti = false;
   $('browser-login-panel').hidden = true;
+  $('browser-ready-platforms').hidden = true;
 }
 
 function renderQrState(data) {
@@ -392,7 +394,8 @@ function renderQrState(data) {
 }
 
 function renderBrowserLoginState(st) {
-  $('browser-status-title').textContent = `${st.platform} · ${st.browser_name || '本地浏览器'}`;
+  const titleName = st.multi_platform ? '多平台托管工作窗' : st.platform;
+  $('browser-status-title').textContent = `${titleName} · ${st.browser_name || '本地浏览器'}`;
   const stagePill = $('browser-stage-pill');
   const stageClassMap = {
     LAUNCHING: 'info',
@@ -440,7 +443,9 @@ function renderBrowserLoginState(st) {
     ],
     [
       st.marker_detected ? 'ok' : '',
-      st.marker_detected ? '已识别核心登录标记' : (st.auto_capture ? '等待登录态标记' : '需登录后手动抓取'),
+      st.marker_detected
+        ? (st.multi_platform ? '已识别平台登录态' : '已识别核心登录标记')
+        : (st.multi_platform ? '等待任意平台登录' : (st.auto_capture ? '等待登录态标记' : '需登录后手动抓取')),
     ],
     ['', `已用 ${st.elapsed_seconds || 0}s`],
   ];
@@ -450,6 +455,23 @@ function renderBrowserLoginState(st) {
     chip.textContent = text;
     telemetry.append(chip);
   }
+
+  const readyWrap = $('browser-ready-platforms');
+  readyWrap.replaceChildren();
+  if (st.multi_platform && Array.isArray(st.ready_platforms) && st.ready_platforms.length) {
+    readyWrap.hidden = false;
+    for (const item of st.ready_platforms) {
+      const pChip = document.createElement('span');
+      pChip.className = 'probe-chip' + (item.marker_detected ? ' ok' : '');
+      const tag = item.auto_sync_ready ? '已就绪' : (item.marker_detected ? '可保存' : '基础Cookie');
+      pChip.textContent = `${item.platform} · ${item.cookie_count}项（${tag}）`;
+      readyWrap.append(pChip);
+    }
+  } else {
+    readyWrap.hidden = true;
+  }
+
+  $('browser-manual-capture').textContent = st.multi_platform ? '保存全部已登录平台' : '我已登录，抓取保存';
   $('browser-status-text').textContent = st.message || '';
 }
 
@@ -506,12 +528,10 @@ async function startBilibiliQrLogin() {
   }, 1500);
 }
 
-async function startBrowserLogin(platform) {
-  stopBrowserPoll();
-  setSessionActivity(platform, 'info', '启动登录', `正在启动本地浏览器独立窗口登录 ${platform}...`);
-  const res = await api('sessions/' + encodeURIComponent(platform) + '/browser-login', 'POST');
+function pollBrowserAttempt(res, targetPlatform, isMulti) {
   activeBrowserAttempt = res.attempt_id;
-  activeBrowserPlatform = platform;
+  activeBrowserPlatform = targetPlatform;
+  activeBrowserMulti = isMulti;
   renderBrowserLoginState(res);
   $('browser-login-panel').hidden = false;
 
@@ -522,25 +542,40 @@ async function startBrowserLogin(platform) {
       renderBrowserLoginState(st);
       if (st.state === 'COMPLETED') {
         stopBrowserPoll();
-        const msg = st.message || `${platform} Cookie 已通过本地浏览器保存`;
-        const badge = st.capture_mode === 'salvaged' ? '关窗兜底保存' : '抓取成功';
-        setSessionActivity(platform, 'ok', badge, msg);
+        const msg = st.message || `${targetPlatform} Cookie 已通过本地浏览器保存`;
+        const badge = st.capture_mode === 'salvaged' ? '关窗兜底保存' : (isMulti ? '批量同步成功' : '抓取成功');
+        setSessionActivity(targetPlatform, 'ok', badge, msg);
         notify(msg);
         await loadSessions();
       } else if (st.state === 'CANCELLED' || st.state === 'FAILED') {
         stopBrowserPoll();
         if (st.state === 'FAILED') {
           const errMsg = st.error || st.message || '本地浏览器登录失败';
-          setSessionActivity(platform, 'err', '抓取失败', errMsg);
+          setSessionActivity(targetPlatform, 'err', '抓取失败', errMsg);
           notify(errMsg, true);
         } else {
-          setSessionActivity(platform, 'warn', '窗口已关闭', st.message || '已取消或关闭浏览器登录窗口');
+          setSessionActivity(targetPlatform, 'warn', '窗口已关闭', st.message || '已取消或关闭浏览器登录窗口');
         }
       }
     } catch {
       stopBrowserPoll();
     }
   }, 700);
+}
+
+async function startBrowserLogin(platform) {
+  stopBrowserPoll();
+  setSessionActivity(platform, 'info', '启动登录', `正在启动持久化托管浏览器登录 ${platform}...`);
+  const res = await api('sessions/' + encodeURIComponent(platform) + '/browser-login', 'POST');
+  pollBrowserAttempt(res, platform, false);
+}
+
+async function startMultiBrowserLogin() {
+  stopBrowserPoll();
+  const displayTarget = selectedPlatform || '哔哩哔哩';
+  setSessionActivity(displayTarget, 'info', '启动多平台窗', '正在打开持久化托管浏览器，可一次性登录并同步多个平台...');
+  const res = await api('sessions/browser-workspace/start', 'POST');
+  pollBrowserAttempt(res, displayTarget, true);
 }
 
 function renderSessionCard() {
@@ -604,6 +639,7 @@ function renderSessionCard() {
     browser_auto: '本地浏览器自动捕获',
     browser_manual: '本地浏览器手动抓取',
     browser_salvage: '本地浏览器关窗兜底保存',
+    browser_sync: '托管浏览器免密同步',
     qr: 'B站官方扫码',
     import: '手动文件/文本导入',
   };
@@ -621,6 +657,25 @@ function renderSessionCard() {
   }
   $('session-meta-hint').textContent = metaParts.join(' · ');
   renderSessionActivity(current.platform);
+
+  const profilePill = $('browser-profile-pill');
+  const hasBrowser = current.local_browser_available !== false;
+  if (!hasBrowser) {
+    profilePill.textContent = '无本机 Chrome/Edge';
+    profilePill.className = 'status-pill';
+  } else if (current.browser_profile_active) {
+    profilePill.textContent = '托管窗口运行中';
+    profilePill.className = 'status-pill ok';
+  } else if (current.browser_profile_exists) {
+    profilePill.textContent = '已建立持久档案（可免密同步）';
+    profilePill.className = 'status-pill info';
+  } else {
+    profilePill.textContent = '首次登录将自动保留档案';
+    profilePill.className = 'status-pill';
+  }
+  $('browser-workspace-start').disabled = !hasBrowser;
+  $('browser-profile-sync').disabled = !hasBrowser || (!current.browser_profile_exists && !current.browser_profile_active);
+  $('browser-profile-reset').disabled = !current.browser_profile_exists && !current.browser_profile_active;
 
   $('session-clear').disabled = current.state === 'MISSING' && current.enabled;
   $('session-verify').disabled = current.state === 'MISSING' || !current.enabled;
@@ -1106,6 +1161,45 @@ $('session-browser-login').addEventListener('click', () => action($('session-bro
   await startBrowserLogin(selectedPlatform);
 }));
 
+$('browser-workspace-start').addEventListener('click', () => action($('browser-workspace-start'), async () => {
+  await startMultiBrowserLogin();
+}));
+
+$('browser-profile-sync').addEventListener('click', () => action($('browser-profile-sync'), async () => {
+  const target = selectedPlatform;
+  setSessionActivity(target, 'info', '免密同步中', '正在从持久化托管浏览器读取并同步全部已登录平台 Cookie...');
+  try {
+    const res = await api('sessions/browser-profile/sync', 'POST', {include_manual: false});
+    const synced = res.synced_platforms || [];
+    const skipped = res.skipped_platforms || [];
+    if (synced.length) {
+      const modeTip = res.used_headless ? '后台无感同步完成' : '实时同步完成';
+      const skipTip = skipped.length ? `；另有 ${skipped.join('、')} 需在对应平台手动点“抓取保存”` : '';
+      const msg = `${modeTip}：已更新 ${synced.join('、')}（共 ${res.total_cookies || 0} 项 Cookie）${skipTip}`;
+      setSessionActivity(target, 'ok', '免密同步成功', msg);
+      notify(msg);
+    } else {
+      const msg = skipped.length
+        ? `仅发现 ${skipped.join('、')} 的基础或待确认 Cookie，请打开“多平台批量登录”完成账号登录`
+        : '托管浏览器中暂未发现有效平台登录态，请先点击“多平台批量登录”完成登录';
+      setSessionActivity(target, 'warn', '暂无可同步平台', msg);
+      notify(msg, true);
+    }
+    await loadSessions();
+  } catch (err) {
+    setSessionActivity(target, 'err', '同步失败', err.message);
+    throw err;
+  }
+}));
+
+$('browser-profile-reset').addEventListener('click', () => action($('browser-profile-reset'), async () => {
+  if (!confirm('确定清空专用托管浏览器的缓存与登录档案吗？（不影响你的日常主浏览器，也不清除已加密保存进会话库的 Cookie）')) return;
+  await api('sessions/browser-profile/reset', 'POST');
+  setSessionActivity(selectedPlatform, 'warn', '已清理浏览器档案', '专用托管浏览器档案已重置为空白状态，不影响已加密保存的会话库');
+  notify('托管浏览器档案已清空');
+  await loadSessions();
+}));
+
 $('session-open-browser').addEventListener('click', () => action($('session-open-browser'), async () => {
   const target = selectedPlatform;
   const res = await api('sessions/' + encodeURIComponent(target) + '/open-login', 'POST');
@@ -1119,8 +1213,11 @@ $('session-open-browser').addEventListener('click', () => action($('session-open
 }));
 
 $('browser-manual-capture').addEventListener('click', () => action($('browser-manual-capture'), async () => {
-  if (!activeBrowserPlatform) return;
-  await api('sessions/' + encodeURIComponent(activeBrowserPlatform) + '/browser-capture', 'POST');
+  if (!activeBrowserAttempt) return;
+  const path = activeBrowserMulti
+    ? 'sessions/browser-workspace/capture'
+    : 'sessions/' + encodeURIComponent(activeBrowserPlatform) + '/browser-capture';
+  await api(path, 'POST');
   $('browser-stage-pill').className = 'status-pill info';
   $('browser-stage-pill').textContent = '即时抓取中';
   $('browser-status-text').textContent = '已触发即时抓取指令，正在读取当前会话完整 Cookie 并加密保存...';
@@ -1128,9 +1225,12 @@ $('browser-manual-capture').addEventListener('click', () => action($('browser-ma
 
 $('browser-cancel').addEventListener('click', () => action($('browser-cancel'), async () => {
   const target = activeBrowserPlatform || selectedPlatform;
-  await api('sessions/' + encodeURIComponent(target) + '/browser-cancel', 'POST');
+  const path = activeBrowserMulti
+    ? 'sessions/browser-workspace/cancel'
+    : 'sessions/' + encodeURIComponent(target) + '/browser-cancel';
+  await api(path, 'POST');
   stopBrowserPoll();
-  setSessionActivity(target, 'warn', '已关闭登录窗', `已取消并关闭 ${target} 的本地浏览器登录窗口`);
+  setSessionActivity(target, 'warn', '已关闭登录窗', '已取消并关闭本地托管浏览器登录窗口');
 }));
 
 $('session-qr-login').addEventListener('click', () => action($('session-qr-login'), startBilibiliQrLogin));

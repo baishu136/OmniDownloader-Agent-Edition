@@ -235,7 +235,7 @@
     </form>
 
     <section id="sessions">
-      <div class="section-heading"><span>05</span><div><h2>平台 Cookie 与会话登录</h2><p>支持官方扫码、拉起本机 Chrome / Edge 临时会话自动读取、默认浏览器打开以及多格式加密导入；Agent 仅可查看非敏感状态、禁用或移除。</p></div></div>
+      <div class="section-heading"><span>05</span><div><h2>平台 Cookie 与会话登录</h2><p>支持持久化专属托管浏览器（一次登录长期免密续签与多平台批量同步）、官方扫码、默认浏览器打开以及多格式加密导入；Agent 仅可查看非敏感状态、禁用或移除。</p></div></div>
       <div class="session-card">
         <div class="session-picker-row">
           <div>
@@ -245,6 +245,20 @@
           <select id="cookie-platform" aria-label="选择平台"></select>
         </div>
         <div id="session-overview" class="session-chips"></div>
+        <div class="workspace-bar">
+          <div>
+            <div class="login-title-group">
+              <strong>持久化托管浏览器</strong>
+              <span id="browser-profile-pill" class="status-pill">未建立档案</span>
+            </div>
+            <small id="browser-profile-hint">专用隔离目录（不触碰日常浏览器）；首次登录后长期保留会话，支持免密续签与批量同步。</small>
+          </div>
+          <div class="actions tight">
+            <button id="browser-workspace-start" type="button">多平台批量登录</button>
+            <button id="browser-profile-sync" type="button" class="primary">一键免密同步</button>
+            <button id="browser-profile-reset" type="button">清理浏览器档案</button>
+          </div>
+        </div>
         <div class="switches sub-switches">
           <label>
             <span>禁用 Cookie<small id="session-disable-desc">仅影响当前平台的后续解析与下载；已保存会话继续加密保留</small></span>
@@ -292,7 +306,8 @@
             <span data-step="save">4. 加密入库</span>
           </div>
           <div id="browser-telemetry" class="capture-telemetry"></div>
-          <p id="browser-status-text" class="hint">请在弹出的本机浏览器独立临时窗口中完成登录；具备明确登录标记的平台会在登录完成后自动读取保存并关闭窗口。</p>
+          <div id="browser-ready-platforms" class="capture-telemetry" hidden></div>
+          <p id="browser-status-text" class="hint">请在弹出的本机浏览器独立窗口中完成登录；首次登录后会话档案将持久化保留，支持后续免密续签。</p>
         </div>
 
         <div id="qr-login-panel" class="login-subpanel qr-panel" hidden>
