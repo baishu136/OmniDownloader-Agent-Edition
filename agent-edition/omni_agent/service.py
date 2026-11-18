@@ -306,11 +306,16 @@ class Service:
         }
         if include_ui:
             browser = find_local_browser()
-            info['ui'] = inspect_cookie_meta(self.sessions, platform)
+            policy = PLATFORM_LOGIN_POLICIES.get(platform, {})
+            meta = inspect_cookie_meta(self.sessions, platform)
+            meta['source'] = validation.get('source', '') if status['state'] == 'IMPORTED' else ''
+            meta['updated_at'] = validation.get('updated_at') if status['state'] == 'IMPORTED' else None
+            info['ui'] = meta
             info['local_browser_available'] = browser is not None
             info['local_browser_name'] = browser['name'] if browser else ''
-            info['login_url'] = PLATFORM_LOGIN_POLICIES.get(platform, {}).get('start_url', '')
-            info['login_hint'] = PLATFORM_LOGIN_POLICIES.get(platform, {}).get('hint', '')
+            info['login_url'] = policy.get('start_url', '')
+            info['login_hint'] = policy.get('hint', '')
+            info['auto_capture'] = bool(policy.get('auto_capture'))
             info['has_qr'] = platform == '哔哩哔哩'
         return info
 
@@ -337,7 +342,7 @@ class Service:
             self.vault.put(self._validation_key(site), '{"state":"MISSING"}')
         return {'platforms': [self._session_info(site) for site in targets]}
 
-    def import_cookie(self, platform, text):
+    def import_cookie(self, platform, text, *, source='import'):
         """仅限用户管理页调用：加密导入或更新平台 Cookie 并默认启用。"""
         if platform not in self.domains:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
@@ -347,7 +352,10 @@ class Service:
         except (ValueError, OSError):
             raise AgentError('INVALID_COOKIE', 'Cookie文件无效或不包含此平台有效凭据') from None
         self.sessions.set_enabled(platform, True)
-        self.vault.put(self._validation_key(platform), '{"state":"UNVERIFIED"}')
+        self.vault.put(
+            self._validation_key(platform),
+            json.dumps({'state': 'UNVERIFIED', 'source': source, 'updated_at': time.time()}),
+        )
         return self._session_info(platform, include_ui=True)
 
     def set_cookie_enabled(self, platform, enabled):
@@ -363,9 +371,17 @@ class Service:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
         if not self.sessions.is_enabled(platform):
             raise AgentError('COOKIE_DISABLED', '当前平台 Cookie 已禁用，请先启用后再检测')
+        prev_raw = self.vault.get(self._validation_key(platform))
+        prev = json.loads(prev_raw) if prev_raw else {}
         result = await self.runner.call({'action': 'verify_session', 'platform': platform})
-        result['checked_at'] = time.time()
-        self.vault.put(self._validation_key(platform), json.dumps(result))
+        checked_at = time.time()
+        result['checked_at'] = checked_at
+        stored = dict(result)
+        if prev.get('source'):
+            stored['source'] = prev['source']
+        if prev.get('updated_at'):
+            stored['updated_at'] = prev['updated_at']
+        self.vault.put(self._validation_key(platform), json.dumps(stored))
         return result
 
     # -------------------- 扫码 / 本地浏览器登录与桥接自动发现 --------------------
@@ -377,25 +393,45 @@ class Service:
         res = await asyncio.to_thread(self.qr_logins.poll, qr_id)
         if res.get('status') != 'confirmed':
             return res
-        session = self.import_cookie('哔哩哔哩', res['netscape'])
+        session = self.import_cookie('哔哩哔哩', res['netscape'], source='qr')
+        verify_note = ''
         try:
-            await self.verify_cookie('哔哩哔哩')
+            ver = await self.verify_cookie('哔哩哔哩')
             session = self._session_info('哔哩哔哩', include_ui=True)
+            verify_note = '（账号在线校验有效）' if ver.get('state') == 'VALID' else ''
         except AgentError:
-            pass
-        return {'status': 'confirmed', 'message': '哔哩哔哩扫码登录成功并已加密保存', 'session': session}
+            verify_note = '（在线校验暂不可达，凭据已先行加密启用）'
+        return {
+            'status': 'confirmed',
+            'stage': 'COMPLETED',
+            'stage_label': '扫码登录完成',
+            'progress': 100,
+            'cookie_count': session.get('ui', {}).get('cookie_count', res.get('cookie_count', 0)),
+            'message': f'哔哩哔哩扫码登录成功并已加密保存{verify_note}',
+            'session': session,
+        }
 
     async def start_browser_login(self, platform: str):
         if platform not in self.domains:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
 
-        async def _on_capture(target_platform: str, netscape: str):
-            self.import_cookie(target_platform, netscape)
+        source_map = {
+            'auto': 'browser_auto',
+            'manual': 'browser_manual',
+            'salvaged': 'browser_salvage',
+        }
+
+        async def _on_capture(target_platform: str, netscape: str, *, mode: str = 'auto', report=None):
+            self.import_cookie(target_platform, netscape, source=source_map.get(mode, 'browser_auto'))
             if target_platform in ('哔哩哔哩', 'Pixiv'):
+                if report:
+                    report('VERIFYING', f'凭据已保存，正在在线验证 {target_platform} 登录有效性...')
                 try:
-                    await self.verify_cookie(target_platform)
+                    ver = await self.verify_cookie(target_platform)
+                    return '账号在线校验有效' if ver.get('state') == 'VALID' else '已捕获并保存，建议点“检测”确认身份'
                 except AgentError:
-                    pass
+                    return '在线校验暂不可达，凭据已保存启用'
+            return ''
 
         return await self.browser_logins.start(
             platform,

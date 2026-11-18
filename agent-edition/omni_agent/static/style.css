@@ -546,6 +546,80 @@ input[type=checkbox]:checked:after { background: #fff; transform: translateX(18p
   flex-wrap: wrap;
   gap: 10px;
 }
+.login-title-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.capture-activity {
+  margin-top: 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 13px;
+}
+.capture-activity[hidden] { display: none; }
+.capture-activity.ok { border-color: var(--success); background: var(--success-bg); }
+.capture-activity.warn { border-color: var(--warn); background: var(--warn-bg); }
+.capture-activity.err { border-color: var(--error); background: var(--error-bg); }
+.capture-activity-text { flex: 1 1 220px; color: var(--text); }
+.capture-progress {
+  margin: 12px 0 10px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface);
+  overflow: hidden;
+  border: 1px solid var(--line);
+}
+.capture-progress-bar {
+  height: 100%;
+  width: 15%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width .35s ease;
+}
+.capture-steps {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.capture-steps > span {
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  text-align: center;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted);
+  transition: background-color .2s ease, color .2s ease, border-color .2s ease;
+}
+.capture-steps > span.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.capture-steps > span.done {
+  border-color: var(--success);
+  background: var(--success-bg);
+  color: var(--success);
+  font-weight: 600;
+}
+.capture-telemetry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+@media (max-width: 500px) {
+  .capture-steps { grid-template-columns: 1fr 1fr; }
+}
 .qr-panel {
   display: flex;
   gap: 18px;
@@ -560,7 +634,7 @@ input[type=checkbox]:checked:after { background: #fff; transform: translateX(18p
   flex: 0 0 auto;
 }
 .qr-meta { flex: 1 1 240px; }
-.qr-meta strong { display: block; font-size: 15px; margin-bottom: 6px; }
+.qr-meta strong { font-size: 15px; }
 
 /* 已识别桥接与 Bot 连接信息摘要卡片 */
 .bridge-grid, .bot-summary-grid {

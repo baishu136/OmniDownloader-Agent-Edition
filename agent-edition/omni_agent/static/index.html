@@ -266,21 +266,46 @@
           </div>
         </div>
 
+        <div id="session-activity-box" class="capture-activity" hidden>
+          <span id="session-activity-badge" class="status-pill info">状态</span>
+          <span id="session-activity-text" class="capture-activity-text"></span>
+        </div>
+
         <div id="browser-login-panel" class="login-subpanel" hidden>
           <div class="login-subpanel-head">
-            <strong id="browser-status-title">本地浏览器登录窗口已打开</strong>
+            <div class="login-title-group">
+              <strong id="browser-status-title">本地浏览器登录窗口已打开</strong>
+              <span id="browser-stage-pill" class="status-pill info">正在启动</span>
+            </div>
             <div class="actions tight">
               <button id="browser-manual-capture" type="button" class="primary">我已登录，抓取保存</button>
               <button id="browser-cancel" type="button">关闭窗口</button>
             </div>
           </div>
+          <div class="capture-progress" aria-hidden="true">
+            <div id="browser-progress-bar" class="capture-progress-bar"></div>
+          </div>
+          <div id="browser-steps" class="capture-steps">
+            <span data-step="launch">1. 启动浏览器</span>
+            <span data-step="connect">2. 读取通道</span>
+            <span data-step="capture">3. 登录抓包</span>
+            <span data-step="save">4. 加密入库</span>
+          </div>
+          <div id="browser-telemetry" class="capture-telemetry"></div>
           <p id="browser-status-text" class="hint">请在弹出的本机浏览器独立临时窗口中完成登录；具备明确登录标记的平台会在登录完成后自动读取保存并关闭窗口。</p>
         </div>
 
         <div id="qr-login-panel" class="login-subpanel qr-panel" hidden>
           <canvas id="qr-canvas" width="180" height="180" aria-label="哔哩哔哩登录二维码"></canvas>
           <div class="qr-meta">
-            <strong>哔哩哔哩官方扫码登录</strong>
+            <div class="login-title-group">
+              <strong>哔哩哔哩官方扫码登录</strong>
+              <span id="qr-stage-pill" class="status-pill info">等待扫码</span>
+              <span id="qr-countdown-badge" class="probe-chip">剩余 180s</span>
+            </div>
+            <div class="capture-progress" aria-hidden="true">
+              <div id="qr-progress-bar" class="capture-progress-bar"></div>
+            </div>
             <p id="qr-status-text">请使用手机哔哩哔哩 App 扫描二维码</p>
             <div class="actions tight">
               <button id="qr-refresh" type="button">刷新二维码</button>

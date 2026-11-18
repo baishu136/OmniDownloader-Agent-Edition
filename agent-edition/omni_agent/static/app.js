@@ -4,6 +4,7 @@ let settings = {}, bots = [], mcpConfig = {}, sessionsData = [];
 let selectedPlatform = '';
 let noticeTimer, refreshTimer, autoSaveTimer, qrTimer, browserLoginTimer;
 let activeQrId = '', activeBrowserAttempt = '', activeBrowserPlatform = '';
+let sessionActivityByPlatform = {};
 let dirModalTargetEl = null, dirModalCurrent = '', dirModalParent = '';
 let savingPromise = Promise.resolve();
 const bytes = v => `${(v / 1024 / 1024).toFixed(1)} MiB`;
@@ -335,6 +336,28 @@ function empty(container, text) {
 
 // -------------------- Cookie 登录与会话管理 --------------------
 
+function setSessionActivity(platform, kind, badge, text) {
+  if (!platform) return;
+  sessionActivityByPlatform[platform] = {kind, badge, text};
+  if (platform === selectedPlatform) renderSessionActivity(platform);
+}
+
+function renderSessionActivity(platform) {
+  const box = $('session-activity-box');
+  const badgeEl = $('session-activity-badge');
+  const textEl = $('session-activity-text');
+  const entry = sessionActivityByPlatform[platform];
+  if (!entry) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  box.className = 'capture-activity ' + (entry.kind || '');
+  badgeEl.className = 'status-pill ' + (entry.kind || 'info');
+  badgeEl.textContent = entry.badge || '状态';
+  textEl.textContent = entry.text || '';
+}
+
 function stopQrLogin() {
   clearInterval(qrTimer);
   activeQrId = '';
@@ -346,6 +369,88 @@ function stopBrowserPoll() {
   activeBrowserAttempt = '';
   activeBrowserPlatform = '';
   $('browser-login-panel').hidden = true;
+}
+
+function renderQrState(data) {
+  const pill = $('qr-stage-pill');
+  const bar = $('qr-progress-bar');
+  const timerChip = $('qr-countdown-badge');
+  const stageClass = {
+    waiting: 'info',
+    scanned: 'ok',
+    confirmed: 'ok',
+    expired: 'err',
+    error: 'err',
+  };
+  pill.className = 'status-pill ' + (stageClass[data.status] || 'info');
+  pill.textContent = data.stage_label || '等待扫码';
+  const pct = Number(data.progress ?? (data.status === 'scanned' ? 75 : data.status === 'confirmed' ? 100 : 35));
+  bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  if (typeof data.remaining_seconds === 'number') {
+    timerChip.textContent = data.remaining_seconds > 0 ? `剩余 ${data.remaining_seconds}s` : '已失效';
+  }
+}
+
+function renderBrowserLoginState(st) {
+  $('browser-status-title').textContent = `${st.platform} · ${st.browser_name || '本地浏览器'}`;
+  const stagePill = $('browser-stage-pill');
+  const stageClassMap = {
+    LAUNCHING: 'info',
+    CONNECTING: 'info',
+    WAITING_LOGIN: 'info',
+    CAPTURING: 'info',
+    CONFIRMING: 'ok',
+    SAVING: 'ok',
+    VERIFYING: 'ok',
+    COMPLETED: 'ok',
+    CANCELLED: 'warn',
+    FAILED: 'err',
+  };
+  stagePill.className = 'status-pill ' + (stageClassMap[st.stage] || 'info');
+  stagePill.textContent = st.stage_label || '处理中';
+
+  const pct = Number(st.progress ?? 20);
+  $('browser-progress-bar').style.width = `${Math.max(5, Math.min(100, pct))}%`;
+
+  const stepOrder = ['launch', 'connect', 'capture', 'save'];
+  const stageToIndex = {
+    LAUNCHING: 0,
+    CONNECTING: 1,
+    WAITING_LOGIN: 2,
+    CAPTURING: 2,
+    CONFIRMING: 2,
+    SAVING: 3,
+    VERIFYING: 3,
+    COMPLETED: 4,
+  };
+  const currentIdx = stageToIndex[st.stage] ?? 0;
+  for (const el of $('browser-steps').children) {
+    const idx = stepOrder.indexOf(el.dataset.step);
+    el.className = idx < currentIdx ? 'done' : idx === currentIdx ? 'active' : '';
+  }
+
+  const telemetry = $('browser-telemetry');
+  telemetry.replaceChildren();
+  const chips = [
+    [st.cdp_connected ? 'ok' : '', st.cdp_connected ? 'CDP 通道已连接' : '正在建立通道'],
+    [st.current_host ? 'ok' : '', st.current_host ? `当前域：${st.current_host}` : '等待页面域'],
+    [
+      st.cookie_count > 0 ? (st.marker_detected ? 'ok' : '') : '',
+      st.cookie_count > 0 ? `已捕获 ${st.cookie_count} 项 Cookie` : '尚未检测到平台 Cookie',
+    ],
+    [
+      st.marker_detected ? 'ok' : '',
+      st.marker_detected ? '已识别核心登录标记' : (st.auto_capture ? '等待登录态标记' : '需登录后手动抓取'),
+    ],
+    ['', `已用 ${st.elapsed_seconds || 0}s`],
+  ];
+  for (const [cls, text] of chips) {
+    const chip = document.createElement('span');
+    chip.className = 'probe-chip' + (cls ? ' ' + cls : '');
+    chip.textContent = text;
+    telemetry.append(chip);
+  }
+  $('browser-status-text').textContent = st.message || '';
 }
 
 function drawQrMatrix(matrix) {
@@ -367,25 +472,35 @@ function drawQrMatrix(matrix) {
 
 async function startBilibiliQrLogin() {
   stopQrLogin();
+  setSessionActivity('哔哩哔哩', 'info', '生成二维码', '正在请求哔哩哔哩官方登录二维码...');
   const res = await api('sessions/bilibili/qr', 'POST');
   activeQrId = res.qr_id;
   drawQrMatrix(res.matrix);
+  renderQrState({status: 'waiting', stage_label: '等待扫码', progress: 25, remaining_seconds: res.expires_in || 180});
   $('qr-status-text').textContent = '请使用手机哔哩哔哩 App 扫描二维码';
   $('qr-login-panel').hidden = false;
+  setSessionActivity('哔哩哔哩', 'info', '等待扫码', '二维码已生成，请使用哔哩哔哩手机端扫码确认登录');
   qrTimer = setInterval(async () => {
     if (!activeQrId) return;
     try {
       const poll = await api('sessions/bilibili/qr/' + encodeURIComponent(activeQrId) + '/poll', 'POST');
+      renderQrState(poll);
       if (poll.message) $('qr-status-text').textContent = poll.message;
-      if (poll.status === 'confirmed') {
+      if (poll.status === 'scanned') {
+        setSessionActivity('哔哩哔哩', 'info', '已扫码', '手机已扫码，请在 App 上点击确认登录');
+      } else if (poll.status === 'confirmed') {
         stopQrLogin();
-        notify('哔哩哔哩扫码登录成功，凭据已加密保存并启用');
+        const msg = poll.message || '哔哩哔哩扫码登录成功，凭据已加密保存并启用';
+        setSessionActivity('哔哩哔哩', 'ok', '扫码登录成功', msg);
+        notify(msg);
         await loadSessions();
       } else if (poll.status === 'expired' || poll.status === 'error') {
         clearInterval(qrTimer);
+        setSessionActivity('哔哩哔哩', 'err', poll.status === 'expired' ? '二维码失效' : '扫码异常', poll.message || '请刷新二维码重试');
       }
     } catch (err) {
       $('qr-status-text').textContent = err.message;
+      setSessionActivity('哔哩哔哩', 'err', '扫码失败', err.message);
       clearInterval(qrTimer);
     }
   }, 1500);
@@ -393,30 +508,39 @@ async function startBilibiliQrLogin() {
 
 async function startBrowserLogin(platform) {
   stopBrowserPoll();
+  setSessionActivity(platform, 'info', '启动登录', `正在启动本地浏览器独立窗口登录 ${platform}...`);
   const res = await api('sessions/' + encodeURIComponent(platform) + '/browser-login', 'POST');
   activeBrowserAttempt = res.attempt_id;
   activeBrowserPlatform = platform;
-  $('browser-status-title').textContent = `${platform} · ${res.browser_name || '本地浏览器'}已打开`;
-  $('browser-status-text').textContent = res.message || '请在打开的本机浏览器独立窗口中完成登录...';
+  renderBrowserLoginState(res);
   $('browser-login-panel').hidden = false;
 
   browserLoginTimer = setInterval(async () => {
     if (!activeBrowserAttempt) return;
     try {
       const st = await api('sessions/browser-status/' + encodeURIComponent(activeBrowserAttempt));
-      $('browser-status-text').textContent = st.message || '';
+      renderBrowserLoginState(st);
       if (st.state === 'COMPLETED') {
         stopBrowserPoll();
-        notify(st.message || `${platform} Cookie 已通过本地浏览器保存`);
+        const msg = st.message || `${platform} Cookie 已通过本地浏览器保存`;
+        const badge = st.capture_mode === 'salvaged' ? '关窗兜底保存' : '抓取成功';
+        setSessionActivity(platform, 'ok', badge, msg);
+        notify(msg);
         await loadSessions();
       } else if (st.state === 'CANCELLED' || st.state === 'FAILED') {
         stopBrowserPoll();
-        if (st.state === 'FAILED') notify(st.error || st.message || '本地浏览器登录失败', true);
+        if (st.state === 'FAILED') {
+          const errMsg = st.error || st.message || '本地浏览器登录失败';
+          setSessionActivity(platform, 'err', '抓取失败', errMsg);
+          notify(errMsg, true);
+        } else {
+          setSessionActivity(platform, 'warn', '窗口已关闭', st.message || '已取消或关闭浏览器登录窗口');
+        }
       }
     } catch {
       stopBrowserPoll();
     }
-  }, 900);
+  }, 700);
 }
 
 function renderSessionCard() {
@@ -476,14 +600,27 @@ function renderSessionCard() {
 
   const meta = current.ui || {};
   const metaParts = [];
+  const sourceLabels = {
+    browser_auto: '本地浏览器自动捕获',
+    browser_manual: '本地浏览器手动抓取',
+    browser_salvage: '本地浏览器关窗兜底保存',
+    qr: 'B站官方扫码',
+    import: '手动文件/文本导入',
+  };
   if (meta.cookie_count) {
     metaParts.push(`共 ${meta.cookie_count} 项会话条目`);
     metaParts.push(meta.marker_present ? '包含核心登录标记' : '暂未检测到登录态标记');
+    if (meta.source) metaParts.push('来源：' + (sourceLabels[meta.source] || meta.source));
+    if (meta.updated_at) metaParts.push('保存于 ' + new Date(meta.updated_at * 1000).toLocaleTimeString());
     if (meta.earliest_expiry) {
       metaParts.push('最早有效期至 ' + new Date(meta.earliest_expiry * 1000).toLocaleDateString());
     }
   }
+  if (current.validation?.checked_at) {
+    metaParts.push('上次校验 ' + new Date(current.validation.checked_at * 1000).toLocaleTimeString());
+  }
   $('session-meta-hint').textContent = metaParts.join(' · ');
+  renderSessionActivity(current.platform);
 
   $('session-clear').disabled = current.state === 'MISSING' && current.enabled;
   $('session-verify').disabled = current.state === 'MISSING' || !current.enabled;
@@ -923,27 +1060,46 @@ $('cookie-platform').addEventListener('change', e => {
 
 $('session-disable-switch').addEventListener('change', async e => {
   const disable = e.target.checked;
+  const target = selectedPlatform;
   const suffix = disable ? '/disable' : '/enable';
   try {
-    await api('sessions/' + encodeURIComponent(selectedPlatform) + suffix, 'POST');
-    notify(disable ? `${selectedPlatform} Cookie 已禁用（会话仍加密保留）` : `${selectedPlatform} Cookie 已启用`);
+    await api('sessions/' + encodeURIComponent(target) + suffix, 'POST');
+    const msg = disable ? `${target} Cookie 已禁用（会话仍加密保留）` : `${target} Cookie 已启用`;
+    setSessionActivity(target, disable ? 'warn' : 'ok', disable ? '已禁用' : '已启用', msg);
+    notify(msg);
     await loadSessions();
   } catch (err) {
     e.target.checked = !disable;
+    setSessionActivity(target, 'err', '切换失败', err.message);
     notify(err.message, true);
   }
 });
 
 $('session-clear').addEventListener('click', () => action($('session-clear'), async () => {
-  await api('sessions/' + encodeURIComponent(selectedPlatform), 'DELETE');
-  notify(`${selectedPlatform} Cookie 已清除`);
+  const target = selectedPlatform;
+  await api('sessions/' + encodeURIComponent(target), 'DELETE');
+  setSessionActivity(target, 'warn', '已清除', `${target} Cookie 凭据已从本地加密存储中移除`);
+  notify(`${target} Cookie 已清除`);
   await loadSessions();
 }));
 
 $('session-verify').addEventListener('click', () => action($('session-verify'), async () => {
-  const result = await api('sessions/' + encodeURIComponent(selectedPlatform) + '/verify', 'POST');
-  notify(result.state === 'INVALID' ? '凭据已失效，请重新登录或导入' : `${selectedPlatform} 账号状态有效`);
-  await loadSessions();
+  const target = selectedPlatform;
+  setSessionActivity(target, 'info', '检测中', `正在在线校验 ${target} 登录凭据有效性...`);
+  try {
+    const result = await api('sessions/' + encodeURIComponent(target) + '/verify', 'POST');
+    if (result.state === 'INVALID') {
+      setSessionActivity(target, 'err', '凭据已失效', `${target} 账号校验未通过，请重新登录或导入有效 Cookie`);
+      notify('凭据已失效，请重新登录或导入', true);
+    } else {
+      setSessionActivity(target, 'ok', '检测有效', `${target} 登录态校验通过，凭据可正常使用`);
+      notify(`${target} 账号状态有效`);
+    }
+    await loadSessions();
+  } catch (err) {
+    setSessionActivity(target, 'err', '检测出错', err.message);
+    throw err;
+  }
 }));
 
 $('session-browser-login').addEventListener('click', () => action($('session-browser-login'), async () => {
@@ -951,50 +1107,75 @@ $('session-browser-login').addEventListener('click', () => action($('session-bro
 }));
 
 $('session-open-browser').addEventListener('click', () => action($('session-open-browser'), async () => {
-  const res = await api('sessions/' + encodeURIComponent(selectedPlatform) + '/open-login', 'POST');
+  const target = selectedPlatform;
+  const res = await api('sessions/' + encodeURIComponent(target) + '/open-login', 'POST');
   if (res.opened === false) {
+    setSessionActivity(target, 'warn', '需手动访问', `无法自动拉起系统默认浏览器，请手动打开：${res.url}`);
     notify('无法自动拉起系统默认浏览器，请手动访问：' + res.url, true);
   } else {
-    notify(`已在系统默认浏览器打开 ${selectedPlatform} 登录页；登录后可使用 Cookie-Editor 等插件导出并粘贴导入`);
+    setSessionActivity(target, 'info', '已外部打开', `已在系统默认浏览器打开 ${target} 登录页，登录后可使用浏览器扩展导出并粘贴保存`);
+    notify(`已在系统默认浏览器打开 ${target} 登录页；登录后可使用 Cookie-Editor 等插件导出并粘贴导入`);
   }
 }));
 
 $('browser-manual-capture').addEventListener('click', () => action($('browser-manual-capture'), async () => {
   if (!activeBrowserPlatform) return;
   await api('sessions/' + encodeURIComponent(activeBrowserPlatform) + '/browser-capture', 'POST');
-  $('browser-status-text').textContent = '已发送抓取保存指令，正在读取 Cookie 并加密保存...';
+  $('browser-stage-pill').className = 'status-pill info';
+  $('browser-stage-pill').textContent = '即时抓取中';
+  $('browser-status-text').textContent = '已触发即时抓取指令，正在读取当前会话完整 Cookie 并加密保存...';
 }));
 
 $('browser-cancel').addEventListener('click', () => action($('browser-cancel'), async () => {
   const target = activeBrowserPlatform || selectedPlatform;
   await api('sessions/' + encodeURIComponent(target) + '/browser-cancel', 'POST');
   stopBrowserPoll();
+  setSessionActivity(target, 'warn', '已关闭登录窗', `已取消并关闭 ${target} 的本地浏览器登录窗口`);
 }));
 
 $('session-qr-login').addEventListener('click', () => action($('session-qr-login'), startBilibiliQrLogin));
 $('qr-refresh').addEventListener('click', () => action($('qr-refresh'), startBilibiliQrLogin));
-$('qr-cancel').addEventListener('click', () => { stopQrLogin(); });
+$('qr-cancel').addEventListener('click', () => {
+  stopQrLogin();
+  setSessionActivity('哔哩哔哩', 'warn', '已取消扫码', '已取消本次哔哩哔哩二维码登录');
+});
 
 $('cookie-file').addEventListener('change', async e => {
   const file = e.target.files[0];
   if (!file) return;
+  const target = selectedPlatform;
+  setSessionActivity(target, 'info', '导入中', `正在解析并加密导入 ${target} Cookie 文件...`);
   try {
     const text = await file.text();
-    await api('sessions', 'POST', {platform: selectedPlatform, text});
+    const info = await api('sessions', 'POST', {platform: target, text});
     e.target.value = '';
-    notify(`${selectedPlatform} Cookie 文件已加密导入并启用`);
+    const count = info?.ui?.cookie_count || 0;
+    const msg = `${target} Cookie 文件已加密导入并启用${count ? `（共 ${count} 项）` : ''}`;
+    setSessionActivity(target, 'ok', '文件导入成功', msg);
+    notify(msg);
     await loadSessions();
   } catch (err) {
     e.target.value = '';
+    setSessionActivity(target, 'err', '导入失败', err.message);
     notify(err.message, true);
   }
 });
 
 $('import-cookie').addEventListener('click', () => action($('import-cookie'), async () => {
-  await api('sessions', 'POST', {platform: selectedPlatform, text: $('cookie-text').value});
-  $('cookie-text').value = '';
-  notify(`${selectedPlatform} 凭据已加密保存并启用`);
-  await loadSessions();
+  const target = selectedPlatform;
+  setSessionActivity(target, 'info', '保存中', `正在校验并加密保存 ${target} 凭据...`);
+  try {
+    const info = await api('sessions', 'POST', {platform: target, text: $('cookie-text').value});
+    $('cookie-text').value = '';
+    const count = info?.ui?.cookie_count || 0;
+    const msg = `${target} 凭据已加密保存并启用${count ? `（共 ${count} 项）` : ''}`;
+    setSessionActivity(target, 'ok', '凭据已保存', msg);
+    notify(msg);
+    await loadSessions();
+  } catch (err) {
+    setSessionActivity(target, 'err', '保存失败', err.message);
+    throw err;
+  }
 }));
 
 $('scan-bridges').addEventListener('click', () => action($('scan-bridges'), async () => {

@@ -30,10 +30,10 @@ DESKTOP_UA = (
 PLATFORM_LOGIN_POLICIES = {
     'YouTube': {
         'start_url': 'https://accounts.google.com/ServiceLogin?service=youtube&continue=https://www.youtube.com/',
-        'cookie_urls': ('https://www.youtube.com/', 'https://youtube.com/', 'https://accounts.google.com/'),
+        'cookie_urls': ('https://www.youtube.com/', 'https://m.youtube.com/', 'https://accounts.google.com/'),
         'markers': ('SID', 'SAPISID', '__Secure-3PAPISID', 'LOGIN_INFO'),
         'auto_capture': True,
-        'hint': '将启动本机真实浏览器独立窗口登录 Google / YouTube；登录完成后自动捕获完整 Cookie，也可从常用浏览器导出 JSON / cookies.txt 导入。',
+        'hint': '将启动本机真实浏览器独立窗口登录 Google / YouTube；跳转回 YouTube 并确认全量会话后自动加密保存，也可手动导出 JSON / cookies.txt 导入。',
     },
     'X (Twitter)': {
         'start_url': 'https://x.com/i/flow/login',
@@ -309,6 +309,12 @@ def normalize_cookie_text(platform: str, raw_text: str, domains: dict) -> str:
 
 def cdp_cookies_to_netscape(cookies: list[dict], policy: dict, allowed_domains: tuple[str, ...]) -> tuple[str, bool]:
     """将浏览器 CDP 返回的 Cookie 列表过滤为指定平台 Netscape 格式，并判断是否出现关键登录标记。"""
+    netscape, marker_hit, _ = analyze_cdp_cookies(cookies, policy, allowed_domains)
+    return netscape, marker_hit
+
+
+def analyze_cdp_cookies(cookies: list[dict], policy: dict, allowed_domains: tuple[str, ...]) -> tuple[str, bool, int]:
+    """解析 CDP Cookie 列表，返回 (Netscape 文本, 是否命中登录标记, 有效条目数)。"""
     dedup = {}
     marker_set = set(policy.get('markers') or ())
     marker_hit = False
@@ -340,42 +346,144 @@ def cdp_cookies_to_netscape(cookies: list[dict], policy: dict, allowed_domains: 
         except ValueError:
             continue
     if not dedup:
-        return '', False
-    return '# Netscape HTTP Cookie File\n' + '\n'.join(dedup.values()) + '\n', marker_hit
+        return '', False, 0
+    return '# Netscape HTTP Cookie File\n' + '\n'.join(dedup.values()) + '\n', marker_hit, len(dedup)
 
 
-async def fetch_cdp_cookies(port: int, browser_ws_path: str) -> list[dict]:
-    """通过本机环回 CDP 端口读取隔离浏览器实例的完整 Cookie（含 HttpOnly）。"""
-    ws_url = f'ws://127.0.0.1:{port}{browser_ws_path}'
-    async with websockets.connect(ws_url, proxy=None, max_size=8 * 1024 * 1024, open_timeout=3) as ws:
-        await ws.send(json.dumps({'id': 1, 'method': 'Storage.getCookies'}))
-        while True:
-            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
-            if msg.get('id') != 1:
+def merge_cdp_cookies(*cookie_groups: list[dict]) -> list[dict]:
+    """合并多路 CDP 接口（Storage / Network）采集到的 Cookie，优先保留完整属性。"""
+    merged: dict[tuple[str, str, str], dict] = {}
+    for group in cookie_groups:
+        if not isinstance(group, list):
+            continue
+        for item in group:
+            if not isinstance(item, dict):
                 continue
-            if 'result' in msg and isinstance(msg['result'].get('cookies'), list):
-                return msg['result']['cookies']
+            name = str(item.get('name') or '').strip()
+            domain = str(item.get('domain') or '').strip().lower()
+            path = str(item.get('path') or '/').strip() or '/'
+            if not name or not domain:
+                continue
+            key = (domain, path, name)
+            prev = merged.get(key)
+            if not prev:
+                merged[key] = dict(item)
+                continue
+            # 同一 Cookie 取含非空值、HttpOnly 或更晚过期时间的记录
+            prev_exp = _expiry_to_epoch(prev.get('expires'))
+            curr_exp = _expiry_to_epoch(item.get('expires'))
+            merged[key] = {
+                **prev,
+                **item,
+                'value': item.get('value') or prev.get('value') or '',
+                'httpOnly': bool(prev.get('httpOnly') or item.get('httpOnly')),
+                'secure': bool(prev.get('secure') or item.get('secure')),
+                'expires': curr_exp if curr_exp > prev_exp else prev_exp,
+            }
+    return list(merged.values())
+
+
+async def _cdp_call(ws_url: str, method: str, params: dict | None = None, *, req_id: int = 1, timeout: float = 3.0) -> dict:
+    """向环回 CDP WebSocket 发送单条指令并等待响应结果。"""
+    async with websockets.connect(ws_url, proxy=None, origin=None, max_size=8 * 1024 * 1024, open_timeout=timeout) as ws:
+        payload = {'id': req_id, 'method': method}
+        if params:
+            payload['params'] = params
+        await ws.send(json.dumps(payload))
+        deadline = time.monotonic() + timeout
+        while True:
+            rem = max(0.1, deadline - time.monotonic())
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=rem))
+            if msg.get('id') == req_id:
+                return msg.get('result') or {}
+
+
+async def fetch_cdp_targets(port: int, browser_ws_path: str) -> dict:
+    """读取本机浏览器 CDP 元信息与当前活动页面脱敏宿主域名。"""
+    ws_url = f'ws://127.0.0.1:{port}{browser_ws_path}' if browser_ws_path else ''
+    page_ws_urls: list[str] = []
+    current_host = ''
+    async with httpx.AsyncClient(trust_env=False, timeout=2.5) as client:
+        try:
+            ver = (await client.get(f'http://127.0.0.1:{port}/json/version')).json()
+            if isinstance(ver, dict) and ver.get('webSocketDebuggerUrl'):
+                ws_url = str(ver['webSocketDebuggerUrl'])
+        except Exception:
+            pass
+        try:
+            targets = (await client.get(f'http://127.0.0.1:{port}/json/list')).json()
+            if isinstance(targets, list):
+                for target in targets:
+                    if not isinstance(target, dict):
+                        continue
+                    t_type = str(target.get('type') or '')
+                    t_url = str(target.get('url') or '')
+                    if t_type == 'page' and t_url.startswith(('http://', 'https://')) and not current_host:
+                        current_host = (urlsplit(t_url).hostname or '').lower()
+                    p_ws = target.get('webSocketDebuggerUrl')
+                    if p_ws and t_type in ('page', 'iframe', 'webview', ''):
+                        page_ws_urls.append(str(p_ws))
+        except Exception:
+            pass
+    return {'browser_ws_url': ws_url, 'page_ws_urls': page_ws_urls, 'current_host': current_host}
+
+
+async def fetch_cdp_snapshot(port: int, browser_ws_path: str, cookie_urls: tuple[str, ...] = ()) -> dict:
+    """多路联合拉取浏览器隔离实例中的完整 Cookie 及页面当前宿主域名。"""
+    meta = await fetch_cdp_targets(port, browser_ws_path)
+    groups: list[list[dict]] = []
+    cdp_connected = False
+
+    browser_ws = meta['browser_ws_url']
+    if browser_ws:
+        try:
+            res = await _cdp_call(browser_ws, 'Storage.getCookies', req_id=1)
+            if isinstance(res.get('cookies'), list):
+                groups.append(res['cookies'])
+                cdp_connected = True
+        except Exception:
+            pass
+
+    for page_ws in meta['page_ws_urls'][:2]:
+        try:
+            res_all = await _cdp_call(page_ws, 'Network.getAllCookies', req_id=2)
+            if isinstance(res_all.get('cookies'), list):
+                groups.append(res_all['cookies'])
+                cdp_connected = True
+        except Exception:
+            pass
+        if cookie_urls:
+            try:
+                res_urls = await _cdp_call(page_ws, 'Network.getCookies', {'urls': list(cookie_urls)}, req_id=3)
+                if isinstance(res_urls.get('cookies'), list):
+                    groups.append(res_urls['cookies'])
+                    cdp_connected = True
+            except Exception:
+                pass
+        if groups:
             break
 
-    # 兼容不支持浏览器级 Storage.getCookies 的旧版 Chromium 内核：退回页面会话 Network.getAllCookies
-    async with httpx.AsyncClient(trust_env=False, timeout=3) as client:
-        targets = (await client.get(f'http://127.0.0.1:{port}/json/list')).json()
-    for target in targets:
-        page_ws = target.get('webSocketDebuggerUrl')
-        if page_ws:
-            async with websockets.connect(page_ws, proxy=None, max_size=8 * 1024 * 1024, open_timeout=3) as ws:
-                await ws.send(json.dumps({'id': 2, 'method': 'Network.getAllCookies'}))
-                while True:
-                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
-                    if msg.get('id') == 2:
-                        return (msg.get('result') or {}).get('cookies') or []
-    return []
+    return {
+        'cdp_connected': cdp_connected,
+        'cookies': merge_cdp_cookies(*groups),
+        'current_host': meta['current_host'],
+    }
+
+
+async def fetch_cdp_cookies(port: int, browser_ws_path: str, cookie_urls: tuple[str, ...] = ()) -> list[dict]:
+    """通过本机环回 CDP 端口读取隔离浏览器实例的完整 Cookie（含 HttpOnly）。"""
+    snap = await fetch_cdp_snapshot(port, browser_ws_path, cookie_urls)
+    return snap['cookies']
+
+
+_DEFAULT_FETCH_CDP_COOKIES = fetch_cdp_cookies
 
 
 async def close_cdp_browser(port: int, browser_ws_path: str) -> None:
     try:
-        ws_url = f'ws://127.0.0.1:{port}{browser_ws_path}'
-        async with websockets.connect(ws_url, proxy=None, open_timeout=2) as ws:
+        meta = await fetch_cdp_targets(port, browser_ws_path)
+        ws_url = meta['browser_ws_url'] or f'ws://127.0.0.1:{port}{browser_ws_path}'
+        async with websockets.connect(ws_url, proxy=None, origin=None, open_timeout=2) as ws:
             await ws.send(json.dumps({'id': 9, 'method': 'Browser.close'}))
     except Exception:
         pass
@@ -482,17 +590,46 @@ class BilibiliQRLoginManager:
 
         data = payload.get('data') or {}
         code = data.get('code')
+        remaining = max(0, int(180 - (time.time() - entry['created_at'])))
         if code == 86101:
-            return {'status': 'waiting', 'message': '等待手机哔哩哔哩 App 扫码...'}
+            return {
+                'status': 'waiting',
+                'stage': 'WAITING_SCAN',
+                'stage_label': '等待扫码',
+                'progress': 35,
+                'remaining_seconds': remaining,
+                'message': '等待手机哔哩哔哩 App 扫码...',
+            }
         if code == 86090:
-            return {'status': 'scanned', 'message': '已扫码，请在手机端点击确认登录'}
+            return {
+                'status': 'scanned',
+                'stage': 'SCANNED_CONFIRM',
+                'stage_label': '已扫码，待手机确认',
+                'progress': 75,
+                'remaining_seconds': remaining,
+                'message': '手机已扫码，请在哔哩哔哩 App 上点击确认登录',
+            }
         if code == 86038:
             with self._lock:
                 self._sessions.pop(qr_id, None)
             client.close()
-            return {'status': 'expired', 'message': '二维码已失效，请重新生成'}
+            return {
+                'status': 'expired',
+                'stage': 'EXPIRED',
+                'stage_label': '二维码已失效',
+                'progress': 0,
+                'remaining_seconds': 0,
+                'message': '二维码已失效，请重新生成',
+            }
         if code != 0:
-            return {'status': 'error', 'message': safe_text(data.get('message') or 'B 站扫码登录返回异常')}
+            return {
+                'status': 'error',
+                'stage': 'ERROR',
+                'stage_label': '扫码接口异常',
+                'progress': 0,
+                'remaining_seconds': remaining,
+                'message': safe_text(data.get('message') or 'B 站扫码登录返回异常'),
+            }
 
         try:
             client.get('https://www.bilibili.com/', proxies=entry['proxies'], headers={'User-Agent': DESKTOP_UA}, timeout=10)
@@ -524,7 +661,28 @@ class BilibiliQRLoginManager:
 
         if not rows:
             raise AgentError('INVALID_COOKIE', 'B 站扫码成功但未收到有效 Cookie')
-        return {'status': 'confirmed', 'netscape': '# Netscape HTTP Cookie File\n' + '\n'.join(rows.values()) + '\n'}
+        return {
+            'status': 'confirmed',
+            'stage': 'COMPLETED',
+            'stage_label': '扫码登录完成',
+            'progress': 100,
+            'cookie_count': len(rows),
+            'netscape': '# Netscape HTTP Cookie File\n' + '\n'.join(rows.values()) + '\n',
+        }
+
+
+_STAGE_META = {
+    'LAUNCHING': ('正在启动本地浏览器', 15),
+    'CONNECTING': ('正在建立抓取通道', 30),
+    'WAITING_LOGIN': ('等待完成网页登录', 50),
+    'CONFIRMING': ('已识别登录态，稳定补采中', 75),
+    'CAPTURING': ('正在读取完整 Cookie', 82),
+    'SAVING': ('正在加密写入本地库', 90),
+    'VERIFYING': ('正在在线校验有效性', 96),
+    'COMPLETED': ('抓取并保存完成', 100),
+    'CANCELLED': ('登录窗口已关闭', 0),
+    'FAILED': ('登录或抓取失败', 0),
+}
 
 
 @dataclass
@@ -533,19 +691,38 @@ class BrowserLoginAttempt:
     platform: str
     browser_name: str
     proxy: str
+    auto_capture: bool = False
     state: str = 'OPENING'
+    stage: str = 'LAUNCHING'
+    stage_label: str = '正在启动本地浏览器'
+    progress: int = 15
+    cdp_connected: bool = False
+    current_host: str = ''
+    cookie_count: int = 0
+    marker_detected: bool = False
+    capture_mode: str = ''
     message: str = '正在启动本地浏览器登录窗口...'
     error: str = ''
     manual_capture_requested: bool = False
     cancel_requested: bool = False
     created_at: float = 0.0
     updated_at: float = 0.0
+    last_netscape: str = ''
+    last_marker_hit: bool = False
+    last_cookie_count: int = 0
     process: object = None
     task: object = None
+    wake_event: object = None
+    loop: object = None
 
 
 class LocalBrowserLoginManager:
     """使用本机 Chrome / Edge 独立隔离窗口完成平台登录并经由环回 CDP 捕获完整 Cookie。"""
+
+    POLL_INTERVAL_SEC = 0.6
+    CONFIRM_WINDOW_SEC = 0.7
+    PORT_WAIT_STEP_SEC = 0.08
+    PORT_WAIT_TICKS = 180
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -557,6 +734,23 @@ class LocalBrowserLoginManager:
             raise AgentError('NOT_FOUND', '登录会话已结束或不存在')
         return attempt
 
+    def _wake(self, attempt: BrowserLoginAttempt) -> None:
+        if attempt.wake_event is not None and attempt.loop is not None:
+            try:
+                attempt.loop.call_soon_threadsafe(attempt.wake_event.set)
+            except Exception:
+                pass
+
+    def set_stage(self, attempt: BrowserLoginAttempt, stage: str, message: str | None = None) -> None:
+        """统一更新阶段标识、中文标签与百分比进度（仅含非敏感状态）。"""
+        label, pct = _STAGE_META.get(stage, ('处理中', attempt.progress))
+        attempt.stage = stage
+        attempt.stage_label = label
+        attempt.progress = pct
+        if message is not None:
+            attempt.message = message
+        attempt.updated_at = time.time()
+
     def public_status(self, attempt_id: str) -> dict:
         a = self.get(attempt_id)
         return {
@@ -564,6 +758,16 @@ class LocalBrowserLoginManager:
             'platform': a.platform,
             'browser_name': a.browser_name,
             'state': a.state,
+            'stage': a.stage,
+            'stage_label': a.stage_label,
+            'progress': a.progress,
+            'cdp_connected': a.cdp_connected,
+            'current_host': a.current_host,
+            'cookie_count': a.cookie_count,
+            'marker_detected': a.marker_detected,
+            'auto_capture': a.auto_capture,
+            'capture_mode': a.capture_mode,
+            'elapsed_seconds': max(0, int(time.time() - a.created_at)) if a.created_at else 0,
             'message': a.message,
             'error': a.error,
         }
@@ -575,7 +779,8 @@ class LocalBrowserLoginManager:
                 raise AgentError('NOT_FOUND', '当前没有正在进行的本地浏览器登录窗口')
             target = max(active, key=lambda a: a.created_at)
             target.manual_capture_requested = True
-            target.updated_at = time.time()
+            self.set_stage(target, 'CAPTURING', '收到抓取指令，正在立即读取浏览器 Cookie...')
+            self._wake(target)
             return {'attempt_id': target.attempt_id, 'requested': True}
 
     def request_cancel(self, platform: str) -> dict:
@@ -586,34 +791,52 @@ class LocalBrowserLoginManager:
             target = max(active, key=lambda a: a.created_at)
             target.cancel_requested = True
             target.state = 'CANCELLED'
-            target.message = '已关闭本地浏览器登录窗口'
-            target.updated_at = time.time()
+            self.set_stage(target, 'CANCELLED', '已取消并关闭本地浏览器登录窗口')
+            self._wake(target)
             return {'attempt_id': target.attempt_id, 'cancelled': True}
+
+    async def _collect_cdp_state(self, port: int, ws_path: str, cookie_urls: tuple[str, ...]) -> dict:
+        """收集当前 CDP 浏览器会话 Cookie 与脱敏页面宿主域（兼容测试对 fetch_cdp_cookies 的拦截）。"""
+        if fetch_cdp_cookies is not _DEFAULT_FETCH_CDP_COOKIES:
+            cookies = await fetch_cdp_cookies(port, ws_path)
+            return {'cdp_connected': True, 'cookies': cookies or [], 'current_host': ''}
+        return await fetch_cdp_snapshot(port, ws_path, cookie_urls)
 
     async def start(self, platform: str, proxy: str, allowed_domains: tuple[str, ...], *, on_capture) -> dict:
         if platform not in PLATFORM_LOGIN_POLICIES:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
         browser = find_local_browser()
         if not browser:
-            raise AgentError('CAPABILITY_UNAVAILABLE', '未检测到本机 Chrome 或 Edge 浏览器，可点击“在默认浏览器打开”完成登录后导入或粘贴 Cookie')
+            raise AgentError('CAPABILITY_UNAVAILABLE', '未检测到本机 Chrome 或 Edge 浏览器，可点击“默认浏览器打开”完成登录后导入或粘贴 Cookie')
 
+        policy = PLATFORM_LOGIN_POLICIES[platform]
         now = time.time()
+        loop = asyncio.get_running_loop()
         with self._lock:
-            for aid, item in list(self._attempts.items()):
-                if now - item.created_at > 900 or item.state in ('COMPLETED', 'CANCELLED', 'FAILED'):
-                    if now - item.updated_at > 60:
-                        self._attempts.pop(aid, None)
+            # 同一平台如已有未关闭尝试，先平滑通知取消，避免多窗口相互竞争
+            for old in list(self._attempts.values()):
+                if old.platform == platform and old.state in ('OPENING', 'WAITING'):
+                    old.cancel_requested = True
+                    old.state = 'CANCELLED'
+                    self.set_stage(old, 'CANCELLED', '已切换至新打开的登录窗口')
+                    self._wake(old)
+                elif now - old.created_at > 900 or (old.state in ('COMPLETED', 'CANCELLED', 'FAILED') and now - old.updated_at > 180):
+                    self._attempts.pop(old.attempt_id, None)
+
             attempt = BrowserLoginAttempt(
                 attempt_id=uuid.uuid4().hex,
                 platform=platform,
                 browser_name=browser['name'],
                 proxy=proxy,
+                auto_capture=bool(policy.get('auto_capture')),
                 created_at=now,
                 updated_at=now,
+                wake_event=asyncio.Event(),
+                loop=loop,
             )
+            self.set_stage(attempt, 'LAUNCHING', f'正在启动本地 {browser["name"]} 独立登录窗口...')
             self._attempts[attempt.attempt_id] = attempt
 
-        policy = PLATFORM_LOGIN_POLICIES[platform]
         temp_profile = tempfile.TemporaryDirectory(prefix='omni-browser-login-', ignore_cleanup_errors=True)
         cmd = [
             browser['path'],
@@ -622,6 +845,9 @@ class LocalBrowserLoginManager:
             '--no-first-run',
             '--no-default-browser-check',
             '--disable-default-apps',
+            '--disable-background-networking',
+            '--disable-sync',
+            '--disable-features=msEdgeFirstRunExperiences',
         ]
         if proxy:
             cmd.append(f'--proxy-server={proxy}')
@@ -635,73 +861,161 @@ class LocalBrowserLoginManager:
         )
         attempt.process = proc
 
+        async def _complete_capture(netscape_text: str, count: int, mode: str) -> None:
+            attempt.capture_mode = mode
+            self.set_stage(attempt, 'SAVING', f'已捕获 {count} 项 {platform} Cookie，正在加密保存...')
+
+            def _report(stage: str, msg: str):
+                self.set_stage(attempt, stage, msg)
+
+            verify_note = ''
+            try:
+                res = await on_capture(platform, netscape_text, mode=mode, report=_report)
+                if isinstance(res, str) and res:
+                    verify_note = f'（{res}）'
+            except TypeError:
+                await on_capture(platform, netscape_text)
+
+            attempt.state = 'COMPLETED'
+            prefix = '检测到关闭窗口前已完成登录，已自动保存' if mode == 'salvaged' else f'Cookie 已通过本地 {browser["name"]} 加密保存并启用'
+            self.set_stage(attempt, 'COMPLETED', f'{platform} {prefix}（共 {count} 项）{verify_note}')
+
+        async def _wait_for_cdp_port():
+            self.set_stage(attempt, 'CONNECTING', f'已打开 {browser["name"]} 窗口，正在建立本地 Cookie 读取通道...')
+            port_file = Path(temp_profile.name) / 'DevToolsActivePort'
+            for _ in range(self.PORT_WAIT_TICKS):
+                if attempt.cancel_requested or proc.returncode is not None:
+                    return None, ''
+                if port_file.is_file():
+                    lines = port_file.read_text('utf-8', errors='ignore').strip().splitlines()
+                    if len(lines) >= 2 and lines[0].isdigit():
+                        return int(lines[0]), lines[1].strip()
+                await asyncio.sleep(self.PORT_WAIT_STEP_SEC)
+            return None, ''
+
+        async def _sleep_or_wake(seconds: float) -> None:
+            if attempt.manual_capture_requested or attempt.cancel_requested or proc.returncode is not None:
+                return
+            if not attempt.wake_event:
+                await asyncio.sleep(seconds)
+                return
+            try:
+                await asyncio.wait_for(attempt.wake_event.wait(), timeout=seconds)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                attempt.wake_event.clear()
+
         async def _monitor():
             cdp_port = None
             cdp_ws = ''
+            confirm_polls = 0
             try:
-                port_file = Path(temp_profile.name) / 'DevToolsActivePort'
-                for _ in range(150):
-                    if attempt.cancel_requested or proc.returncode is not None:
-                        break
-                    if port_file.is_file():
-                        lines = port_file.read_text('utf-8', errors='ignore').strip().splitlines()
-                        if len(lines) >= 2 and lines[0].isdigit():
-                            cdp_port = int(lines[0])
-                            cdp_ws = lines[1].strip()
-                            break
-                    await asyncio.sleep(0.1)
-
+                cdp_port, cdp_ws = await _wait_for_cdp_port()
                 if attempt.cancel_requested or proc.returncode is not None:
                     attempt.state = 'CANCELLED'
-                    attempt.message = '本地浏览器窗口已关闭'
-                    attempt.updated_at = time.time()
+                    self.set_stage(attempt, 'CANCELLED', '本地浏览器窗口已关闭（尚未完成通道初始化）')
                     return
                 if not cdp_port:
                     raise RuntimeError('未能与本地浏览器建立 Cookie 读取通道，请关闭已存在的同内核隔离实例或改用默认浏览器打开后导入')
 
                 attempt.state = 'WAITING'
-                attempt.message = (
-                    f'已启动本地 {browser["name"]} 独立登录窗口；登录后将自动保存 Cookie'
+                attempt.cdp_connected = True
+                wait_msg = (
+                    f'已连接本地 {browser["name"]} 读取通道；请完成账号登录，系统将自动捕获并保存完整 Cookie'
                     if policy.get('auto_capture')
-                    else f'已启动本地 {browser["name"]} 独立登录窗口；请完成账号登录后点击“我已登录，抓取保存”'
+                    else f'已连接本地 {browser["name"]} 读取通道；请完成账号登录后点击“我已登录，抓取保存”'
                 )
-                attempt.updated_at = time.time()
+                self.set_stage(attempt, 'WAITING_LOGIN', wait_msg)
 
+                first_tick = True
                 while not attempt.cancel_requested and proc.returncode is None:
-                    await asyncio.sleep(1.0)
+                    if not first_tick:
+                        await _sleep_or_wake(self.POLL_INTERVAL_SEC)
+                    first_tick = False
                     if attempt.cancel_requested or proc.returncode is not None:
                         break
                     try:
-                        cookies = await fetch_cdp_cookies(cdp_port, cdp_ws)
+                        snap = await self._collect_cdp_state(cdp_port, cdp_ws, policy.get('cookie_urls') or ())
                     except Exception:
+                        if attempt.manual_capture_requested:
+                            attempt.manual_capture_requested = False
+                            if attempt.last_netscape:
+                                await _complete_capture(attempt.last_netscape, attempt.last_cookie_count, 'manual')
+                                return
+                            self.set_stage(attempt, 'WAITING_LOGIN', '浏览器正在加载页面，请稍候 1 秒后再试点击抓取')
                         continue
-                    netscape, marker_hit = cdp_cookies_to_netscape(cookies, policy, allowed_domains)
+
+                    attempt.cdp_connected = bool(snap.get('cdp_connected', True))
+                    if snap.get('current_host'):
+                        attempt.current_host = snap['current_host']
+
+                    netscape, marker_hit, cookie_count = analyze_cdp_cookies(snap['cookies'], policy, allowed_domains)
+                    attempt.cookie_count = cookie_count
+                    attempt.marker_detected = marker_hit
+                    if netscape:
+                        attempt.last_netscape = netscape
+                        attempt.last_marker_hit = marker_hit
+                        attempt.last_cookie_count = cookie_count
+
                     force = attempt.manual_capture_requested
                     if force:
                         attempt.manual_capture_requested = False
-                    if netscape and (force or (policy.get('auto_capture') and marker_hit)):
-                        await on_capture(platform, netscape)
-                        attempt.state = 'COMPLETED'
-                        attempt.message = f'{platform} Cookie 已通过本地 {browser["name"]} 加密保存并启用'
-                        attempt.updated_at = time.time()
+                        selected_netscape = netscape or attempt.last_netscape
+                        selected_count = cookie_count if netscape else attempt.last_cookie_count
+                        if selected_netscape:
+                            await _complete_capture(selected_netscape, selected_count, 'manual')
+                            return
+                        host_tip = f'（当前页面：{attempt.current_host}）' if attempt.current_host else ''
+                        self.set_stage(attempt, 'WAITING_LOGIN', f'尚未扫描到属于 {platform} 的有效 Cookie{host_tip}，请先登录网页后再点击抓取')
+                        continue
+
+                    # 自动捕获平台采用短暂防抖确认窗口，防止重定向中途仅落半套 Cookie 即关窗
+                    if netscape and policy.get('auto_capture') and marker_hit:
+                        if confirm_polls == 0:
+                            confirm_polls = 1
+                            self.set_stage(
+                                attempt,
+                                'CONFIRMING',
+                                f'已识别到登录核心标记（当前 {cookie_count} 项 Cookie），正在确认页面跳转完成与全量补采...',
+                            )
+                            await _sleep_or_wake(self.CONFIRM_WINDOW_SEC)
+                            continue
+                        await _complete_capture(netscape, cookie_count, 'auto')
                         return
-                    if force:
-                        attempt.message = '尚未检测到有效平台 Cookie，请确认已在打开的浏览器窗口完成登录后再点抓取'
+                    confirm_polls = 0
+                    if attempt.stage != 'WAITING_LOGIN':
+                        self.set_stage(attempt, 'WAITING_LOGIN', wait_msg)
+                    elif cookie_count > 0:
+                        host_part = f'@{attempt.current_host}' if attempt.current_host else ''
+                        if policy.get('auto_capture'):
+                            attempt.message = f'正在监听登录态{host_part} · 已发现 {cookie_count} 项基础 Cookie，等待登录完成...'
+                        else:
+                            attempt.message = f'正在监听{host_part} · 已捕获 {cookie_count} 项 Cookie，请在确认登录后点击“我已登录，抓取保存”'
                         attempt.updated_at = time.time()
 
+                # 浏览器窗口被用户手动关闭时，若之前已清晰出现登录核心标记，则自动兜底保存
                 if attempt.state not in ('COMPLETED', 'FAILED'):
+                    if not attempt.cancel_requested and attempt.last_netscape and attempt.last_marker_hit:
+                        await _complete_capture(attempt.last_netscape, attempt.last_cookie_count, 'salvaged')
+                        return
                     attempt.state = 'CANCELLED'
-                    attempt.message = '本地浏览器窗口已关闭'
-                    attempt.updated_at = time.time()
+                    if attempt.last_cookie_count > 0 and not attempt.cancel_requested:
+                        cancel_msg = (
+                            f'浏览器窗口已关闭（已捕捉到 {attempt.last_cookie_count} 项访客/前置 Cookie，'
+                            '但未识别到核心登录标记，未覆盖现有凭据）'
+                        )
+                    else:
+                        cancel_msg = '已关闭本地浏览器登录窗口' if attempt.cancel_requested else '本地浏览器窗口已关闭，未保存凭据'
+                    self.set_stage(attempt, 'CANCELLED', cancel_msg)
             except asyncio.CancelledError:
                 attempt.state = 'CANCELLED'
-                attempt.message = '本地浏览器登录已中止'
+                self.set_stage(attempt, 'CANCELLED', '本地浏览器登录已中止')
                 raise
             except Exception as exc:
                 attempt.state = 'FAILED'
                 attempt.error = safe_text(exc)
-                attempt.message = attempt.error
-                attempt.updated_at = time.time()
+                self.set_stage(attempt, 'FAILED', attempt.error)
             finally:
                 if cdp_port and cdp_ws:
                     await close_cdp_browser(cdp_port, cdp_ws)
@@ -726,6 +1040,7 @@ class LocalBrowserLoginManager:
     async def close_all(self):
         for attempt in list(self._attempts.values()):
             attempt.cancel_requested = True
+            self._wake(attempt)
             if attempt.task and not attempt.task.done():
                 attempt.task.cancel()
         tasks = [a.task for a in self._attempts.values() if a.task]

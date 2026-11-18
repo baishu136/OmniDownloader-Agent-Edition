@@ -12,7 +12,14 @@ from fastapi.testclient import TestClient
 import pytest
 
 from omni_agent.api import create_app
-from omni_agent.cookie_login import PLATFORM_LOGIN_POLICIES, cdp_cookies_to_netscape, normalize_cookie_text
+from omni_agent.cookie_login import (
+    PLATFORM_LOGIN_POLICIES,
+    analyze_cdp_cookies,
+    cdp_cookies_to_netscape,
+    fetch_cdp_snapshot,
+    merge_cdp_cookies,
+    normalize_cookie_text,
+)
 from omni_agent.errors import AgentError
 from omni_agent.visualization import build_visualization
 
@@ -88,16 +95,21 @@ def test_cookie_multi_format_local_browser_cdp_and_qr_login(service, monkeypatch
     netscape = normalize_cookie_text('哔哩哔哩', json_cookies, service.domains)
     assert '#HttpOnly_.bilibili.com' in netscape and 'json-secret-sess' in netscape and 'evil.example' not in netscape
 
-    # CDP Cookie 过滤与转换应保留 HttpOnly 并检测关键登录标记
-    cdp_netscape, marker_hit = cdp_cookies_to_netscape(
-        [
-            {'name': 'auth_token', 'value': 'x-cdp-secret', 'domain': '.x.com', 'path': '/', 'httpOnly': True, 'secure': True, 'expires': int(time.time()) + 3600},
-            {'name': 'guest', 'value': '1', 'domain': '.other.com', 'path': '/'},
-        ],
-        PLATFORM_LOGIN_POLICIES['X (Twitter)'],
-        service.domains['X (Twitter)'],
+    # 多路 CDP Cookie 合并应去重并保留 HttpOnly、非空值和更大过期时间
+    future_ts = int(time.time()) + 3600
+    merged = merge_cdp_cookies(
+        [{'name': 'auth_token', 'value': 'x-cdp-secret', 'domain': '.x.com', 'path': '/', 'httpOnly': False, 'expires': 0}],
+        [{'name': 'auth_token', 'value': '', 'domain': '.x.com', 'path': '/', 'httpOnly': True, 'secure': True, 'expires': future_ts}],
+        [{'name': 'guest', 'value': '1', 'domain': '.other.com', 'path': '/'}],
     )
-    assert marker_hit is True
+    assert len(merged) == 2
+    x_token = next(c for c in merged if c['name'] == 'auth_token')
+    assert x_token['value'] == 'x-cdp-secret' and x_token['httpOnly'] is True and x_token['expires'] == future_ts
+
+    # CDP Cookie 过滤与转换应保留 HttpOnly、检测关键登录标记并返回精确条目数
+    cdp_netscape, marker_hit = cdp_cookies_to_netscape(merged, PLATFORM_LOGIN_POLICIES['X (Twitter)'], service.domains['X (Twitter)'])
+    analyzed_text, analyzed_marker, count = analyze_cdp_cookies(merged, PLATFORM_LOGIN_POLICIES['X (Twitter)'], service.domains['X (Twitter)'])
+    assert marker_hit is True and analyzed_marker is True and count == 1 and analyzed_text == cdp_netscape
     assert '#HttpOnly_.x.com' in cdp_netscape and 'x-cdp-secret' in cdp_netscape and 'other.com' not in cdp_netscape
 
     # 本地未检测到浏览器时应优雅降级为 CAPABILITY_UNAVAILABLE (400)，并保留默认浏览器打开能力
@@ -112,15 +124,16 @@ def test_cookie_multi_format_local_browser_cdp_and_qr_login(service, monkeypatch
         ui_info = next(s for s in client.get('/api/admin/sessions').json() if s['platform'] == '哔哩哔哩')
         assert ui_info['ui']['cookie_count'] == 2
         assert ui_info['ui']['marker_present'] is True
+        assert ui_info['ui']['source'] == 'import'
         assert ui_info['local_browser_available'] is False
         assert ui_info['login_url'].startswith('https://')
 
-        # Agent 视角绝不能包含任何 Cookie 键名、明文或 UI 元字段
+        # Agent 视角绝不能包含任何 Cookie 键名、明文、来源或 UI 元字段
         agent_resp = client.post('/api/tools/list_cookie_statuses', json={}).json()
         assert agent_resp['ok']
-        assert 'SESSDATA' not in json.dumps(agent_resp)
-        assert 'json-secret-sess' not in json.dumps(agent_resp)
-        assert 'ui' not in agent_resp['result']['platforms'][0]
+        dumped_agent = json.dumps(agent_resp)
+        assert 'SESSDATA' not in dumped_agent and 'json-secret-sess' not in dumped_agent
+        assert 'source' not in dumped_agent and 'ui' not in agent_resp['result']['platforms'][0]
 
         # 默认浏览器打开接口与无本地浏览器错误提示
         opened = client.post('/api/admin/sessions/X (Twitter)/open-login')
@@ -128,14 +141,16 @@ def test_cookie_multi_format_local_browser_cdp_and_qr_login(service, monkeypatch
         no_browser = client.post('/api/admin/sessions/X (Twitter)/browser-login')
         assert no_browser.status_code == 400 and no_browser.json()['error']['code'] == 'CAPABILITY_UNAVAILABLE'
 
-        # 模拟本地已安装 Chrome：验证 CDP 自动抓取、加密保存、手动抓取和关闭窗口取消
+        # 模拟本地 Chrome：验证三阶段状态展示、防抖二次补采、手动即时抓取与关窗自动兜底
         fake_browser = {'name': 'Google Chrome', 'path': 'mock-chrome'}
         monkeypatch.setattr('omni_agent.cookie_login.find_local_browser', lambda: fake_browser)
         monkeypatch.setattr('omni_agent.service.find_local_browser', lambda: fake_browser)
+        monkeypatch.setattr(service.browser_logins, 'POLL_INTERVAL_SEC', 0.01)
+        monkeypatch.setattr(service.browser_logins, 'CONFIRM_WINDOW_SEC', 0.01)
+        monkeypatch.setattr(service.browser_logins, 'PORT_WAIT_STEP_SEC', 0.005)
 
-        real_sleep = asyncio.sleep
         real_exec = asyncio.create_subprocess_exec
-        monkeypatch.setattr('omni_agent.cookie_login.asyncio.sleep', lambda sec: real_sleep(0.01 if sec >= 0.9 else sec))
+        procs = []
 
         class FakeProc:
             def __init__(self):
@@ -156,61 +171,188 @@ def test_cookie_multi_format_local_browser_cdp_and_qr_login(service, monkeypatch
                     if str(arg).startswith('--user-data-dir='):
                         profile_dir = Path(str(arg).split('=', 1)[1])
                         (profile_dir / 'DevToolsActivePort').write_text('9229\n/devtools/browser/mock\n', encoding='utf-8')
-                return FakeProc()
+                proc = FakeProc()
+                procs.append(proc)
+                return proc
             return await real_exec(*cmd, **kwargs)
-
-        poll_counter = {'n': 0}
-
-        async def fake_fetch(port, ws_path):
-            assert port == 9229
-            poll_counter['n'] += 1
-            if poll_counter['n'] == 1:
-                return [{'name': 'guest_id', 'value': 'guest-1', 'domain': '.x.com', 'path': '/'}]
-            return [{'name': 'auth_token', 'value': 'x-cdp-secret', 'domain': '.x.com', 'path': '/', 'httpOnly': True, 'secure': True}]
 
         async def fake_close(port, ws_path):
             return None
 
+        poll_counter = {'n': 0}
+
+        async def fake_snapshot(port, ws_path, cookie_urls=()):
+            assert port == 9229
+            poll_counter['n'] += 1
+            if poll_counter['n'] == 1:
+                return {'cdp_connected': True, 'current_host': 'x.com', 'cookies': [{'name': 'guest_id', 'value': 'guest-1', 'domain': '.x.com', 'path': '/'}]}
+            if poll_counter['n'] == 2:
+                return {'cdp_connected': True, 'current_host': 'x.com', 'cookies': [{'name': 'auth_token', 'value': 'x-cdp-secret', 'domain': '.x.com', 'path': '/', 'httpOnly': True, 'secure': True}]}
+            return {
+                'cdp_connected': True,
+                'current_host': 'x.com',
+                'cookies': [
+                    {'name': 'auth_token', 'value': 'x-cdp-secret', 'domain': '.x.com', 'path': '/', 'httpOnly': True, 'secure': True},
+                    {'name': 'ct0', 'value': 'x-ct0-secret', 'domain': '.x.com', 'path': '/'},
+                ],
+            }
+
         monkeypatch.setattr('omni_agent.cookie_login.asyncio.create_subprocess_exec', fake_exec)
-        monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_cookies', fake_fetch)
+        monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_snapshot', fake_snapshot)
         monkeypatch.setattr('omni_agent.cookie_login.close_cdp_browser', fake_close)
 
         started = client.post('/api/admin/sessions/X (Twitter)/browser-login')
         assert started.status_code == 200
-        attempt_id = started.json()['attempt_id']
+        start_body = started.json()
+        attempt_id = start_body['attempt_id']
+        assert start_body['stage'] == 'LAUNCHING' and start_body['progress'] == 15
 
         final_status = {}
-        for _ in range(40):
+        seen_stages = []
+        for _ in range(50):
             final_status = client.get(f'/api/admin/sessions/browser-status/{attempt_id}').json()
+            seen_stages.append(final_status['stage'])
             if final_status['state'] == 'COMPLETED':
                 break
-            time.sleep(0.02)
+            time.sleep(0.01)
 
         assert final_status['state'] == 'COMPLETED'
+        assert final_status['progress'] == 100
+        assert final_status['capture_mode'] == 'auto'
+        assert final_status['cookie_count'] == 2
+        assert final_status['marker_detected'] is True
+        assert final_status['current_host'] == 'x.com'
         assert 'x-cdp-secret' not in json.dumps(final_status)
         assert service.sessions.status('X (Twitter)')['state'] == 'IMPORTED'
+        x_ui = next(s for s in client.get('/api/admin/sessions').json() if s['platform'] == 'X (Twitter)')
+        assert x_ui['ui']['cookie_count'] == 2 and x_ui['ui']['source'] == 'browser_auto'
 
-        # 测试等待期间的手动抓取与取消
-        async def empty_cookies(port, ws_path):
-            return [{'name': 'PHPSESSID', 'value': 'px-manual-secret', 'domain': '.pixiv.net', 'path': '/'}]
+        # 验证手动点击抓取即时响应（Pixiv）
+        async def pixiv_snapshot(port, ws_path, cookie_urls=()):
+            return {'cdp_connected': True, 'current_host': 'www.pixiv.net', 'cookies': [{'name': 'PHPSESSID', 'value': 'px-manual-secret', 'domain': '.pixiv.net', 'path': '/'}]}
 
-        monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_cookies', empty_cookies)
+        monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_snapshot', pixiv_snapshot)
+        monkeypatch.setattr(service, 'verify_cookie', lambda p: asyncio.sleep(0, result={'state': 'VALID'}))
         px = client.post('/api/admin/sessions/Pixiv/browser-login')
         assert px.status_code == 200
         px_id = px.json()['attempt_id']
-        time.sleep(0.03)
-        cancel_res = client.post('/api/admin/sessions/Pixiv/browser-cancel')
-        assert cancel_res.status_code == 200 and cancel_res.json()['cancelled'] is True
-        assert client.get(f'/api/admin/sessions/browser-status/{px_id}').json()['state'] == 'CANCELLED'
+        for _ in range(30):
+            if client.get(f'/api/admin/sessions/browser-status/{px_id}').json()['cookie_count'] == 1:
+                break
+            time.sleep(0.01)
+        cap_res = client.post('/api/admin/sessions/Pixiv/browser-capture')
+        assert cap_res.status_code == 200 and cap_res.json()['requested'] is True
+        px_done = {}
+        for _ in range(40):
+            px_done = client.get(f'/api/admin/sessions/browser-status/{px_id}').json()
+            if px_done['state'] == 'COMPLETED':
+                break
+            time.sleep(0.01)
+        assert px_done['state'] == 'COMPLETED' and px_done['capture_mode'] == 'manual'
 
-        # 模拟 B 站二维码生成与扫码确认流程
+        # 验证窗口被用户提前关闭时：若已出现核心登录标记则自动兜底挽救（salvaged）
+        monkeypatch.setattr(service.browser_logins, 'CONFIRM_WINDOW_SEC', 2.0)
+
+        async def ig_snapshot(port, ws_path, cookie_urls=()):
+            if procs:
+                procs[-1].returncode = 0
+            return {'cdp_connected': True, 'current_host': 'www.instagram.com', 'cookies': [{'name': 'sessionid', 'value': 'ig-salvage-secret', 'domain': '.instagram.com', 'path': '/', 'httpOnly': True}]}
+
+        monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_snapshot', ig_snapshot)
+        ig = client.post('/api/admin/sessions/Instagram/browser-login')
+        ig_id = ig.json()['attempt_id']
+        ig_done = {}
+        for _ in range(40):
+            ig_done = client.get(f'/api/admin/sessions/browser-status/{ig_id}').json()
+            if ig_done['state'] == 'COMPLETED':
+                break
+            time.sleep(0.01)
+        assert ig_done['state'] == 'COMPLETED' and ig_done['capture_mode'] == 'salvaged'
+        assert service.sessions.status('Instagram')['state'] == 'IMPORTED'
+
+        # 验证仅有访客 Cookie 时手动关闭窗口不会误覆盖凭据，且给出清晰取消说明
+        async def guest_only_snapshot(port, ws_path, cookie_urls=()):
+            return {'cdp_connected': True, 'current_host': 'www.douyin.com', 'cookies': [{'name': 'ttwid', 'value': 'guest-ttwid', 'domain': '.douyin.com', 'path': '/'}]}
+
+        monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_snapshot', guest_only_snapshot)
+        dy = client.post('/api/admin/sessions/抖音/browser-login')
+        dy_id = dy.json()['attempt_id']
+        for _ in range(30):
+            if client.get(f'/api/admin/sessions/browser-status/{dy_id}').json()['cookie_count'] == 1:
+                procs[-1].returncode = 0
+                break
+            time.sleep(0.01)
+        dy_done = {}
+        for _ in range(40):
+            dy_done = client.get(f'/api/admin/sessions/browser-status/{dy_id}').json()
+            if dy_done['state'] == 'CANCELLED':
+                break
+            time.sleep(0.01)
+        assert dy_done['state'] == 'CANCELLED' and '访客' in dy_done['message']
+        assert service.sessions.status('抖音')['state'] == 'MISSING'
+
+        # 模拟 B 站二维码生成、扫码中与扫码确认状态字段
         monkeypatch.setattr(service.qr_logins, 'generate', lambda proxy='': {'qr_id': 'mock-qr', 'matrix': [[1, 0], [0, 1]], 'expires_in': 180})
-        monkeypatch.setattr(service.qr_logins, 'poll', lambda qr_id: {'status': 'confirmed', 'netscape': 'SESSDATA=qr-secret-val'})
+        monkeypatch.setattr(
+            service.qr_logins,
+            'poll',
+            lambda qr_id: {'status': 'confirmed', 'stage': 'COMPLETED', 'stage_label': '扫码登录完成', 'progress': 100, 'netscape': 'SESSDATA=qr-secret-val'},
+        )
         qr = client.post('/api/admin/sessions/bilibili/qr')
         assert qr.status_code == 200 and qr.json()['matrix'] == [[1, 0], [0, 1]]
         polled = client.post('/api/admin/sessions/bilibili/qr/mock-qr/poll')
-        assert polled.status_code == 200 and polled.json()['status'] == 'confirmed'
+        assert polled.status_code == 200 and polled.json()['status'] == 'confirmed' and polled.json()['stage'] == 'COMPLETED'
         assert 'qr-secret-val' not in polled.text
+
+
+async def test_cdp_snapshot_loopback_multi_source_and_host_extraction():
+    from http import HTTPStatus
+    import websockets
+
+    port_holder = {'port': 0}
+
+    def handle_http(connection, request):
+        path = request.path
+        port = port_holder['port']
+        if path == '/json/version':
+            body = json.dumps({'webSocketDebuggerUrl': f'ws://127.0.0.1:{port}/devtools/browser/b1'}).encode()
+            return connection.respond(HTTPStatus.OK, body.decode())
+        if path == '/json/list':
+            body = json.dumps([
+                {
+                    'type': 'page',
+                    'url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ&token=secret',
+                    'webSocketDebuggerUrl': f'ws://127.0.0.1:{port}/devtools/page/p1',
+                }
+            ]).encode()
+            return connection.respond(HTTPStatus.OK, body.decode())
+        return None
+
+    async def handle_ws(ws):
+        async for raw in ws:
+            req = json.loads(raw)
+            method = req.get('method')
+            rid = req['id']
+            if method == 'Storage.getCookies':
+                cookies = [{'name': 'SID', 'value': 'sid-val', 'domain': '.youtube.com', 'path': '/', 'httpOnly': False}]
+            elif method == 'Network.getAllCookies':
+                cookies = [{'name': 'SID', 'value': 'sid-val', 'domain': '.youtube.com', 'path': '/', 'httpOnly': True}]
+            elif method == 'Network.getCookies':
+                cookies = [{'name': 'LOGIN_INFO', 'value': 'login-val', 'domain': '.youtube.com', 'path': '/', 'httpOnly': True}]
+            else:
+                cookies = []
+            await ws.send(json.dumps({'id': rid, 'result': {'cookies': cookies}}))
+
+    async with websockets.serve(handle_ws, '127.0.0.1', 0, process_request=handle_http) as server:
+        port = server.sockets[0].getsockname()[1]
+        port_holder['port'] = port
+        snap = await fetch_cdp_snapshot(port, '/devtools/browser/fallback', ('https://www.youtube.com/',))
+        assert snap['cdp_connected'] is True
+        # 严格脱敏：仅保留宿主域名，绝不含 path/query 参数
+        assert snap['current_host'] == 'www.youtube.com'
+        names = {c['name']: c for c in snap['cookies']}
+        assert set(names) == {'SID', 'LOGIN_INFO'}
+        assert names['SID']['httpOnly'] is True
 
 
 def test_bridge_auto_discovery_and_scan(service):
