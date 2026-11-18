@@ -19,6 +19,7 @@ from .cookie_login import (
     MULTI_PLATFORM_KEY,
     BilibiliQRLoginManager,
     LocalBrowserLoginManager,
+    ManagedProfileStore,
     PLATFORM_LOGIN_POLICIES,
     find_local_browser,
     inspect_cookie_meta,
@@ -123,6 +124,7 @@ class Service:
         self.bridges = BridgeRegistry()
         self.qr_logins = BilibiliQRLoginManager()
         self.browser_logins = LocalBrowserLoginManager(profile_dir=private_dir(self.config.directory / 'browser-profile'))
+        self.browser_accounts = ManagedProfileStore(self.vault, self.config.directory)
         self._startup_probe = None
 
     async def start(self):
@@ -346,7 +348,24 @@ class Service:
             self.vault.put(self._validation_key(site), '{"state":"MISSING"}')
         return {'platforms': [self._session_info(site) for site in targets]}
 
-    def import_cookie(self, platform, text, *, source='import'):
+    def clear_owned_cookie(self, platform: str, expected_owner: str) -> bool:
+        """仅当当前凭据的加密所有权令牌匹配时才清理，防止误删用户另外导入的新会话。"""
+        if not expected_owner or platform not in self.domains:
+            return False
+        raw = self.vault.get(self._validation_key(platform))
+        if not raw:
+            return False
+        try:
+            stored = json.loads(raw)
+        except ValueError:
+            return False
+        if stored.get('owner_token') != expected_owner:
+            return False
+        self.sessions.clear(platform)
+        self.vault.put(self._validation_key(platform), '{"state":"MISSING"}')
+        return True
+
+    def import_cookie(self, platform, text, *, source='import', owner_token=''):
         """仅限用户管理页调用：加密导入或更新平台 Cookie 并默认启用。"""
         if platform not in self.domains:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
@@ -356,10 +375,10 @@ class Service:
         except (ValueError, OSError):
             raise AgentError('INVALID_COOKIE', 'Cookie文件无效或不包含此平台有效凭据') from None
         self.sessions.set_enabled(platform, True)
-        self.vault.put(
-            self._validation_key(platform),
-            json.dumps({'state': 'UNVERIFIED', 'source': source, 'updated_at': time.time()}),
-        )
+        payload = {'state': 'UNVERIFIED', 'source': source, 'updated_at': time.time()}
+        if owner_token:
+            payload['owner_token'] = owner_token
+        self.vault.put(self._validation_key(platform), json.dumps(payload))
         return self._session_info(platform, include_ui=True)
 
     def set_cookie_enabled(self, platform, enabled):
@@ -385,6 +404,8 @@ class Service:
             stored['source'] = prev['source']
         if prev.get('updated_at'):
             stored['updated_at'] = prev['updated_at']
+        if prev.get('owner_token'):
+            stored['owner_token'] = prev['owner_token']
         self.vault.put(self._validation_key(platform), json.dumps(stored))
         return result
 
@@ -415,23 +436,34 @@ class Service:
             'session': session,
         }
 
-    async def _save_captured_batch(self, targets: list[dict], *, mode: str = 'sync') -> list[str]:
+    async def _save_captured_batch(
+        self,
+        targets: list[dict],
+        *,
+        mode: str = 'sync',
+        account_id: str = '',
+        account_epoch: int = 0,
+    ) -> list[str]:
         """批量保存从持久化托管浏览器捕获的多平台 Cookie。"""
         source_map = {
             'auto': 'browser_auto',
             'manual': 'browser_manual',
             'salvaged': 'browser_salvage',
             'sync': 'browser_sync',
+            'account': 'browser_account',
         }
-        source = source_map.get(mode, 'browser_sync')
+        source = 'browser_account' if account_id else source_map.get(mode, 'browser_sync')
         saved = []
         for item in targets:
             plat = item.get('platform')
             netscape = item.get('netscape')
             if not plat or not netscape or plat not in self.domains:
                 continue
+            owner_tok = uuid.uuid4().hex if account_id else ''
             try:
-                self.import_cookie(plat, netscape, source=source)
+                self.import_cookie(plat, netscape, source=source, owner_token=owner_tok)
+                if account_id:
+                    self.browser_accounts.record_binding(account_id, account_epoch, plat, owner_tok)
                 saved.append(plat)
             except AgentError:
                 continue
@@ -445,6 +477,13 @@ class Service:
     async def start_browser_login(self, platform: str):
         if platform != MULTI_PLATFORM_KEY and platform not in self.domains:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
+
+        # 对齐 Android 版逻辑：非首次导入（需要重新验证或换号）时强制显式点击保存，避免未退出即自动覆写
+        require_explicit = (
+            False
+            if platform == MULTI_PLATFORM_KEY
+            else (self.sessions.status(platform)['state'] != 'MISSING')
+        )
 
         source_map = {
             'auto': 'browser_auto',
@@ -473,6 +512,7 @@ class Service:
             on_capture=_on_capture,
             domains=self.domains,
             on_capture_many=self._save_captured_batch,
+            require_explicit_save=require_explicit,
         )
 
     async def start_multi_browser_login(self):
@@ -490,6 +530,121 @@ class Service:
 
     async def reset_browser_profile(self):
         return await self.browser_logins.reset_profile()
+
+    # -------------------- 独立登录档案（多账号隔离，对齐 Android GoogleAccountsCard） --------------------
+
+    def list_browser_accounts(self) -> dict:
+        return self.browser_accounts.public_state()
+
+    def add_browser_account(self, label: str) -> dict:
+        return self.browser_accounts.add(label)
+
+    def activate_browser_account(self, account_id: str) -> dict:
+        return self.browser_accounts.activate(account_id)
+
+    async def open_browser_account(self, account_id: str, platform: str = 'YouTube') -> dict:
+        if platform not in self.domains:
+            raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
+        acc, target_dir = self.browser_accounts.prepare_open(account_id)
+
+        async def _on_capture(target_platform: str, netscape: str, *, mode: str = 'manual', report=None):
+            owner_tok = uuid.uuid4().hex
+            self.import_cookie(target_platform, netscape, source='browser_account', owner_token=owner_tok)
+            self.browser_accounts.record_binding(acc.id, acc.epoch, target_platform, owner_tok)
+            if target_platform in ('哔哩哔哩', 'Pixiv'):
+                if report:
+                    report('VERIFYING', f'已关联至 {acc.label}，正在在线校验 {target_platform} 有效性...')
+                try:
+                    ver = await self.verify_cookie(target_platform)
+                    return '账号在线校验有效' if ver.get('state') == 'VALID' else '已关联到此档案'
+                except AgentError:
+                    return '已关联到此档案'
+            return f'已关联至 {acc.label}'
+
+        return await self.browser_logins.start(
+            platform,
+            self.config.settings.proxy,
+            self.domains[platform],
+            on_capture=_on_capture,
+            domains=self.domains,
+            profile_dir_override=target_dir,
+            initial_url='https://accounts.google.com/',
+            require_explicit_save=True,
+            account_id=acc.id,
+            account_label=acc.label,
+            account_epoch=acc.epoch,
+        )
+
+    async def sync_browser_account(self, account_id: str, *, include_manual: bool = False) -> dict:
+        acc, target_dir = self.browser_accounts.prepare_open(account_id)
+        existing_imported = {p for p in self.domains if self.sessions.status(p)['state'] == 'IMPORTED'}
+
+        async def _on_capture_many(targets: list[dict], *, mode: str = 'sync'):
+            return await self._save_captured_batch(targets, mode=mode, account_id=acc.id, account_epoch=acc.epoch)
+
+        return await self.browser_logins.sync_from_profile(
+            self.config.settings.proxy,
+            self.domains,
+            existing_imported,
+            include_manual=include_manual,
+            profile_dir_override=target_dir,
+            on_capture_many=_on_capture_many,
+        )
+
+    async def logout_browser_accounts(self, account_ids: list[str]) -> dict:
+        prepared = self.browser_accounts.begin_logout(account_ids)
+        cleared_platforms = []
+        for acc, old_dir in prepared:
+            for plat, owner_tok in acc.bindings.items():
+                if self.clear_owned_cookie(plat, owner_tok):
+                    cleared_platforms.append(plat)
+            await self.browser_logins.delete_profile_dir(old_dir)
+            self.browser_accounts.finish_logout(acc.id)
+        return {
+            'accounts': self.list_browser_accounts(),
+            'cleared_platforms': cleared_platforms,
+        }
+
+    async def remove_browser_account(self, account_id: str) -> dict:
+        prepared = self.browser_accounts.remove_account(account_id)
+        for acc, old_dir in prepared:
+            for plat, owner_tok in acc.bindings.items():
+                self.clear_owned_cookie(plat, owner_tok)
+            await self.browser_logins.delete_profile_dir(old_dir)
+            self.browser_accounts.finalize_remove_account(acc.id)
+        return self.list_browser_accounts()
+
+    async def start_manage_google(self, account_id: str = '') -> dict:
+        """只管理 Google 登录状态（不抓包、不保存或覆盖凭据，对齐 Android manageOnly）。"""
+        target_dir = None
+        acc_label = ''
+        if account_id:
+            acc, target_dir = self.browser_accounts.prepare_open(account_id)
+            acc_label = acc.label
+        return await self.browser_logins.start(
+            'YouTube',
+            self.config.settings.proxy,
+            self.domains['YouTube'],
+            on_capture=lambda *a, **k: asyncio.sleep(0),
+            profile_dir_override=target_dir,
+            initial_url='https://accounts.google.com/',
+            manage_only=True,
+            account_id=account_id,
+            account_label=acc_label,
+        )
+
+    async def navigate_browser_login(self, attempt_id: str, action: str) -> dict:
+        att = self.browser_logins.get(attempt_id)
+        if action == 'google':
+            url = 'https://accounts.google.com/'
+        elif action == 'platform':
+            pol = PLATFORM_LOGIN_POLICIES.get(att.platform, {})
+            url = pol.get('start_url') or 'https://www.youtube.com/'
+        elif action == 'reload':
+            url = att.start_url or PLATFORM_LOGIN_POLICIES.get(att.platform, {}).get('start_url') or 'https://accounts.google.com/'
+        else:
+            raise AgentError('INVALID_PARAMETER', '不支持的导航动作')
+        return await self.browser_logins.navigate_attempt(attempt_id, url)
 
     async def open_login_page(self, platform: str):
         return await asyncio.to_thread(open_in_default_browser, platform)

@@ -1,9 +1,11 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let settings = {}, bots = [], mcpConfig = {}, sessionsData = [];
+let accountsState = {current_id: null, accounts: []};
+let selectedAccountIds = new Set();
 let selectedPlatform = '';
 let noticeTimer, refreshTimer, autoSaveTimer, qrTimer, browserLoginTimer;
-let activeQrId = '', activeBrowserAttempt = '', activeBrowserPlatform = '', activeBrowserMulti = false;
+let activeQrId = '', activeBrowserAttempt = '', activeBrowserPlatform = '', activeBrowserMulti = false, activeBrowserManageOnly = false;
 let sessionActivityByPlatform = {};
 let dirModalTargetEl = null, dirModalCurrent = '', dirModalParent = '';
 let savingPromise = Promise.resolve();
@@ -369,6 +371,7 @@ function stopBrowserPoll() {
   activeBrowserAttempt = '';
   activeBrowserPlatform = '';
   activeBrowserMulti = false;
+  activeBrowserManageOnly = false;
   $('browser-login-panel').hidden = true;
   $('browser-ready-platforms').hidden = true;
 }
@@ -394,8 +397,24 @@ function renderQrState(data) {
 }
 
 function renderBrowserLoginState(st) {
-  const titleName = st.multi_platform ? '多平台托管工作窗' : st.platform;
+  const titleName = st.manage_only
+    ? '管理 Google 登录'
+    : st.multi_platform
+      ? '多平台托管工作窗'
+      : st.account_label
+        ? `${st.account_label} · ${st.platform}`
+        : st.platform;
   $('browser-status-title').textContent = `${titleName} · ${st.browser_name || '本地浏览器'}`;
+  $('browser-host-subtitle').textContent = st.current_host
+    ? `当前域：${st.current_host}`
+    : (st.account_label ? `独立容器：${st.account_label}` : '等待页面打开');
+
+  const isManage = Boolean(st.manage_only);
+  const isMulti = Boolean(st.multi_platform);
+  $('browser-nav-google').hidden = isMulti || (!st.account_id && !st.require_explicit_save && !isManage);
+  $('browser-nav-platform').hidden = isMulti || isManage;
+  $('browser-nav-reload').hidden = isMulti;
+
   const stagePill = $('browser-stage-pill');
   const stageClassMap = {
     LAUNCHING: 'info',
@@ -434,21 +453,28 @@ function renderBrowserLoginState(st) {
 
   const telemetry = $('browser-telemetry');
   telemetry.replaceChildren();
-  const chips = [
-    [st.cdp_connected ? 'ok' : '', st.cdp_connected ? 'CDP 通道已连接' : '正在建立通道'],
-    [st.current_host ? 'ok' : '', st.current_host ? `当前域：${st.current_host}` : '等待页面域'],
-    [
-      st.cookie_count > 0 ? (st.marker_detected ? 'ok' : '') : '',
-      st.cookie_count > 0 ? `已捕获 ${st.cookie_count} 项 Cookie` : '尚未检测到平台 Cookie',
-    ],
-    [
-      st.marker_detected ? 'ok' : '',
-      st.marker_detected
-        ? (st.multi_platform ? '已识别平台登录态' : '已识别核心登录标记')
-        : (st.multi_platform ? '等待任意平台登录' : (st.auto_capture ? '等待登录态标记' : '需登录后手动抓取')),
-    ],
-    ['', `已用 ${st.elapsed_seconds || 0}s`],
-  ];
+  const chips = isManage
+    ? [
+        [st.cdp_connected ? 'ok' : '', st.cdp_connected ? '浏览器通道已连接' : '正在建立通道'],
+        [st.current_host ? 'ok' : '', st.current_host ? `当前域：${st.current_host}` : '等待 Google 账号页'],
+        ['', '只管理网页登录（不改动下载凭据）'],
+        ['', `已用 ${st.elapsed_seconds || 0}s`],
+      ]
+    : [
+        [st.cdp_connected ? 'ok' : '', st.cdp_connected ? 'CDP 通道已连接' : '正在建立通道'],
+        [st.current_host ? 'ok' : '', st.current_host ? `当前域：${st.current_host}` : '等待页面域'],
+        [
+          st.cookie_count > 0 ? (st.marker_detected ? 'ok' : '') : '',
+          st.cookie_count > 0 ? `已捕获 ${st.cookie_count} 项 Cookie` : '尚未检测到平台 Cookie',
+        ],
+        [
+          st.marker_detected ? 'ok' : '',
+          st.marker_detected
+            ? (isMulti ? '已识别平台登录态' : (st.require_explicit_save ? '已识别登录态（待点击保存）' : '已识别核心登录标记'))
+            : (isMulti ? '等待任意平台登录' : ((st.auto_capture && !st.require_explicit_save) ? '等待登录态标记' : '需点击保存按钮确认')),
+        ],
+        ['', `已用 ${st.elapsed_seconds || 0}s`],
+      ];
   for (const [cls, text] of chips) {
     const chip = document.createElement('span');
     chip.className = 'probe-chip' + (cls ? ' ' + cls : '');
@@ -458,7 +484,7 @@ function renderBrowserLoginState(st) {
 
   const readyWrap = $('browser-ready-platforms');
   readyWrap.replaceChildren();
-  if (st.multi_platform && Array.isArray(st.ready_platforms) && st.ready_platforms.length) {
+  if (isMulti && Array.isArray(st.ready_platforms) && st.ready_platforms.length) {
     readyWrap.hidden = false;
     for (const item of st.ready_platforms) {
       const pChip = document.createElement('span');
@@ -471,7 +497,15 @@ function renderBrowserLoginState(st) {
     readyWrap.hidden = true;
   }
 
-  $('browser-manual-capture').textContent = st.multi_platform ? '保存全部已登录平台' : '我已登录，抓取保存';
+  $('browser-manual-capture').textContent = isManage
+    ? '完成'
+    : isMulti
+      ? '保存全部已登录平台'
+      : (st.account_id || st.require_explicit_save)
+        ? `保存 ${st.platform} 下载凭据`
+        : !st.auto_capture
+          ? '我已登录，保存会话'
+          : '完成（可手动确认）';
   $('browser-status-text').textContent = st.message || '';
 }
 
@@ -532,6 +566,7 @@ function pollBrowserAttempt(res, targetPlatform, isMulti) {
   activeBrowserAttempt = res.attempt_id;
   activeBrowserPlatform = targetPlatform;
   activeBrowserMulti = isMulti;
+  activeBrowserManageOnly = Boolean(res.manage_only);
   renderBrowserLoginState(res);
   $('browser-login-panel').hidden = false;
 
@@ -543,10 +578,14 @@ function pollBrowserAttempt(res, targetPlatform, isMulti) {
       if (st.state === 'COMPLETED') {
         stopBrowserPoll();
         const msg = st.message || `${targetPlatform} Cookie 已通过本地浏览器保存`;
-        const badge = st.capture_mode === 'salvaged' ? '关窗兜底保存' : (isMulti ? '批量同步成功' : '抓取成功');
+        const badge = st.manage_only
+          ? '管理完成'
+          : st.capture_mode === 'salvaged'
+            ? '关窗兜底保存'
+            : (isMulti ? '批量同步成功' : '抓取成功');
         setSessionActivity(targetPlatform, 'ok', badge, msg);
         notify(msg);
-        await loadSessions();
+        await Promise.all([loadSessions(), loadAccounts()]);
       } else if (st.state === 'CANCELLED' || st.state === 'FAILED') {
         stopBrowserPoll();
         if (st.state === 'FAILED') {
@@ -556,6 +595,7 @@ function pollBrowserAttempt(res, targetPlatform, isMulti) {
         } else {
           setSessionActivity(targetPlatform, 'warn', '窗口已关闭', st.message || '已取消或关闭浏览器登录窗口');
         }
+        await loadAccounts();
       }
     } catch {
       stopBrowserPoll();
@@ -565,17 +605,36 @@ function pollBrowserAttempt(res, targetPlatform, isMulti) {
 
 async function startBrowserLogin(platform) {
   stopBrowserPoll();
+  $('session-clear-guide').hidden = true;
   setSessionActivity(platform, 'info', '启动登录', `正在启动持久化托管浏览器登录 ${platform}...`);
   const res = await api('sessions/' + encodeURIComponent(platform) + '/browser-login', 'POST');
-  pollBrowserAttempt(res, platform, false);
+  pollBrowserAttempt(res, res.platform || platform, false);
 }
 
 async function startMultiBrowserLogin() {
   stopBrowserPoll();
+  $('session-clear-guide').hidden = true;
   const displayTarget = selectedPlatform || '哔哩哔哩';
   setSessionActivity(displayTarget, 'info', '启动多平台窗', '正在打开持久化托管浏览器，可一次性登录并同步多个平台...');
   const res = await api('sessions/browser-workspace/start', 'POST');
   pollBrowserAttempt(res, displayTarget, true);
+}
+
+async function startManageGoogle(accountId = '') {
+  stopBrowserPoll();
+  const displayTarget = selectedPlatform || 'YouTube';
+  setSessionActivity(displayTarget, 'info', '打开账号管理', '正在打开 Google 账号管理页面（只退出/切换网页登录，不覆盖下载凭据）...');
+  const res = await api('sessions/manage-google', 'POST', {account_id: accountId || ''});
+  pollBrowserAttempt(res, res.platform || 'YouTube', false);
+}
+
+async function openBrowserAccount(accountId, platform = '') {
+  stopBrowserPoll();
+  $('session-clear-guide').hidden = true;
+  const targetPlatform = platform || selectedPlatform || 'YouTube';
+  setSessionActivity(targetPlatform, 'info', '打开独立档案', `正在为独立登录档案打开浏览器窗口（起始于 Google 账号页，可随时切至 ${targetPlatform}）...`);
+  const res = await api('sessions/accounts/' + encodeURIComponent(accountId) + '/open', 'POST', {platform: targetPlatform});
+  pollBrowserAttempt(res, res.platform || targetPlatform, false);
 }
 
 function renderSessionCard() {
@@ -681,10 +740,13 @@ function renderSessionCard() {
   $('session-verify').disabled = current.state === 'MISSING' || !current.enabled;
   $('session-qr-login').hidden = !current.has_qr;
   const brBtn = $('session-browser-login');
+  brBtn.textContent = current.state === 'MISSING' ? '登录获取会话' : '重新验证登录';
   brBtn.disabled = current.local_browser_available === false;
   brBtn.title = current.local_browser_available === false
     ? '当前环境未检测到本机 Chrome / Edge / Chromium，请使用默认浏览器打开后导入，或使用官方扫码'
-    : `使用本机 ${current.local_browser_name || 'Chrome / Edge'} 打开独立临时窗口并自动读取 Cookie`;
+    : current.state === 'MISSING'
+      ? `使用本机 ${current.local_browser_name || 'Chrome / Edge'} 登录 ${current.platform} 并保存凭据`
+      : `重新验证或切换 ${current.platform} 登录账号（需点击右下方保存按钮后才更新本地凭据）`;
   const openBtn = $('session-open-browser');
   openBtn.disabled = !current.login_url;
   openBtn.title = current.login_url ? `使用系统默认浏览器打开 ${current.login_url}` : '当前平台暂无直达登录地址';
@@ -707,6 +769,204 @@ function renderSessionCard() {
 async function loadSessions() {
   sessionsData = await api('sessions');
   renderSessionCard();
+  if (accountsState && Array.isArray(accountsState.accounts)) renderAccountsCard();
+}
+
+function updateAccountsBulkBar() {
+  const accounts = accountsState?.accounts || [];
+  const bar = $('accounts-bulk-bar');
+  bar.hidden = !accounts.length;
+  if (!accounts.length) return;
+  const allSelected = accounts.every(a => selectedAccountIds.has(a.id));
+  $('accounts-select-all').textContent = allSelected ? '取消选择' : '全选';
+  $('accounts-logout-current').disabled = !accountsState.current_id;
+  const selBtn = $('accounts-logout-selected');
+  selBtn.textContent = `退出所选（${selectedAccountIds.size}）`;
+  selBtn.disabled = selectedAccountIds.size === 0;
+}
+
+function renderAccountsCard() {
+  const list = $('browser-accounts-list');
+  const accounts = accountsState?.accounts || [];
+  const validIds = new Set(accounts.map(a => a.id));
+  for (const id of [...selectedAccountIds]) {
+    if (!validIds.has(id)) selectedAccountIds.delete(id);
+  }
+  const hasBrowser = !sessionsData.length || sessionsData.some(s => s.local_browser_available !== false);
+  list.replaceChildren();
+
+  if (!accounts.length) {
+    const empty = document.createElement('div');
+    empty.className = 'muted';
+    empty.style.cssText = 'font-size:12.5px;padding:6px 0';
+    empty.textContent = '暂无独立登录档案；点击上方“添加账号”可为多账号隔离分别保存 Google / 各平台会话。';
+    list.append(empty);
+    updateAccountsBulkBar();
+    return;
+  }
+
+  for (const acc of accounts) {
+    const row = document.createElement('div');
+    row.className = 'account-row' + (acc.is_current ? ' current' : '');
+
+    const left = document.createElement('div');
+    left.className = 'account-left';
+
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.className = 'account-check';
+    check.checked = selectedAccountIds.has(acc.id);
+    check.title = `选择账号 ${acc.label}`;
+    check.addEventListener('change', () => {
+      if (check.checked) selectedAccountIds.add(acc.id);
+      else selectedAccountIds.delete(acc.id);
+      updateAccountsBulkBar();
+    });
+
+    const meta = document.createElement('div');
+    meta.className = 'account-meta';
+
+    const title = document.createElement('strong');
+    const flags = [];
+    if (acc.is_current) flags.push('当前档案');
+    if (acc.signed_out) flags.push('已退出');
+    if (acc.pending_cleanup) flags.push('清理中');
+    title.textContent = flags.length ? `${acc.label}（${flags.join(' · ')}）` : acc.label;
+
+    const sub = document.createElement('small');
+    const parts = [];
+    if (acc.signed_out) parts.push('已退出登录，点击“打开”可重新登录');
+    else parts.push(acc.has_browser_data ? '已保存浏览器状态' : '空白独立容器');
+    if (Array.isArray(acc.bound_platforms) && acc.bound_platforms.length) {
+      parts.push(`已关联：${acc.bound_platforms.join('、')}`);
+    } else {
+      parts.push('未关联平台下载凭据');
+    }
+    sub.textContent = parts.join(' · ');
+
+    meta.append(title, sub);
+    left.append(check, meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'actions tight';
+
+    if (!acc.is_current) {
+      const actBtn = document.createElement('button');
+      actBtn.type = 'button';
+      actBtn.textContent = '设为当前';
+      actBtn.addEventListener('click', () => action(actBtn, async () => {
+        accountsState = await api('sessions/accounts/' + encodeURIComponent(acc.id) + '/activate', 'POST');
+        renderAccountsCard();
+        notify(`已切换当前独立档案为「${acc.label}」`);
+      }));
+      actions.append(actBtn);
+    }
+
+    const openBtn = document.createElement('button');
+    openBtn.type = 'button';
+    openBtn.className = 'primary';
+    openBtn.textContent = '打开';
+    openBtn.disabled = !hasBrowser;
+    openBtn.title = hasBrowser ? `使用「${acc.label}」独立浏览器容器打开 Google 账号与平台登录页` : '未检测到本机 Chrome / Edge 浏览器';
+    openBtn.addEventListener('click', () => action(openBtn, async () => {
+      await openBrowserAccount(acc.id, selectedPlatform || 'YouTube');
+      await loadAccounts();
+    }));
+
+    const syncBtn = document.createElement('button');
+    syncBtn.type = 'button';
+    syncBtn.textContent = '同步';
+    syncBtn.disabled = !hasBrowser || acc.signed_out || !acc.has_browser_data;
+    syncBtn.title = '从该独立容器读取已登录平台的 Cookie 并更新下载凭据';
+    syncBtn.addEventListener('click', () => action(syncBtn, async () => {
+      const res = await api('sessions/accounts/' + encodeURIComponent(acc.id) + '/sync', 'POST', {include_manual: false});
+      const synced = res.synced_platforms || [];
+      const skipped = res.skipped_platforms || [];
+      if (synced.length) {
+        const msg = `「${acc.label}」已同步 ${synced.join('、')}（${res.total_cookies || 0} 项 Cookie）`
+          + (skipped.length ? `；另有 ${skipped.join('、')} 需“打开”窗口后手动点保存` : '');
+        notify(msg);
+      } else {
+        const msg = skipped.length
+          ? `「${acc.label}」检测到 ${skipped.join('、')}，请点击“打开”进入对应平台页面后手动保存`
+          : `「${acc.label}」暂未发现可同步的平台登录态`;
+        notify(msg, true);
+      }
+      await Promise.all([loadSessions(), loadAccounts()]);
+    }));
+
+    const googleBtn = document.createElement('button');
+    googleBtn.type = 'button';
+    googleBtn.textContent = 'Google';
+    googleBtn.disabled = !hasBrowser;
+    googleBtn.title = '打开该档案的 Google 账号页面手动退出或切换网页登录（不修改下载凭据）';
+    googleBtn.addEventListener('click', () => action(googleBtn, async () => {
+      await startManageGoogle(acc.id);
+    }));
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.textContent = '删除';
+    delBtn.title = '移除该独立登录档案并安全清理其关联下载凭据与隔离目录';
+    delBtn.addEventListener('click', () => action(delBtn, async () => {
+      if (!confirm(`确定删除独立登录档案「${acc.label}」吗？\n关联到此档案的已保存下载凭据和该容器浏览器记录将被一并清理。`)) return;
+      accountsState = await api('sessions/accounts/' + encodeURIComponent(acc.id), 'DELETE');
+      selectedAccountIds.delete(acc.id);
+      renderAccountsCard();
+      await loadSessions();
+      notify(`已删除独立档案「${acc.label}」`);
+    }));
+
+    actions.append(openBtn, syncBtn, googleBtn, delBtn);
+    row.append(left, actions);
+    list.append(row);
+  }
+  updateAccountsBulkBar();
+}
+
+async function loadAccounts() {
+  accountsState = await api('sessions/accounts');
+  renderAccountsCard();
+}
+
+function openAccountModal() {
+  const input = $('account-label-input');
+  input.value = '';
+  $('account-add-modal').hidden = false;
+  setTimeout(() => input.focus(), 20);
+}
+
+function closeAccountModal() {
+  $('account-add-modal').hidden = true;
+}
+
+async function submitNewAccount() {
+  const label = $('account-label-input').value.trim();
+  if (!label) {
+    notify('请输入档案名称或邮箱备注', true);
+    $('account-label-input').focus();
+    return;
+  }
+  accountsState = await api('sessions/accounts', 'POST', {label});
+  closeAccountModal();
+  renderAccountsCard();
+  notify(`已添加独立登录档案「${label}」，点击“打开”即可隔离登录`);
+}
+
+async function performLogoutAccounts(ids, descLabel) {
+  if (!ids.length) return;
+  if (!confirm(`确定退出${descLabel}吗？\n仅由该档案保存且未被覆盖的下载凭据将被移除，对应浏览器目录也会隔离重置（重新“打开”可重登）。`)) return;
+  const res = await api('sessions/accounts/logout', 'POST', {account_ids: ids});
+  accountsState = res.accounts || {current_id: null, accounts: []};
+  for (const id of ids) selectedAccountIds.delete(id);
+  renderAccountsCard();
+  await loadSessions();
+  const cleared = res.cleared_platforms || [];
+  notify(
+    cleared.length
+      ? `已退出${descLabel}，并安全清理了 ${cleared.join('、')} 下载凭据`
+      : `已退出${descLabel}并重置对应隔离浏览器容器`
+  );
 }
 
 // -------------------- 已识别桥接与 Bot 摘要 --------------------
@@ -989,11 +1249,11 @@ async function init() {
   settings = await api('config');
   populate();
   setSaveStatus('saved', '已保存');
-  await Promise.all([loadSessions(), loadBots(), refresh()]);
+  await Promise.all([loadSessions(), loadAccounts(), loadBots(), refresh()]);
   mcpConfig = await api('mcp-config');
   clearInterval(refreshTimer);
   refreshTimer = setInterval(() => {
-    Promise.all([refresh(), loadSessions()]).catch(() => {
+    Promise.all([refresh(), loadSessions(), loadAccounts()]).catch(() => {
       $('connection').textContent = '连接已断开';
     });
   }, 10000);
@@ -1110,6 +1370,7 @@ $('reset-settings').addEventListener('click', () => action($('reset-settings'), 
 
 $('cookie-platform').addEventListener('change', e => {
   selectedPlatform = e.target.value;
+  $('session-clear-guide').hidden = true;
   renderSessionCard();
 });
 
@@ -1133,9 +1394,22 @@ $('session-disable-switch').addEventListener('change', async e => {
 $('session-clear').addEventListener('click', () => action($('session-clear'), async () => {
   const target = selectedPlatform;
   await api('sessions/' + encodeURIComponent(target), 'DELETE');
+  $('session-clear-guide').hidden = false;
   setSessionActivity(target, 'warn', '已清除', `${target} Cookie 凭据已从本地加密存储中移除`);
   notify(`${target} Cookie 已清除`);
-  await loadSessions();
+  await Promise.all([loadSessions(), loadAccounts()]);
+}));
+
+$('session-clear-done').addEventListener('click', () => {
+  $('session-clear-guide').hidden = true;
+});
+
+$('session-manage-google').addEventListener('click', () => action($('session-manage-google'), async () => {
+  await startManageGoogle(accountsState?.current_id || '');
+}));
+
+$('session-manage-google-legacy').addEventListener('click', () => action($('session-manage-google-legacy'), async () => {
+  await startManageGoogle('');
 }));
 
 $('session-verify').addEventListener('click', () => action($('session-verify'), async () => {
@@ -1212,6 +1486,24 @@ $('session-open-browser').addEventListener('click', () => action($('session-open
   }
 }));
 
+$('browser-nav-google').addEventListener('click', () => action($('browser-nav-google'), async () => {
+  if (!activeBrowserAttempt) return;
+  await api('sessions/browser-login/' + encodeURIComponent(activeBrowserAttempt) + '/navigate', 'POST', {target: 'google'});
+  $('browser-status-text').textContent = '已在本地浏览器窗口导航至 Google 账号页';
+}));
+
+$('browser-nav-platform').addEventListener('click', () => action($('browser-nav-platform'), async () => {
+  if (!activeBrowserAttempt) return;
+  await api('sessions/browser-login/' + encodeURIComponent(activeBrowserAttempt) + '/navigate', 'POST', {target: 'platform'});
+  $('browser-status-text').textContent = `已导航至 ${activeBrowserPlatform || selectedPlatform} 登录页`;
+}));
+
+$('browser-nav-reload').addEventListener('click', () => action($('browser-nav-reload'), async () => {
+  if (!activeBrowserAttempt) return;
+  await api('sessions/browser-login/' + encodeURIComponent(activeBrowserAttempt) + '/navigate', 'POST', {target: 'reload'});
+  $('browser-status-text').textContent = '正在重新加载平台登录页...';
+}));
+
 $('browser-manual-capture').addEventListener('click', () => action($('browser-manual-capture'), async () => {
   if (!activeBrowserAttempt) return;
   const path = activeBrowserMulti
@@ -1219,18 +1511,64 @@ $('browser-manual-capture').addEventListener('click', () => action($('browser-ma
     : 'sessions/' + encodeURIComponent(activeBrowserPlatform) + '/browser-capture';
   await api(path, 'POST');
   $('browser-stage-pill').className = 'status-pill info';
-  $('browser-stage-pill').textContent = '即时抓取中';
-  $('browser-status-text').textContent = '已触发即时抓取指令，正在读取当前会话完整 Cookie 并加密保存...';
+  if (activeBrowserManageOnly) {
+    $('browser-stage-pill').textContent = '正在完成';
+    $('browser-status-text').textContent = '正在关闭网页账号管理确认状态...';
+  } else {
+    $('browser-stage-pill').textContent = '即时抓取中';
+    $('browser-status-text').textContent = '已触发即时抓取指令，正在读取当前会话完整 Cookie 并加密保存...';
+  }
 }));
 
 $('browser-cancel').addEventListener('click', () => action($('browser-cancel'), async () => {
   const target = activeBrowserPlatform || selectedPlatform;
+  const manageMode = activeBrowserManageOnly;
   const path = activeBrowserMulti
     ? 'sessions/browser-workspace/cancel'
     : 'sessions/' + encodeURIComponent(target) + '/browser-cancel';
   await api(path, 'POST');
   stopBrowserPoll();
-  setSessionActivity(target, 'warn', '已关闭登录窗', '已取消并关闭本地托管浏览器登录窗口');
+  setSessionActivity(target, 'warn', '已关闭登录窗', manageMode ? '已关闭 Google 账号管理窗口' : '已取消并关闭本地托管浏览器登录窗口');
+}));
+
+$('account-add-btn').addEventListener('click', openAccountModal);
+$('account-modal-close').addEventListener('click', closeAccountModal);
+$('account-modal-cancel').addEventListener('click', closeAccountModal);
+$('account-add-modal').addEventListener('click', e => {
+  if (e.target === $('account-add-modal')) closeAccountModal();
+});
+$('account-modal-confirm').addEventListener('click', () => action($('account-modal-confirm'), submitNewAccount));
+$('account-label-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    action($('account-modal-confirm'), submitNewAccount);
+  } else if (e.key === 'Escape') {
+    closeAccountModal();
+  }
+});
+
+$('accounts-select-all').addEventListener('click', () => {
+  const accounts = accountsState?.accounts || [];
+  const allSelected = accounts.length > 0 && accounts.every(a => selectedAccountIds.has(a.id));
+  if (allSelected) {
+    selectedAccountIds.clear();
+  } else {
+    for (const a of accounts) selectedAccountIds.add(a.id);
+  }
+  renderAccountsCard();
+});
+
+$('accounts-logout-current').addEventListener('click', () => action($('accounts-logout-current'), async () => {
+  const curId = accountsState?.current_id;
+  if (!curId) return;
+  const cur = (accountsState.accounts || []).find(a => a.id === curId);
+  await performLogoutAccounts([curId], `当前独立档案「${cur?.label || curId}」`);
+}));
+
+$('accounts-logout-selected').addEventListener('click', () => action($('accounts-logout-selected'), async () => {
+  const ids = [...selectedAccountIds];
+  if (!ids.length) return;
+  await performLogoutAccounts(ids, `所选 ${ids.length} 个独立档案`);
 }));
 
 $('session-qr-login').addEventListener('click', () => action($('session-qr-login'), startBilibiliQrLogin));
@@ -1288,7 +1626,7 @@ $('scan-bridges').addEventListener('click', () => action($('scan-bridges'), asyn
 $('refresh').addEventListener('click', () => action($('refresh'), async () => {
   settings = await api('config');
   populate();
-  await Promise.all([loadSessions(), loadBots(), refresh()]);
+  await Promise.all([loadSessions(), loadAccounts(), loadBots(), refresh()]);
   notify('状态已同步');
 }));
 

@@ -673,3 +673,244 @@ async def test_astrbot_plugin_stage_visualization_and_direct_error(tmp_path, mon
     err_res = await plugin.process(DummyEvent(), 'https://www.bilibili.com/video/BV1fail', 'default', emit=lambda m: asyncio.sleep(0, result=err_emitted.append(m)))
     assert '登录凭证已过期，请扫码重新登录' in err_emitted[-1]
     assert '登录凭证已过期，请扫码重新登录' in err_res
+
+
+@pytest.mark.asyncio
+async def test_android_style_explicit_reverify_manage_only_and_multi_account_profiles(service, monkeypatch):
+    """验证对齐 Android 版的防自动覆盖重验证、Google manage_only、页内导航及多账号隔离退出闭环。"""
+    from starlette.testclient import TestClient
+    from omni_agent.api import create_app, invoke
+    from omni_agent.cookie_login import LocalBrowserLoginManager
+
+    fake_browser = {'name': 'Chrome', 'path': 'mock-chrome'}
+    monkeypatch.setattr('omni_agent.cookie_login.find_local_browser', lambda: fake_browser)
+    monkeypatch.setattr('omni_agent.service.find_local_browser', lambda: fake_browser)
+    monkeypatch.setattr(service.browser_logins, 'POLL_INTERVAL_SEC', 0.01)
+    monkeypatch.setattr(service.browser_logins, 'PORT_WAIT_STEP_SEC', 0.01)
+    monkeypatch.setattr(service.browser_logins, 'CONFIRM_WINDOW_SEC', 0.02)
+
+    cfg = service.config
+    app = create_app(service)
+
+    launch_records = []
+    nav_records = []
+    procs = []
+    real_exec = asyncio.create_subprocess_exec
+
+    class FakeProc:
+        def __init__(self):
+            self.returncode = None
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_exec(*cmd, **kwargs):
+        if cmd and str(cmd[0]) == 'mock-chrome':
+            data_dir = None
+            for arg in cmd:
+                if str(arg).startswith('--user-data-dir='):
+                    data_dir = Path(str(arg).split('=', 1)[1])
+                    data_dir.mkdir(parents=True, exist_ok=True)
+                    (data_dir / 'DevToolsActivePort').write_text('9333\n/devtools/browser/mock\n', encoding='utf-8')
+                    (data_dir / 'Local State').write_text('{"os_crypt":{}}', encoding='utf-8')
+            launch_records.append({'cmd': list(cmd), 'profile_dir': data_dir, 'url': str(cmd[-1])})
+            proc = FakeProc()
+            procs.append(proc)
+            return proc
+        return await real_exec(*cmd, **kwargs)
+
+    async def fake_close(port, ws_path):
+        return None
+
+    async def fake_probe(port, ws_path):
+        return (bool(procs and procs[-1].returncode is None), 'ws://127.0.0.1:9333/devtools/browser/mock')
+
+    async def fake_open_tab(ws_url, target_url):
+        launch_records.append({'reuse_tab': True, 'url': target_url})
+        return True
+
+    async def fake_navigate(port, ws_path, target_url):
+        nav_records.append(target_url)
+        return True
+
+    async def fake_targets(port, ws_path):
+        return {'current_host': 'accounts.google.com', 'page_ws': ''}
+
+    snap_state = {
+        'host': 'x.com',
+        'cookies': [
+            {'name': 'auth_token', 'value': 'new-x-auth', 'domain': '.x.com', 'path': '/', 'httpOnly': True, 'secure': True},
+            {'name': 'ct0', 'value': 'new-x-ct0', 'domain': '.x.com', 'path': '/'},
+        ],
+    }
+
+    async def fake_snapshot(port, ws_path, cookie_urls=()):
+        return {'cdp_connected': True, 'current_host': snap_state['host'], 'cookies': list(snap_state['cookies'])}
+
+    monkeypatch.setattr('omni_agent.cookie_login.asyncio.create_subprocess_exec', fake_exec)
+    monkeypatch.setattr('omni_agent.cookie_login.close_cdp_browser', fake_close)
+    monkeypatch.setattr('omni_agent.cookie_login.probe_cdp_alive', fake_probe)
+    monkeypatch.setattr('omni_agent.cookie_login.open_cdp_tab', fake_open_tab)
+    monkeypatch.setattr('omni_agent.cookie_login.navigate_cdp_page', fake_navigate)
+    monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_targets', fake_targets)
+    monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_snapshot', fake_snapshot)
+    monkeypatch.setattr(service, 'verify_cookie', lambda p: asyncio.sleep(0, result={'state': 'VALID'}))
+
+    def read_cookie_text(plat):
+        with service.sessions.cookie_file(plat) as path:
+            return Path(path).read_text('utf-8') if path else ''
+
+    with TestClient(app) as client:
+        # 1. X (Twitter) 已有凭据时，重新验证登录必须 require_explicit_save=True，不自动覆盖，关窗也不覆盖
+        service.import_cookie('X (Twitter)', 'auth_token=old-x-auth; ct0=old-x-ct0')
+        relogin = client.post('/api/admin/sessions/X%20(Twitter)/browser-login').json()
+        assert relogin['require_explicit_save'] is True
+        attempt_1 = relogin['attempt_id']
+        for _ in range(25):
+            st = client.get(f'/api/admin/sessions/browser-status/{attempt_1}').json()
+            if st['marker_detected'] and st['cookie_count'] == 2:
+                break
+            time.sleep(0.01)
+        assert client.get(f'/api/admin/sessions/browser-status/{attempt_1}').json()['state'] in ('OPENING', 'WAITING')
+        assert 'old-x-auth' in read_cookie_text('X (Twitter)')
+
+        # 关闭窗口而不点保存 -> 绝对不覆盖 old-x-auth
+        procs[-1].returncode = 0
+        closed_st = {}
+        for _ in range(30):
+            closed_st = client.get(f'/api/admin/sessions/browser-status/{attempt_1}').json()
+            if closed_st['state'] == 'CANCELLED':
+                break
+            time.sleep(0.01)
+        assert closed_st['state'] == 'CANCELLED'
+        assert 'old-x-auth' in read_cookie_text('X (Twitter)')
+
+        # 再次重新验证，测试页内导航 + 显式点击“保存下载凭据”才真正覆盖
+        relogin_2 = client.post('/api/admin/sessions/X%20(Twitter)/browser-login').json()
+        attempt_2 = relogin_2['attempt_id']
+        for _ in range(25):
+            if client.get(f'/api/admin/sessions/browser-status/{attempt_2}').json()['cdp_connected']:
+                break
+            time.sleep(0.01)
+        assert client.post(f'/api/admin/sessions/browser-login/{attempt_2}/navigate', json={'target': 'google'}).status_code == 200
+        assert client.post(f'/api/admin/sessions/browser-login/{attempt_2}/navigate', json={'target': 'platform'}).status_code == 200
+        assert client.post(f'/api/admin/sessions/browser-login/{attempt_2}/navigate', json={'target': 'reload'}).status_code == 200
+        assert nav_records[:2] == ['https://accounts.google.com/', 'https://x.com/i/flow/login']
+        assert client.post('/api/admin/sessions/X%20(Twitter)/browser-capture').status_code == 200
+        for _ in range(40):
+            if client.get(f'/api/admin/sessions/browser-status/{attempt_2}').json()['state'] == 'COMPLETED':
+                break
+            time.sleep(0.01)
+        assert 'new-x-auth' in read_cookie_text('X (Twitter)')
+
+        # 2. manage-google 模式打开 Google 账号页，只管理网页登录，不修改已保存凭据
+        manage = client.post('/api/admin/sessions/manage-google', json={}).json()
+        assert manage['manage_only'] is True and manage['require_explicit_save'] is True
+        manage_id = manage['attempt_id']
+        for _ in range(25):
+            if client.get(f'/api/admin/sessions/browser-status/{manage_id}').json()['cdp_connected']:
+                break
+            time.sleep(0.01)
+        assert launch_records[-1]['url'] == 'https://accounts.google.com/'
+        assert client.post('/api/admin/sessions/YouTube/browser-capture').status_code == 200
+        manage_done = {}
+        for _ in range(30):
+            manage_done = client.get(f'/api/admin/sessions/browser-status/{manage_id}').json()
+            if manage_done['state'] == 'COMPLETED':
+                break
+            time.sleep(0.01)
+        assert manage_done['state'] == 'COMPLETED' and '未保存或修改' in manage_done['message']
+        assert service.sessions.status('YouTube')['state'] == 'MISSING'
+
+        # 3. 独立登录档案多账号隔离：新建、激活、打开隔离容器保存 YouTube + Pixiv、覆写保护、同步及退出清理
+        acc_main = client.post('/api/admin/sessions/accounts', json={'label': '主号 Google'}).json()
+        main_id = acc_main['accounts'][0]['id']
+        acc_alt = client.post('/api/admin/sessions/accounts', json={'label': '工作号'}).json()
+        assert len(acc_alt['accounts']) == 2
+        alt_id = next(a['id'] for a in acc_alt['accounts'] if a['id'] != main_id)
+        act_res = client.post(f'/api/admin/sessions/accounts/{main_id}/activate').json()
+        assert act_res['current_id'] == main_id
+
+        # 打开主号保存 YouTube（启动地址应为 Google 账号页且使用主号隔离目录 _e0）
+        snap_state['host'] = 'www.youtube.com'
+        snap_state['cookies'] = [
+            {'name': 'SID', 'value': 'yt-main-sid', 'domain': '.youtube.com', 'path': '/', 'httpOnly': True, 'secure': True},
+            {'name': 'SAPISID', 'value': 'yt-main-sapisid', 'domain': '.youtube.com', 'path': '/', 'httpOnly': False, 'secure': True},
+        ]
+        open_yt = client.post(f'/api/admin/sessions/accounts/{main_id}/open', json={'platform': 'YouTube'}).json()
+        assert open_yt['account_id'] == main_id and open_yt['require_explicit_save'] is True
+        main_dir_e0 = cfg.directory / 'browser-profiles' / f'{main_id}_e0'
+        yt_attempt = open_yt['attempt_id']
+        for _ in range(30):
+            if client.get(f'/api/admin/sessions/browser-status/{yt_attempt}').json()['cookie_count'] == 2:
+                break
+            time.sleep(0.01)
+        assert launch_records[-1]['url'] == 'https://accounts.google.com/'
+        assert any(r.get('profile_dir') == main_dir_e0 for r in launch_records)
+        client.post('/api/admin/sessions/YouTube/browser-capture')
+        for _ in range(40):
+            if client.get(f'/api/admin/sessions/browser-status/{yt_attempt}').json()['state'] == 'COMPLETED':
+                break
+            time.sleep(0.01)
+
+        # 同时在主号下保存 Pixiv 凭据
+        snap_state['host'] = 'www.pixiv.net'
+        snap_state['cookies'] = [
+            {'name': 'SID', 'value': 'yt-main-sid', 'domain': '.youtube.com', 'path': '/', 'httpOnly': True, 'secure': True},
+            {'name': 'SAPISID', 'value': 'yt-main-sapisid', 'domain': '.youtube.com', 'path': '/', 'httpOnly': False, 'secure': True},
+            {'name': 'PHPSESSID', 'value': 'px-main-1', 'domain': '.pixiv.net', 'path': '/', 'httpOnly': True, 'secure': True},
+        ]
+        open_px = client.post(f'/api/admin/sessions/accounts/{main_id}/open', json={'platform': 'Pixiv'}).json()
+        px_attempt = open_px['attempt_id']
+        for _ in range(30):
+            if client.get(f'/api/admin/sessions/browser-status/{px_attempt}').json()['cookie_count'] == 1:
+                break
+            time.sleep(0.01)
+        client.post('/api/admin/sessions/Pixiv/browser-capture')
+        for _ in range(40):
+            if client.get(f'/api/admin/sessions/browser-status/{px_attempt}').json()['state'] == 'COMPLETED':
+                break
+            time.sleep(0.01)
+
+        # 验证同步接口可工作且账号列表中记录已绑定平台
+        synced = client.post(f'/api/admin/sessions/accounts/{main_id}/sync', json={'include_manual': False}).json()
+        assert 'YouTube' in synced['synced_platforms']
+        listed_before = client.get('/api/admin/sessions/accounts').json()
+        main_entry = next(a for a in listed_before['accounts'] if a['id'] == main_id)
+        assert set(main_entry['bound_platforms']) == {'YouTube', 'Pixiv'}
+
+        # 关闭活动窗口后模拟用户手动覆写 Pixiv（使用其他账号/导入） -> owner_token 变更
+        procs[-1].returncode = 0
+        service.import_cookie('Pixiv', 'PHPSESSID=px-overwritten-by-manual', source='import')
+
+        # 退出主号：仅清除仍归属主号的 YouTube，保留被覆盖的 Pixiv，递增 epoch=1 并删除旧 _e0 目录
+        logout_res = client.post('/api/admin/sessions/accounts/logout', json={'account_ids': [main_id]}).json()
+        assert 'YouTube' in logout_res['cleared_platforms']
+        assert 'Pixiv' not in logout_res['cleared_platforms']
+        assert service.sessions.status('YouTube')['state'] == 'MISSING'
+        assert service.sessions.status('Pixiv')['state'] == 'IMPORTED'
+        assert 'px-overwritten-by-manual' in read_cookie_text('Pixiv')
+        assert not main_dir_e0.exists()
+        main_after = next(a for a in logout_res['accounts']['accounts'] if a['id'] == main_id)
+        assert main_after['epoch'] == 1 and main_after['signed_out'] is True and main_after['bound_platforms'] == []
+
+        # 删除工作号，确认状态 clean
+        del_res = client.delete(f'/api/admin/sessions/accounts/{alt_id}').json()
+        assert len(del_res['accounts']) == 1
+
+        # 4. 严格隔离检查：Agent MCP list_cookie_statuses 绝不泄漏 accounts / ui / owner_token / browser_profile
+        agent_res = await invoke(service, 'agent', 'list_cookie_statuses', {})
+        assert agent_res['ok'] is True
+        agent_statuses = agent_res['result']['platforms']
+        serialized = json.dumps(agent_statuses, ensure_ascii=False)
+        for item in agent_statuses:
+            assert set(item.keys()) == {'platform', 'state', 'enabled', 'validation'}
+            assert set(item['validation'].keys()).issubset({'state', 'checked_at'})
+        for forbidden in ('owner_token', 'source', 'browser_profile', 'browser_accounts', '主号', 'yt-main', 'px-overwritten'):
+            assert forbidden not in serialized

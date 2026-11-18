@@ -516,6 +516,213 @@ async def open_cdp_tab(ws_url: str, url: str) -> bool:
         return False
 
 
+async def navigate_cdp_page(port: int, browser_ws_path: str, url: str) -> bool:
+    """将活动浏览器标签页直接导航至目标地址（优先原标签跳转，失败时回退新开标签）。"""
+    meta = await fetch_cdp_targets(port, browser_ws_path)
+    for page_ws in meta['page_ws_urls'][:1]:
+        try:
+            await _cdp_call(page_ws, 'Page.navigate', {'url': url}, req_id=12, timeout=3.0)
+            return True
+        except Exception:
+            pass
+    if meta['browser_ws_url']:
+        return await open_cdp_tab(meta['browser_ws_url'], url)
+    return False
+
+
+@dataclass
+class ManagedProfileAccount:
+    id: str
+    label: str
+    epoch: int = 0
+    signed_out: bool = False
+    pending_epoch: int | None = None
+    bindings: dict[str, str] = field(default_factory=dict)
+
+
+class ManagedProfileStore:
+    """多账号独立浏览器登录档案仓库（对齐 Android GoogleAccountRepository）。
+
+    - 每个档案拥有独立的 --user-data-dir（data/browser-profiles/<id>_e<epoch>），互不串号；
+    - 索引加密保存在 Vault 中，仅向本机管理员界面返回非敏感备注与已绑定平台列表；
+    - 退出或清理档案时采用两阶段递增 epoch 与 owner 校验，绝不误删其他方式导入的凭据。
+    """
+
+    VAULT_KEY = 'browser-accounts'
+    MAX_ACCOUNTS = 20
+
+    def __init__(self, vault, root_dir: Path):
+        self.vault = vault
+        self.profiles_root = Path(root_dir) / 'browser-profiles'
+        self.profiles_root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._current_id: str | None = None
+        self._accounts: list[ManagedProfileAccount] = []
+        self._load()
+
+    def _load(self) -> None:
+        raw = self.vault.get(self.VAULT_KEY)
+        if not raw:
+            self._accounts = []
+            self._current_id = None
+            return
+        try:
+            root = json.loads(raw)
+        except ValueError:
+            raise AgentError('INTERNAL_ERROR', '独立登录档案数据损坏，请检查凭据目录') from None
+        accounts: list[ManagedProfileAccount] = []
+        for item in root.get('accounts') or []:
+            if not isinstance(item, dict) or not item.get('id'):
+                continue
+            bindings = item.get('bindings') or {}
+            accounts.append(ManagedProfileAccount(
+                id=str(item['id']),
+                label=str(item.get('label') or ''),
+                epoch=int(item.get('epoch') or 0),
+                signed_out=bool(item.get('signed_out', False)),
+                pending_epoch=None if item.get('pending_epoch') is None else int(item['pending_epoch']),
+                bindings={str(k): str(v) for k, v in bindings.items() if k and v},
+            ))
+        cur = root.get('current_id')
+        self._accounts = accounts
+        self._current_id = cur if any(a.id == cur for a in accounts) else None
+
+    def _persist(self) -> None:
+        payload = {
+            'current_id': self._current_id,
+            'accounts': [
+                {
+                    'id': a.id,
+                    'label': a.label,
+                    'epoch': a.epoch,
+                    'signed_out': a.signed_out,
+                    'pending_epoch': a.pending_epoch,
+                    'bindings': a.bindings,
+                }
+                for a in self._accounts
+            ],
+        }
+        self.vault.put(self.VAULT_KEY, json.dumps(payload, ensure_ascii=False))
+
+    def profile_dir(self, account_id: str, epoch: int) -> Path:
+        return self.profiles_root / f'{account_id}_e{epoch}'
+
+    def public_state(self) -> dict:
+        with self._lock:
+            items = []
+            for a in self._accounts:
+                pdir = self.profile_dir(a.id, a.epoch)
+                items.append({
+                    'id': a.id,
+                    'label': a.label,
+                    'epoch': a.epoch,
+                    'signed_out': a.signed_out,
+                    'pending_cleanup': a.pending_epoch is not None,
+                    'bound_platforms': list(a.bindings.keys()),
+                    'has_browser_data': profile_has_session_data(pdir),
+                    'is_current': a.id == self._current_id,
+                })
+            return {'current_id': self._current_id, 'accounts': items}
+
+    def add(self, label: str) -> dict:
+        clean = str(label or '').strip()
+        if not clean or len(clean) > 80:
+            raise AgentError('INVALID_PARAMETER', '请填写不超过 80 字的档案名称')
+        with self._lock:
+            if len(self._accounts) >= self.MAX_ACCOUNTS:
+                raise AgentError('LIMIT_EXCEEDED', f'最多保存 {self.MAX_ACCOUNTS} 个独立登录档案')
+            if any(a.label.lower() == clean.lower() for a in self._accounts):
+                raise AgentError('INVALID_PARAMETER', '档案名称已存在')
+            acc = ManagedProfileAccount(id=uuid.uuid4().hex[:16], label=clean)
+            self._accounts.append(acc)
+            self._current_id = acc.id
+            self._persist()
+            return self.public_state()
+
+    def activate(self, account_id: str) -> dict:
+        with self._lock:
+            acc = next((a for a in self._accounts if a.id == account_id), None)
+            if not acc:
+                raise AgentError('NOT_FOUND', '独立登录档案不存在')
+            if acc.pending_epoch is not None:
+                raise AgentError('INVALID_STATE', '该档案正在清理，请稍候或重试清理')
+            self._current_id = acc.id
+            self._persist()
+            return self.public_state()
+
+    def prepare_open(self, account_id: str) -> tuple[ManagedProfileAccount, Path]:
+        with self._lock:
+            acc = next((a for a in self._accounts if a.id == account_id), None)
+            if not acc:
+                raise AgentError('NOT_FOUND', '独立登录档案不存在')
+            if acc.pending_epoch is not None:
+                raise AgentError('INVALID_STATE', '档案正在清理，请稍后重试')
+            acc.signed_out = False
+            self._current_id = acc.id
+            self._persist()
+            target_dir = self.profile_dir(acc.id, acc.epoch)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            return ManagedProfileAccount(**{**acc.__dict__, 'bindings': dict(acc.bindings)}), target_dir
+
+    def record_binding(self, account_id: str, epoch: int, platform: str, owner_token: str) -> None:
+        with self._lock:
+            acc = next((a for a in self._accounts if a.id == account_id), None)
+            if not acc or acc.epoch != epoch or acc.pending_epoch is not None or acc.signed_out:
+                raise AgentError('INVALID_STATE', '档案已退出或已切换，请重新打开档案后再保存凭据')
+            acc.bindings[platform] = owner_token
+            self._persist()
+
+    def remove_binding(self, account_id: str, platform: str) -> None:
+        with self._lock:
+            acc = next((a for a in self._accounts if a.id == account_id), None)
+            if acc and platform in acc.bindings:
+                acc.bindings.pop(platform, None)
+                self._persist()
+
+    def begin_logout(self, account_ids: list[str]) -> list[tuple[ManagedProfileAccount, Path]]:
+        if not account_ids:
+            raise AgentError('INVALID_PARAMETER', '请选择需要退出的独立登录档案')
+        with self._lock:
+            targets = []
+            for aid in account_ids:
+                acc = next((a for a in self._accounts if a.id == aid), None)
+                if not acc:
+                    raise AgentError('NOT_FOUND', '指定的登录档案不存在')
+                targets.append(acc)
+            prepared = []
+            for acc in targets:
+                old_epoch = acc.pending_epoch if acc.pending_epoch is not None else acc.epoch
+                if acc.pending_epoch is None:
+                    acc.epoch += 1
+                    acc.signed_out = True
+                    acc.pending_epoch = old_epoch
+                prepared.append((
+                    ManagedProfileAccount(**{**acc.__dict__, 'bindings': dict(acc.bindings)}),
+                    self.profile_dir(acc.id, old_epoch),
+                ))
+            self._persist()
+            return prepared
+
+    def finish_logout(self, account_id: str) -> None:
+        with self._lock:
+            acc = next((a for a in self._accounts if a.id == account_id), None)
+            if acc:
+                acc.bindings.clear()
+                acc.pending_epoch = None
+                self._persist()
+
+    def remove_account(self, account_id: str) -> list[tuple[ManagedProfileAccount, Path]]:
+        """准备移除一个已存在档案（需在删除磁盘文件夹与关联凭据前调用）。"""
+        return self.begin_logout([account_id])
+
+    def finalize_remove_account(self, account_id: str) -> None:
+        with self._lock:
+            self._accounts = [a for a in self._accounts if a.id != account_id]
+            if self._current_id == account_id:
+                self._current_id = self._accounts[0].id if self._accounts else None
+            self._persist()
+
+
 def profile_has_session_data(profile_dir: Path | None) -> bool:
     """判断专属托管浏览器目录是否已保留历史登录会话档案（不含敏感字段）。"""
     if not profile_dir or not profile_dir.is_dir():
@@ -773,6 +980,15 @@ class BrowserLoginAttempt:
     proxy: str
     auto_capture: bool = False
     multi_platform: bool = False
+    manage_only: bool = False
+    require_explicit_save: bool = False
+    account_id: str = ''
+    account_label: str = ''
+    account_epoch: int = 0
+    start_url: str = ''
+    profile_dir_used: Path | None = None
+    cdp_port: int | None = None
+    cdp_ws: str = ''
     state: str = 'OPENING'
     stage: str = 'LAUNCHING'
     stage_label: str = '正在启动本地浏览器'
@@ -801,7 +1017,7 @@ class BrowserLoginAttempt:
 
 
 class LocalBrowserLoginManager:
-    """使用持久化专属托管浏览器档案完成单平台/多平台登录与免密续签。"""
+    """使用持久化专属托管浏览器档案完成单平台/多平台登录、账号档案隔离与免密续签。"""
 
     POLL_INTERVAL_SEC = 0.6
     CONFIRM_WINDOW_SEC = 0.7
@@ -815,6 +1031,7 @@ class LocalBrowserLoginManager:
         self._shared_proc = None
         self._shared_port: int | None = None
         self._shared_ws: str = ''
+        self._shared_profile_dir: Path | None = None
         self._launch_lock: asyncio.Lock | None = None
 
     def _get_launch_lock(self) -> asyncio.Lock:
@@ -823,7 +1040,7 @@ class LocalBrowserLoginManager:
         return self._launch_lock
 
     def has_profile_data(self) -> bool:
-        """检查持久化专用浏览器目录中是否已保存账号档案。"""
+        """检查持久化共享浏览器目录中是否已保存账号档案。"""
         return profile_has_session_data(self.profile_dir)
 
     def is_shared_browser_active(self) -> bool:
@@ -860,7 +1077,11 @@ class LocalBrowserLoginManager:
             'platform': a.platform,
             'browser_name': a.browser_name,
             'multi_platform': a.multi_platform,
-            'profile_persistent': self.profile_dir is not None,
+            'manage_only': a.manage_only,
+            'require_explicit_save': a.require_explicit_save,
+            'account_id': a.account_id,
+            'account_label': a.account_label,
+            'profile_persistent': (a.profile_dir_used or self.profile_dir) is not None,
             'state': a.state,
             'stage': a.stage,
             'stage_label': a.stage_label,
@@ -878,6 +1099,16 @@ class LocalBrowserLoginManager:
             'error': a.error,
         }
 
+    async def navigate_attempt(self, attempt_id: str, url: str) -> dict:
+        """在当前活动登录浏览器窗口中跳转至指定 URL（如 Google 账号页、平台登录页或重载）。"""
+        a = self.get(attempt_id)
+        if a.state not in ('OPENING', 'WAITING') or not a.cdp_port:
+            raise AgentError('INVALID_STATE', '当前登录窗口未连接就绪')
+        if not str(url).startswith(('https://', 'http://')):
+            raise AgentError('INVALID_PARAMETER', '无效导航地址')
+        ok = await navigate_cdp_page(a.cdp_port, a.cdp_ws, url)
+        return {'navigated': ok}
+
     def request_manual_capture(self, platform: str) -> dict:
         with self._lock:
             active = [a for a in self._attempts.values() if a.platform == platform and a.state in ('OPENING', 'WAITING')]
@@ -885,7 +1116,8 @@ class LocalBrowserLoginManager:
                 raise AgentError('NOT_FOUND', '当前没有正在进行的本地浏览器登录窗口')
             target = max(active, key=lambda a: a.created_at)
             target.manual_capture_requested = True
-            self.set_stage(target, 'CAPTURING', '收到抓取指令，正在立即读取浏览器 Cookie...')
+            msg = '正在结束网页管理...' if target.manage_only else '收到保存指令，正在立即读取浏览器 Cookie...'
+            self.set_stage(target, 'CAPTURING', msg)
             self._wake(target)
             return {'attempt_id': target.attempt_id, 'requested': True}
 
@@ -957,15 +1189,19 @@ class LocalBrowserLoginManager:
             self._shared_proc = None
             self._shared_port = None
             self._shared_ws = ''
+            self._shared_profile_dir = None
 
-    async def _try_reuse_shared_browser(self, target_url: str) -> tuple[object, int, str] | None:
+    async def _try_reuse_shared_browser(self, target_dir: Path, target_url: str) -> tuple[object, int, str] | None:
         if self._shared_proc is None or self._shared_proc.returncode is not None or not self._shared_port:
+            return None
+        if self._shared_profile_dir is None or Path(self._shared_profile_dir).resolve() != Path(target_dir).resolve():
             return None
         alive, ws_url = await probe_cdp_alive(self._shared_port, self._shared_ws)
         if not alive:
             self._shared_proc = None
             self._shared_port = None
             self._shared_ws = ''
+            self._shared_profile_dir = None
             return None
         if target_url and target_url != 'about:blank' and ws_url:
             await open_cdp_tab(ws_url, target_url)
@@ -980,6 +1216,13 @@ class LocalBrowserLoginManager:
         on_capture,
         domains: dict | None = None,
         on_capture_many=None,
+        profile_dir_override: Path | None = None,
+        initial_url: str | None = None,
+        manage_only: bool = False,
+        require_explicit_save: bool = False,
+        account_id: str = '',
+        account_label: str = '',
+        account_epoch: int = 0,
     ) -> dict:
         is_multi = platform == MULTI_PLATFORM_KEY
         if not is_multi and platform not in PLATFORM_LOGIN_POLICIES:
@@ -990,15 +1233,18 @@ class LocalBrowserLoginManager:
 
         policy = PLATFORM_LOGIN_POLICIES.get(platform, {})
         all_domains = domains or {}
+        effective_explicit = bool(manage_only or require_explicit_save or is_multi or not policy.get('auto_capture'))
+        start_url = initial_url or ('https://www.bilibili.com/' if is_multi else policy['start_url'])
+        target_profile_dir = Path(profile_dir_override) if profile_dir_override else self.profile_dir
+
         now = time.time()
         loop = asyncio.get_running_loop()
         with self._lock:
-            # 同一目标如已有未关闭监听尝试，平滑替换旧尝试（但不强制杀死复用中的共享浏览器）
             for old in list(self._attempts.values()):
-                if old.platform == platform and old.state in ('OPENING', 'WAITING'):
+                if old.state in ('OPENING', 'WAITING') and (old.platform == platform or old.profile_dir_used != target_profile_dir):
                     old.cancel_requested = True
                     old.state = 'CANCELLED'
-                    self.set_stage(old, 'CANCELLED', '已切换至新打开的登录任务')
+                    self.set_stage(old, 'CANCELLED', '已切换至新打开的登录窗口')
                     self._wake(old)
                 elif now - old.created_at > 900 or (old.state in ('COMPLETED', 'CANCELLED', 'FAILED') and now - old.updated_at > 180):
                     self._attempts.pop(old.attempt_id, None)
@@ -1008,26 +1254,33 @@ class LocalBrowserLoginManager:
                 platform=platform,
                 browser_name=browser['name'],
                 proxy=proxy,
-                auto_capture=False if is_multi else bool(policy.get('auto_capture')),
+                auto_capture=bool(not effective_explicit and policy.get('auto_capture')),
                 multi_platform=is_multi,
+                manage_only=manage_only,
+                require_explicit_save=effective_explicit,
+                account_id=account_id,
+                account_label=account_label,
+                account_epoch=account_epoch,
+                start_url=start_url,
+                profile_dir_used=target_profile_dir,
                 created_at=now,
                 updated_at=now,
                 wake_event=asyncio.Event(),
                 loop=loop,
             )
+            title_tag = f'{account_label} · {platform}' if account_label else platform
             init_msg = (
-                f'正在启动本地 {browser["name"]} 多平台托管工作窗（自动保存历史登录档案）...'
-                if is_multi
-                else f'正在启动本地 {browser["name"]} 独立登录窗口...'
+                f'正在打开 Google 账号管理页面（此模式仅管理退出，不保存凭据）...'
+                if manage_only
+                else f'正在启动本地 {browser["name"]} 登录 {title_tag}...'
             )
             self.set_stage(attempt, 'LAUNCHING', init_msg)
             self._attempts[attempt.attempt_id] = attempt
 
-        start_url = 'https://www.bilibili.com/' if is_multi else policy['start_url']
-        using_persistent = self.profile_dir is not None
+        using_persistent = target_profile_dir is not None
         temp_profile = None
         if using_persistent:
-            data_dir = self.profile_dir
+            data_dir = target_profile_dir
             data_dir.mkdir(parents=True, exist_ok=True)
         else:
             temp_profile = tempfile.TemporaryDirectory(prefix='omni-browser-login-', ignore_cleanup_errors=True)
@@ -1090,8 +1343,10 @@ class LocalBrowserLoginManager:
             confirm_polls = 0
             try:
                 async with self._get_launch_lock():
+                    if using_persistent and self._shared_proc is not None and self._shared_profile_dir != data_dir:
+                        await self._shutdown_browser_process(self._shared_proc, self._shared_port, self._shared_ws)
                     if using_persistent:
-                        reused_info = await self._try_reuse_shared_browser(start_url)
+                        reused_info = await self._try_reuse_shared_browser(data_dir, start_url)
                         if reused_info:
                             proc, cdp_port, cdp_ws = reused_info
                             reused = True
@@ -1116,10 +1371,13 @@ class LocalBrowserLoginManager:
                             self._shared_proc = proc
                             self._shared_port = cdp_port
                             self._shared_ws = cdp_ws
+                            self._shared_profile_dir = data_dir
                     else:
                         attempt.process = proc
                         self.set_stage(attempt, 'CONNECTING', f'已复用打开中的 {browser["name"]} 独立窗口，正在建立读取通道...')
 
+                attempt.cdp_port = cdp_port
+                attempt.cdp_ws = cdp_ws
                 if attempt.cancel_requested or (proc and proc.returncode is not None):
                     attempt.state = 'CANCELLED'
                     self.set_stage(attempt, 'CANCELLED', '本地浏览器窗口已关闭（尚未完成通道初始化）')
@@ -1129,12 +1387,14 @@ class LocalBrowserLoginManager:
 
                 attempt.state = 'WAITING'
                 attempt.cdp_connected = True
-                if is_multi:
-                    wait_msg = f'已在持久托管 {browser["name"]} 中监听全平台；在窗口内登录任意平台后点击“我已登录，抓取保存”或直接关窗自动保存'
-                elif policy.get('auto_capture'):
+                if manage_only:
+                    wait_msg = '请在打开的 Google 页面点击右上角头像手动退出登录（此页面不会保存或覆盖任何下载凭据），完成后点“完成”关闭'
+                elif is_multi:
+                    wait_msg = f'已在持久托管 {browser["name"]} 中监听全平台；在窗口内登录任意平台后点击“保存全部已登录平台”或直接关窗自动保存'
+                elif attempt.auto_capture:
                     wait_msg = f'已连接本地 {browser["name"]} 读取通道；请完成账号登录，系统将自动捕获并保存完整 Cookie'
                 else:
-                    wait_msg = f'已连接本地 {browser["name"]} 读取通道；请完成账号登录后点击“我已登录，抓取保存”'
+                    wait_msg = f'请在本地 {browser["name"]} 确认使用目标账号登录后，点击右下“保存 {platform} 下载凭据”'
                 self.set_stage(attempt, 'WAITING_LOGIN', wait_msg)
 
                 cookie_urls = tuple(
@@ -1150,6 +1410,20 @@ class LocalBrowserLoginManager:
                     first_tick = False
                     if attempt.cancel_requested or proc.returncode is not None:
                         break
+                    if manage_only:
+                        try:
+                            meta = await fetch_cdp_targets(cdp_port, cdp_ws)
+                            if meta.get('current_host'):
+                                attempt.current_host = meta['current_host']
+                        except Exception:
+                            pass
+                        if attempt.manual_capture_requested:
+                            attempt.manual_capture_requested = False
+                            attempt.state = 'COMPLETED'
+                            self.set_stage(attempt, 'COMPLETED', '已完成网页账号管理（未保存或修改本机下载凭据）')
+                            return
+                        continue
+
                     try:
                         snap = await self._collect_cdp_state(cdp_port, cdp_ws, cookie_urls)
                     except Exception:
@@ -1189,7 +1463,7 @@ class LocalBrowserLoginManager:
                             continue
                         ready_names = [i['platform'] for i in scanned if i['marker_detected'] or i['auto_sync_ready']]
                         if ready_names:
-                            attempt.message = f'正在监听多平台窗口 · 已识别 {len(ready_names)} 个平台登录态（{"、".join(ready_names[:5])}{" 等" if len(ready_names) > 5 else ""}），点“我已登录，抓取保存”即可批量入库'
+                            attempt.message = f'正在监听多平台窗口 · 已识别 {len(ready_names)} 个平台登录态（{"、".join(ready_names[:5])}{" 等" if len(ready_names) > 5 else ""}），点保存即可批量入库'
                         elif attempt.cookie_count > 0:
                             attempt.message = f'正在监听多平台窗口 · 已捕获 {attempt.cookie_count} 项基础 Cookie，请完成目标网站登录'
                         else:
@@ -1213,10 +1487,10 @@ class LocalBrowserLoginManager:
                             await _complete_single(selected_netscape, selected_count, 'manual')
                             return
                         host_tip = f'（当前页面：{attempt.current_host}）' if attempt.current_host else ''
-                        self.set_stage(attempt, 'WAITING_LOGIN', f'尚未扫描到属于 {platform} 的有效 Cookie{host_tip}，请先登录网页后再点击抓取')
+                        self.set_stage(attempt, 'WAITING_LOGIN', f'尚未取得有效会话{host_tip}，请先完成网页登录后再保存')
                         continue
 
-                    if netscape and policy.get('auto_capture') and marker_hit:
+                    if attempt.auto_capture and netscape and marker_hit:
                         if confirm_polls == 0:
                             confirm_polls = 1
                             self.set_stage(
@@ -1233,28 +1507,39 @@ class LocalBrowserLoginManager:
                         self.set_stage(attempt, 'WAITING_LOGIN', wait_msg)
                     elif cookie_count > 0:
                         host_part = f'@{attempt.current_host}' if attempt.current_host else ''
-                        if policy.get('auto_capture'):
+                        if attempt.auto_capture:
                             attempt.message = f'正在监听登录态{host_part} · 已发现 {cookie_count} 项基础 Cookie，等待登录完成...'
                         else:
-                            attempt.message = f'正在监听{host_part} · 已捕获 {cookie_count} 项 Cookie，请在确认登录后点击“我已登录，抓取保存”'
+                            attempt.message = f'正在监听{host_part} · 已捕获 {cookie_count} 项 Cookie，请在确认登录后点击“保存 {platform} 下载凭据”'
                         attempt.updated_at = time.time()
 
-                # 浏览器窗口关闭前自动兜底挽救
+                # 浏览器窗口关闭前自动兜底挽救（显式保存 / 只管理模式下不自动覆盖）
                 if attempt.state not in ('COMPLETED', 'FAILED'):
-                    if not attempt.cancel_requested:
+                    if not attempt.cancel_requested and not manage_only and not effective_explicit:
                         if is_multi and await _complete_multi(attempt.last_scanned, 'salvaged'):
                             return
                         if not is_multi and attempt.last_netscape and attempt.last_marker_hit:
                             await _complete_single(attempt.last_netscape, attempt.last_cookie_count, 'salvaged')
                             return
+                    if not attempt.cancel_requested and is_multi and attempt.last_scanned:
+                        if await _complete_multi(attempt.last_scanned, 'salvaged'):
+                            return
                     attempt.state = 'CANCELLED'
-                    if not is_multi and attempt.last_cookie_count > 0 and not attempt.cancel_requested:
-                        cancel_msg = (
-                            f'浏览器窗口已关闭（已捕捉到 {attempt.last_cookie_count} 项访客/前置 Cookie，'
-                            '但未识别到核心登录标记，未覆盖现有凭据）'
-                        )
+                    if manage_only:
+                        cancel_msg = '已关闭 Google 账号管理窗口'
+                    elif not is_multi and attempt.last_cookie_count > 0 and not attempt.cancel_requested:
+                        if not attempt.last_marker_hit:
+                            cancel_msg = (
+                                f'浏览器窗口已关闭（仅捕捉到 {attempt.last_cookie_count} 项访客 Cookie，'
+                                '未检测到账号登录标记，未保存凭据）'
+                            )
+                        else:
+                            cancel_msg = (
+                                f'浏览器窗口已关闭（已捕捉到 {attempt.last_cookie_count} 项 Cookie，'
+                                '处于手动确认/防覆盖模式，需点击页面右下保存按钮，未覆盖现有凭据）'
+                            )
                     else:
-                        cancel_msg = '已关闭本地浏览器登录窗口' if attempt.cancel_requested else '本地浏览器窗口已关闭，未检测到可保存登录凭据'
+                        cancel_msg = '已关闭本地浏览器登录窗口' if attempt.cancel_requested else '本地浏览器窗口已关闭，未保存凭据'
                     self.set_stage(attempt, 'CANCELLED', cancel_msg)
             except asyncio.CancelledError:
                 attempt.state = 'CANCELLED'
@@ -1289,13 +1574,22 @@ class LocalBrowserLoginManager:
         existing_imported: set[str],
         *,
         include_manual: bool = False,
+        profile_dir_override: Path | None = None,
         on_capture_many,
     ) -> dict:
         """从持久化托管浏览器直接或后台静默无头同步全部已登录平台的 Cookie。"""
         used_headless = False
         cookies: list[dict] = []
+        target_dir = Path(profile_dir_override) if profile_dir_override else self.profile_dir
 
-        if self.is_shared_browser_active() and self._shared_port:
+        same_active = (
+            self.is_shared_browser_active()
+            and self._shared_port
+            and self._shared_profile_dir is not None
+            and target_dir is not None
+            and Path(self._shared_profile_dir).resolve() == Path(target_dir).resolve()
+        )
+        if same_active:
             alive, ws_url = await probe_cdp_alive(self._shared_port, self._shared_ws)
             if alive:
                 cookie_urls = tuple(
@@ -1307,17 +1601,19 @@ class LocalBrowserLoginManager:
                 self._shared_proc = None
                 self._shared_port = None
                 self._shared_ws = ''
+                self._shared_profile_dir = None
+                same_active = False
 
-        if not cookies and not self.is_shared_browser_active():
-            if not self.has_profile_data():
-                raise AgentError('NOT_FOUND', '本地托管浏览器尚未建立持久化登录档案，请先通过“本地浏览器登录”或“多平台托管登录”完成一次登录')
+        if not cookies and not same_active:
+            if not profile_has_session_data(target_dir):
+                raise AgentError('NOT_FOUND', '该浏览器档案尚未建立网页登录会话，请先打开完成一次登录')
             browser = find_local_browser()
             if not browser:
                 raise AgentError('CAPABILITY_UNAVAILABLE', '未检测到本机 Chrome 或 Edge 浏览器')
             used_headless = True
             async with self._get_launch_lock():
-                cleanup_stale_profile_locks(self.profile_dir)
-                cmd = self._build_browser_cmd(browser['path'], self.profile_dir, proxy, 'about:blank', headless=True)
+                cleanup_stale_profile_locks(target_dir)
+                cmd = self._build_browser_cmd(browser['path'], target_dir, proxy, 'about:blank', headless=True)
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.DEVNULL,
@@ -1326,9 +1622,9 @@ class LocalBrowserLoginManager:
                 )
                 port, ws_path = None, ''
                 try:
-                    port, ws_path = await self._wait_cdp_port_file(self.profile_dir, proc)
+                    port, ws_path = await self._wait_cdp_port_file(target_dir, proc)
                     if not port:
-                        raise AgentError('UPSTREAM_ERROR', '后台读取托管浏览器档案超时，请点击“本地浏览器登录”唤醒同步')
+                        raise AgentError('UPSTREAM_ERROR', '后台读取托管浏览器档案超时，请点“打开”唤醒同步')
                     cookie_urls = tuple(
                         url for pol in PLATFORM_LOGIN_POLICIES.values() for url in (pol.get('cookie_urls') or ())
                     )
@@ -1351,22 +1647,42 @@ class LocalBrowserLoginManager:
             'total_cookies': sum(item['cookie_count'] for item in targets),
         }
 
+    async def delete_profile_dir(self, target_dir: Path | None) -> bool:
+        """优雅停掉占用目标档案目录的任何浏览器进程并安全移除目录。"""
+        if not target_dir:
+            return False
+        resolved = Path(target_dir).resolve()
+        for aid, att in list(self._attempts.items()):
+            if att.profile_dir_used and Path(att.profile_dir_used).resolve() == resolved and att.state in ('OPENING', 'WAITING'):
+                att.cancel_requested = True
+                self._wake(att)
+                if att.task and not att.task.done():
+                    try:
+                        await asyncio.wait_for(att.task, timeout=3)
+                    except Exception:
+                        pass
+        if self._shared_proc is not None and self._shared_profile_dir and Path(self._shared_profile_dir).resolve() == resolved:
+            await self._shutdown_browser_process(self._shared_proc, self._shared_port, self._shared_ws)
+        if not resolved.exists():
+            return True
+        for attempt_idx in range(6):
+            try:
+                shutil.rmtree(resolved)
+                return True
+            except OSError:
+                if attempt_idx == 5:
+                    raise AgentError('INTERNAL_ERROR', '浏览器进程文件尚未完全释放，请稍后再试清理')
+                await asyncio.sleep(0.25)
+        return True
+
     async def reset_profile(self) -> dict:
-        """优雅关闭正在运行的托管浏览器实例并彻底清空持久化浏览器数据目录。"""
+        """优雅关闭正在运行的托管浏览器实例并彻底清空共享持久化浏览器数据目录。"""
         await self.close_all()
         if self._shared_proc is not None:
             await self._shutdown_browser_process(self._shared_proc, self._shared_port, self._shared_ws)
         if not self.profile_dir:
             return {'cleared': False}
-        if self.profile_dir.exists():
-            for attempt_idx in range(5):
-                try:
-                    shutil.rmtree(self.profile_dir)
-                    break
-                except OSError:
-                    if attempt_idx == 4:
-                        raise AgentError('INTERNAL_ERROR', '浏览器进程文件尚未完全释放，请稍后再点清理')
-                    await asyncio.sleep(0.25)
+        await self.delete_profile_dir(self.profile_dir)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         return {'cleared': True}
 

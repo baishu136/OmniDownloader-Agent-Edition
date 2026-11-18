@@ -104,6 +104,26 @@ class SyncBrowserProfileArgs(Input):
     include_manual: bool = False
 
 
+class BrowserAccountCreateArgs(Input):
+    label: str = Field(min_length=1, max_length=80)
+
+
+class BrowserAccountOpenArgs(Input):
+    platform: str = 'YouTube'
+
+
+class BrowserAccountLogoutArgs(Input):
+    account_ids: list[str] = Field(min_length=1, max_length=20)
+
+
+class ManageGoogleArgs(Input):
+    account_id: str = ''
+
+
+class BrowserNavigateArgs(Input):
+    target: Literal['google', 'platform', 'reload']
+
+
 class Retry(Input):
     reconciled_allow_retry: bool = False
 
@@ -485,6 +505,42 @@ def create_app(service=None):
     @app.post('/api/admin/sessions/browser-profile/reset')
     async def browser_profile_reset():
         return await service.reset_browser_profile()
+
+    @app.get('/api/admin/sessions/accounts')
+    async def browser_accounts_list():
+        return service.list_browser_accounts()
+
+    @app.post('/api/admin/sessions/accounts')
+    async def browser_accounts_add(body: BrowserAccountCreateArgs):
+        return service.add_browser_account(body.label)
+
+    @app.post('/api/admin/sessions/accounts/logout')
+    async def browser_accounts_logout(body: BrowserAccountLogoutArgs):
+        return await service.logout_browser_accounts(body.account_ids)
+
+    @app.post('/api/admin/sessions/accounts/{account_id}/activate')
+    async def browser_accounts_activate(account_id: str):
+        return service.activate_browser_account(account_id)
+
+    @app.post('/api/admin/sessions/accounts/{account_id}/open')
+    async def browser_accounts_open(account_id: str, body: BrowserAccountOpenArgs | None = None):
+        return await service.open_browser_account(account_id, body.platform if body else 'YouTube')
+
+    @app.post('/api/admin/sessions/accounts/{account_id}/sync')
+    async def browser_accounts_sync(account_id: str, body: SyncBrowserProfileArgs | None = None):
+        return await service.sync_browser_account(account_id, include_manual=bool(body and body.include_manual))
+
+    @app.delete('/api/admin/sessions/accounts/{account_id}')
+    async def browser_accounts_delete(account_id: str):
+        return await service.remove_browser_account(account_id)
+
+    @app.post('/api/admin/sessions/manage-google')
+    async def browser_manage_google(body: ManageGoogleArgs | None = None):
+        return await service.start_manage_google(body.account_id if body else '')
+
+    @app.post('/api/admin/sessions/browser-login/{attempt_id}/navigate')
+    async def browser_login_navigate(attempt_id: str, body: BrowserNavigateArgs):
+        return await service.navigate_browser_login(attempt_id, body.target)
 
     @app.post('/api/admin/sessions/{platform}/browser-login')
     async def browser_login_start(platform: str):

@@ -235,48 +235,49 @@
     </form>
 
     <section id="sessions">
-      <div class="section-heading"><span>05</span><div><h2>平台 Cookie 与会话登录</h2><p>支持持久化专属托管浏览器（一次登录长期免密续签与多平台批量同步）、官方扫码、默认浏览器打开以及多格式加密导入；Agent 仅可查看非敏感状态、禁用或移除。</p></div></div>
+      <div class="section-heading"><span>05</span><div><h2>平台会话与账号档案</h2><p>参照 Android 版登录体验：支持独立隔离账号档案（多账号互不串号）、官方扫码及多格式加密导入；Agent 仅可查看非敏感状态、禁用或移除。</p></div></div>
+
       <div class="session-card">
         <div class="session-picker-row">
           <div>
-            <strong>选择平台</strong>
-            <small id="session-platform-hint">选择需要登录或管理的媒体平台账号会话</small>
+            <strong>平台</strong>
+            <small id="session-platform-hint">导入 Cookie 或登录获取平台会话，解析与下载共用同一份加密凭据</small>
           </div>
           <select id="cookie-platform" aria-label="选择平台"></select>
         </div>
         <div id="session-overview" class="session-chips"></div>
-        <div class="workspace-bar">
-          <div>
-            <div class="login-title-group">
-              <strong>持久化托管浏览器</strong>
-              <span id="browser-profile-pill" class="status-pill">未建立档案</span>
-            </div>
-            <small id="browser-profile-hint">专用隔离目录（不触碰日常浏览器）；首次登录后长期保留会话，支持免密续签与批量同步。</small>
-          </div>
-          <div class="actions tight">
-            <button id="browser-workspace-start" type="button">多平台批量登录</button>
-            <button id="browser-profile-sync" type="button" class="primary">一键免密同步</button>
-            <button id="browser-profile-reset" type="button">清理浏览器档案</button>
-          </div>
-        </div>
+
         <div class="switches sub-switches">
           <label>
             <span>禁用 Cookie<small id="session-disable-desc">仅影响当前平台的后续解析与下载；已保存会话继续加密保留</small></span>
             <input type="checkbox" id="session-disable-switch" role="switch">
           </label>
         </div>
+
         <div class="session-status-row">
           <div>
             <span id="session-pill" class="status-pill">未导入</span>
             <small id="session-meta-hint" class="session-meta-hint"></small>
           </div>
           <div class="actions tight">
-            <button id="session-browser-login" type="button" class="primary">本地浏览器登录</button>
-            <button id="session-open-browser" type="button">默认浏览器打开</button>
-            <button id="session-qr-login" type="button" hidden>B站扫码登录</button>
             <button id="session-verify" type="button">检测</button>
-            <button id="session-clear" type="button">清除</button>
-            <label class="file-button">导入文件<input type="file" id="cookie-file" accept=".txt,.cookies,.json"></label>
+            <button id="session-clear" type="button">清除会话</button>
+            <label class="file-button">导入 Cookies 文件<input type="file" id="cookie-file" accept=".txt,.cookies,.json"></label>
+            <button id="session-open-browser" type="button">默认浏览器打开</button>
+          </div>
+        </div>
+
+        <div class="primary-login-row">
+          <button id="session-browser-login" type="button" class="primary login-main-btn">登录获取会话</button>
+          <button id="session-qr-login" type="button" class="login-qr-btn" hidden>B站官方扫码登录</button>
+        </div>
+
+        <div id="session-clear-guide" class="capture-activity warn" hidden>
+          <span class="status-pill warn">会话已清除</span>
+          <span class="capture-activity-text">已清除本机保存的下载凭据。本地独立浏览器内可能仍保留网页登录态；若通过 Google 等第三方账号登录，请点「管理 Google 登录」手动退出账号，避免再次自动登录原账号。</span>
+          <div class="actions tight">
+            <button id="session-manage-google" type="button">管理 Google 登录</button>
+            <button id="session-clear-done" type="button">完成</button>
           </div>
         </div>
 
@@ -288,12 +289,15 @@
         <div id="browser-login-panel" class="login-subpanel" hidden>
           <div class="login-subpanel-head">
             <div class="login-title-group">
-              <strong id="browser-status-title">本地浏览器登录窗口已打开</strong>
+              <strong id="browser-status-title">平台登录</strong>
               <span id="browser-stage-pill" class="status-pill info">正在启动</span>
+              <small id="browser-host-subtitle" class="login-host-sub">等待页面打开</small>
             </div>
             <div class="actions tight">
-              <button id="browser-manual-capture" type="button" class="primary">我已登录，抓取保存</button>
-              <button id="browser-cancel" type="button">关闭窗口</button>
+              <button id="browser-nav-google" type="button" hidden>Google 账号页</button>
+              <button id="browser-nav-platform" type="button" hidden>平台登录页</button>
+              <button id="browser-nav-reload" type="button">重新加载登录页</button>
+              <button id="browser-cancel" type="button">取消</button>
             </div>
           </div>
           <div class="capture-progress" aria-hidden="true">
@@ -307,7 +311,10 @@
           </div>
           <div id="browser-telemetry" class="capture-telemetry"></div>
           <div id="browser-ready-platforms" class="capture-telemetry" hidden></div>
-          <p id="browser-status-text" class="hint">请在弹出的本机浏览器独立窗口中完成登录；首次登录后会话档案将持久化保留，支持后续免密续签。</p>
+          <div class="capture-footer">
+            <p id="browser-status-text" class="hint">请在弹出的本机浏览器中完成登录；首次登录后会话档案将持久化保留，支持后续免密续签。</p>
+            <button id="browser-manual-capture" type="button" class="primary">完成</button>
+          </div>
         </div>
 
         <div id="qr-login-panel" class="login-subpanel qr-panel" hidden>
@@ -330,11 +337,49 @@
         </div>
 
         <div class="import-box">
-          <label>手动粘贴 Cookie 请求头、Netscape 或浏览器 JSON 数组<textarea id="cookie-text" rows="4" placeholder="粘贴 Cookie 请求头（SESSDATA=...; ...）、Netscape cookies.txt 或 Cookie-Editor 导出的 JSON 数组"></textarea></label>
+          <label>手动粘贴 Cookie 请求头、Netscape 或浏览器 JSON 数组<textarea id="cookie-text" rows="3" placeholder="粘贴 Cookie 请求头（SESSDATA=...; ...）、Netscape cookies.txt 或 Cookie-Editor 导出的 JSON 数组"></textarea></label>
           <div class="actions">
             <button id="import-cookie" type="button" class="primary">加密保存凭据</button>
           </div>
           <p class="hint" id="session-extra-hint">凭据在本地加密保存，不会回显明文；哔哩哔哩与 Pixiv 支持点击“检测”验证账号有效性。</p>
+        </div>
+      </div>
+
+      <div class="session-card accounts-card">
+        <div class="accounts-head">
+          <div>
+            <strong>Google / 独立登录档案（多账号隔离容器）</strong>
+            <small class="hint">每个档案使用独立浏览器隔离目录，名称仅作本机备注。支持在档案中切换平台保存下载凭据、单独或批量退出清理，或后台免密续签。</small>
+          </div>
+          <div class="actions tight">
+            <button id="account-add-btn" type="button" class="primary">添加账号</button>
+            <button id="browser-workspace-start" type="button">多平台批量登录</button>
+          </div>
+        </div>
+
+        <div id="browser-accounts-list" class="accounts-list"></div>
+
+        <div id="accounts-bulk-bar" class="accounts-bulk-bar" hidden>
+          <button id="accounts-select-all" type="button">全选</button>
+          <div class="actions tight">
+            <button id="accounts-logout-current" type="button">退出当前</button>
+            <button id="accounts-logout-selected" type="button">退出所选（0）</button>
+          </div>
+        </div>
+
+        <div class="workspace-bar legacy-bar">
+          <div>
+            <div class="login-title-group">
+              <strong>共享网页登录（默认持久化档案）</strong>
+              <span id="browser-profile-pill" class="status-pill">未建立档案</span>
+            </div>
+            <small>上方“登录获取会话”默认使用共享独立档案；支持一键后台免密同步或手动清理。</small>
+          </div>
+          <div class="actions tight">
+            <button id="browser-profile-sync" type="button">一键免密同步</button>
+            <button id="session-manage-google-legacy" type="button">管理 Google 登录</button>
+            <button id="browser-profile-reset" type="button">清理共享档案</button>
+          </div>
         </div>
       </div>
     </section>
@@ -383,6 +428,23 @@
     <div class="modal-foot">
       <button type="button" id="dir-modal-cancel">取消</button>
       <button type="button" id="dir-modal-confirm" class="primary">选择当前目录</button>
+    </div>
+  </div>
+</div>
+
+<div id="account-add-modal" class="modal-backdrop" hidden>
+  <div class="modal-card modal-card-sm" role="dialog" aria-modal="true" aria-labelledby="account-modal-title">
+    <div class="modal-head">
+      <strong id="account-modal-title">添加独立登录档案</strong>
+      <button type="button" id="account-modal-close">关闭</button>
+    </div>
+    <label>档案名称或邮箱（仅作本机备注）
+      <input id="account-label-input" maxlength="80" placeholder="例如：主号 Google / 工作账号">
+    </label>
+    <p class="hint">每个独立档案使用完全隔离的浏览器目录，退出档案时会安全清理关联下载凭据与浏览器记录。</p>
+    <div class="modal-foot">
+      <button type="button" id="account-modal-cancel">取消</button>
+      <button type="button" id="account-modal-confirm" class="primary">添加账号</button>
     </div>
   </div>
 </div>
