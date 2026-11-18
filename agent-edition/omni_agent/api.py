@@ -7,7 +7,7 @@ import sys
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -15,7 +15,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import Settings
-from .cookie_login import PLATFORM_LOGIN_POLICIES, webview_available
+from .cookie_login import find_local_browser, local_browser_available
 from .desktop_tools import create_directory, list_directories, pick_directory, probe_proxy_connectivity
 from .errors import AgentError
 from .mcp_server import create_mcp
@@ -136,15 +136,6 @@ class BridgeRegisterArgs(Input):
 
 class BridgeUnregisterArgs(Input):
     bridge_id: str = Field(min_length=1, max_length=128)
-
-
-class WebViewCaptureArgs(Input):
-    netscape: str = Field(min_length=1, max_length=1024 * 1024)
-
-
-class WebViewHeartbeatArgs(Input):
-    state: str = Field('WAITING', max_length=32)
-    message: str = Field('', max_length=300)
 
 
 SCHEMAS = {
@@ -410,7 +401,7 @@ def create_app(service=None):
             'bots': service.get_bot_configs(),
             'bridges': service.bridges.list_bridges(),
             'bridge_hints': service.bridges.local_hints,
-            'webview_available': webview_available(),
+            'local_browser': (find_local_browser() or {}).get('name', ''),
         }
 
     @app.get('/api/admin/bridges')
@@ -471,64 +462,25 @@ def create_app(service=None):
     async def bilibili_qr_poll(qr_id: str):
         return await service.poll_bilibili_qr(qr_id)
 
-    @app.post('/api/admin/sessions/{platform}/webview-login')
-    async def webview_login_start(platform: str, request: Request):
-        return await service.start_webview_login(platform, str(request.base_url).rstrip('/'))
+    @app.post('/api/admin/sessions/{platform}/browser-login')
+    async def browser_login_start(platform: str):
+        return await service.start_browser_login(platform)
 
-    @app.get('/api/admin/sessions/webview-status/{attempt_id}')
-    async def webview_login_status(attempt_id: str):
-        return service.webview_logins.public_status(attempt_id)
+    @app.get('/api/admin/sessions/browser-status/{attempt_id}')
+    async def browser_login_status(attempt_id: str):
+        return service.browser_logins.public_status(attempt_id)
 
-    @app.post('/api/admin/sessions/{platform}/webview-capture')
-    async def webview_login_manual_capture(platform: str):
-        return service.webview_logins.request_manual_capture(platform)
+    @app.post('/api/admin/sessions/{platform}/browser-capture')
+    async def browser_login_manual_capture(platform: str):
+        return service.browser_logins.request_manual_capture(platform)
 
-    @app.post('/api/admin/sessions/{platform}/webview-cancel')
-    async def webview_login_cancel(platform: str):
-        return service.webview_logins.request_cancel(platform)
+    @app.post('/api/admin/sessions/{platform}/browser-cancel')
+    async def browser_login_cancel(platform: str):
+        return service.browser_logins.request_cancel(platform)
 
-    @app.get('/api/internal/webview-login/{attempt_id}')
-    async def internal_webview_config(attempt_id: str, x_omni_webview_nonce: str = Header(default='')):
-        attempt = service.webview_logins.verify_internal(attempt_id, x_omni_webview_nonce)
-        policy = PLATFORM_LOGIN_POLICIES[attempt.platform]
-        return {
-            'platform': attempt.platform,
-            'start_url': policy['start_url'],
-            'cookie_urls': list(policy['cookie_urls']),
-            'domains': list(service.domains[attempt.platform]),
-            'markers': list(policy['markers']),
-            'auto_capture': policy['auto_capture'],
-            'proxy': attempt.proxy,
-        }
-
-    @app.get('/api/internal/webview-login/{attempt_id}/commands')
-    async def internal_webview_commands(attempt_id: str, x_omni_webview_nonce: str = Header(default='')):
-        attempt = service.webview_logins.verify_internal(attempt_id, x_omni_webview_nonce)
-        capture = attempt.manual_capture_requested
-        attempt.manual_capture_requested = False
-        return {'capture': capture, 'cancel': attempt.cancel_requested}
-
-    @app.post('/api/internal/webview-login/{attempt_id}/heartbeat')
-    async def internal_webview_heartbeat(attempt_id: str, body: WebViewHeartbeatArgs, x_omni_webview_nonce: str = Header(default='')):
-        attempt = service.webview_logins.verify_internal(attempt_id, x_omni_webview_nonce)
-        if attempt.state in ('OPENING', 'WAITING'):
-            attempt.state = body.state
-            attempt.message = body.message
-            attempt.updated_at = __import__('time').time()
-        return {'ok': True}
-
-    @app.post('/api/internal/webview-login/{attempt_id}/capture')
-    async def internal_webview_capture(attempt_id: str, body: WebViewCaptureArgs, x_omni_webview_nonce: str = Header(default='')):
-        return await service.complete_webview_capture(attempt_id, x_omni_webview_nonce, body.netscape)
-
-    @app.post('/api/internal/webview-login/{attempt_id}/cancel')
-    async def internal_webview_cancel(attempt_id: str, x_omni_webview_nonce: str = Header(default='')):
-        attempt = service.webview_logins.verify_internal(attempt_id, x_omni_webview_nonce)
-        if attempt.state not in ('COMPLETED', 'FAILED'):
-            attempt.state = 'CANCELLED'
-            attempt.message = '内置登录窗口已关闭'
-            attempt.updated_at = __import__('time').time()
-        return {'ok': True}
+    @app.post('/api/admin/sessions/{platform}/open-login')
+    async def browser_open_login_page(platform: str):
+        return await service.open_login_page(platform)
 
     @app.post('/api/admin/sessions/{platform}/enable')
     async def enable_cookie(platform: str):

@@ -174,15 +174,6 @@ def main():
         from .desktop_tools import run_pick_dir_cli
         run_pick_dir_cli(pick_args.initial, pick_args.title, pick_args.out)
         return
-    if '--webview-login' in sys.argv:
-        p = argparse.ArgumentParser()
-        p.add_argument('--webview-login', action='store_true')
-        p.add_argument('--server', required=True)
-        p.add_argument('--attempt', required=True)
-        wv_args = p.parse_args()
-        from .cookie_login import run_webview_login_cli
-        run_webview_login_cli(wv_args.server, wv_args.attempt, os.environ.get('OMNI_WEBVIEW_NONCE', ''))
-        return
     parser = argparse.ArgumentParser(description='OmniDownloader Agent Edition')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--stdio', action='store_true', help='Official MCP stdio bridge to the persistent service')

@@ -12,8 +12,8 @@
   - QQ 视频/图片消息与群文件发送切换、`.zip` 强制文件上传、合集/图集打包为合并转发聊天记录（`send_group_forward_msg`）及 Bot 连接信息探测；
   - 下载可视化规则与 AstrBot 插件联动验证：开关控制收到/开始/完成（正在发送）三阶段反馈、自定义模板防注入渲染、Agent 决定模式、`visual_enabled=false` 静默以及下载/发送失败时 `error_message` 直接输出；
   - 已接入桥接自动识别：Streamable HTTP / MCP stdio / AstrBot 心跳注册、`list_bridges` 工具与离线注销检测；
-  - Cookie 多格式导入（Netscape / 请求头 / JSON 数组）、`pywebview` 内部认证 nonce 边界、B站扫码流程模拟、严格权限隔离（Agent 仅可读取非敏感状态、禁用与移除，绝无读取明文/UI 元数据、登录/导入或重新启用权限）；
+  - Cookie 多格式导入（Netscape / 请求头 / JSON 数组）、本地桌面浏览器（Chrome / Edge）隔离临时会话 CDP Cookie 自动捕获/手动抓取/取消流程模拟、系统默认浏览器打开接口、B站扫码流程模拟及严格权限隔离（Agent 仅可读取非敏感状态、禁用与移除，绝无读取明文/UI 元数据、登录/导入或重新启用权限）；
   - 本机 `Host`/`Origin` 防护、兼容 Fake-IP / TUN（放行 `198.18.0.0/15` 与 `fc00::/18`，继续阻断本机回环/私网/云元数据与显式代理本地 DNS 误判）的精细化 SSRF 防护、受控路径边界、文件引用账本、异步取消进程树与核心 TaskManager 桥接。
-- Windows 便携包：PyInstaller 实际构建（含 `pywebview`、`qrcode`、`tkinter` 运行时）；`tools/portable_smoke.py` 及独立冻结进程实测通过（`browser_assisted_login=True`、驱动器浏览、代理测试、桥接识别）。
+- Windows 便携包：PyInstaller 实际构建（已移除 `pywebview` / `pythonnet` / `clr_loader`，保留 `websockets`、`qrcode`、`tkinter` 运行时）；`tools/portable_smoke.py` 及独立冻结进程实测通过（本机 Edge 检测、驱动器浏览、代理测试、桥接识别、零 `webview` 残留）。
 - Linux/Docker 部署：由 GitHub Actions `.github/workflows/agent-edition.yml` 与 `tools/docker_smoke.py` 执行构建与验证。
-- 未配置已授权的 QQ、Telegram 或 AstrBot 真实账号；相关平台发送与二维码/内置网页真人扫码登录以模拟 API 及隔离接口测试通过，真实账号在线交互由使用方按实际环境验收。
+- 未配置已授权的 QQ、Telegram 或 AstrBot 真实账号；相关平台发送与二维码/本地浏览器真实账号交互由使用方按实际环境验收。

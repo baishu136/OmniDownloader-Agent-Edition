@@ -24,10 +24,6 @@ attrs==26.1.0 \
     # via
     #   jsonschema
     #   referencing
-bottle==0.13.4 ; sys_platform == 'win32' \
-    --hash=sha256:045684fbd2764eac9cdeb824861d1551d113e8b683d8d26e296898d3dd99a12e \
-    --hash=sha256:787e78327e12b227938de02248333d788cfe45987edca735f8f88e03472c3f47
-    # via pywebview
 brotli==1.2.1 ; implementation_name == 'cpython' and sys_platform != 'ios' \
     --hash=sha256:0023348c448140a6ea71615eba331835c971d38ae8acf8a89b4e963b1f38f131 \
     --hash=sha256:00a50d063aae2e69c2eb28818ccf6dc3e51f2ea5b74e3c2082a47943ee23f399 \
@@ -202,7 +198,7 @@ certifi==2026.10.23 \
     #   httpx
     #   requests
     #   yt-dlp
-cffi==2.1.1 ; implementation_name != 'cpython' or platform_python_implementation != 'PyPy' or sys_platform == 'win32' \
+cffi==2.1.1 ; implementation_name != 'cpython' or platform_python_implementation != 'PyPy' \
     --hash=sha256:046bfc24911b37851ee1b51aab8bffe713d89c68c6a057b09484ce9fd5f69b4e \
     --hash=sha256:06c72bb76605a4b0cd0aad6930b69d4baf7dd5d806cfc409b824191099700e66 \
     --hash=sha256:0beceaabe56af686895136a2de78db54ecd8e4046b236b8fd6d6cb61389e9bf2 \
@@ -305,7 +301,6 @@ cffi==2.1.1 ; implementation_name != 'cpython' or platform_python_implementation
     --hash=sha256:fcd22650c908d7b7da162bbfaab594a1227a15d1643a98c68b122ac642fa2264
     # via
     #   brotlicffi
-    #   clr-loader
     #   cryptography
 charset-normalizer==3.5.2 \
     --hash=sha256:01077390b03f7988f11d700a2194e69b119741a86b1a638b1db88891e3eced8e \
@@ -485,10 +480,6 @@ click==8.5.1 \
     --hash=sha256:8bb5376d2006950386f8c6427613334a2acadc5f559cb80e638d00b4df957e37 \
     --hash=sha256:9bbfada76703fd1d784b83eea012e3e8c6a001a876543ef104fa56aaaeb072b4
     # via uvicorn
-clr-loader==0.3.1 ; sys_platform == 'win32' \
-    --hash=sha256:2e073e9aaf49d1ae2f56ecba27987ad5fb68be4bcd9dd34a5bed8f0e4e128366 \
-    --hash=sha256:cbad189de20d202a7d621956b0fc38049e13c9bf7ca2923441eff725cd121aa1
-    # via pythonnet
 colorama==0.4.6 ; sys_platform == 'win32' \
     --hash=sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44 \
     --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
@@ -720,10 +711,7 @@ pillow==13.0.0 \
     --hash=sha256:ff3fe9eb621fbb9db4c4be33ab946f6bac5f98ab50ca8d3260503653656c961b \
     --hash=sha256:ffea6b2986a797c84b6d1d27d4f43e0b83c73fc16281a930891cd237cf0d08fe
     # via omnidownloader-agent (F:/AGENT/Gemini/OmniDownloader Agent Edition/agent-edition/pyproject.toml)
-proxy-tools==0.1.0 ; sys_platform == 'win32' \
-    --hash=sha256:ccb3751f529c047e2d8a58440d86b205303cf0fe8146f784d1cbcd94f0a28010
-    # via pywebview
-pycparser==3.12 ; (implementation_name != 'PyPy' and implementation_name != 'cpython') or (implementation_name != 'PyPy' and platform_python_implementation != 'PyPy') or (implementation_name != 'PyPy' and sys_platform == 'win32') \
+pycparser==3.12 ; (implementation_name != 'PyPy' and implementation_name != 'cpython') or (implementation_name != 'PyPy' and platform_python_implementation != 'PyPy') \
     --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e \
     --hash=sha256:f03387877eab82ce01bbdfd0ba7252ee55a90b1c708d5129e2ce915475cf1db6
     # via cffi
@@ -938,14 +926,6 @@ python-multipart==0.0.34 \
     --hash=sha256:b998ae90ca6e1e363261ce2e0e230281b8af53867b757970abd69ee9edcd843a \
     --hash=sha256:ebacd224bd686eee2f9aa1066a657affe07435a185834e05e5235e2e59173e91
     # via mcp
-pythonnet==3.2.1 ; sys_platform == 'win32' \
-    --hash=sha256:c86e8dd31268f6e0c48fcc4d6030041316d49ed2764a1cb6ea8c37876e07c572 \
-    --hash=sha256:dd5668b74b0c903d9a24e1ba86f728fc490f8e919d56b3c24bf06739b9ee2b7f
-    # via pywebview
-pywebview==6.2.1 ; sys_platform == 'win32' \
-    --hash=sha256:71b7136752e40824655304d938efb62014218d1a90bd8e87e1cbdb1ce9c466af \
-    --hash=sha256:9d07275f53894ab4d5e2e0e996227193e7187dec276d9b624dccbce029216b46
-    # via omnidownloader-agent (F:/AGENT/Gemini/OmniDownloader Agent Edition/agent-edition/pyproject.toml)
 pywin32==312 ; sys_platform == 'win32' \
     --hash=sha256:02ebca0f0242b75292e218065004310d6a477407c09fa449bfe4f6022bc0c0fc \
     --hash=sha256:17948aeadbdb091f0ced6ef0841620794e68327b94ee415571c1203594b7215c \
@@ -1147,7 +1127,6 @@ typing-extensions==4.16.0 \
     #   opentelemetry-api
     #   pydantic
     #   pydantic-core
-    #   pywebview
     #   referencing
     #   starlette
     #   typing-inspection
@@ -1325,7 +1304,9 @@ websockets==17.4 \
     --hash=sha256:f5b1d315a615cec81a79e2ce3a94221dc5c23e7fd4012897085d3b5e5a5638d0 \
     --hash=sha256:f5f06f59e19aa0770aaf651ce91c196fa620b35aed49a7e6c36e7335f3f83db7 \
     --hash=sha256:fcac44d917672ad6257ad64b80b5168306f168a78cab5c0612e4c699caed18cf
-    # via yt-dlp
+    # via
+    #   omnidownloader-agent (F:/AGENT/Gemini/OmniDownloader Agent Edition/agent-edition/pyproject.toml)
+    #   yt-dlp
 yt-dlp==2026.10.26 \
     --hash=sha256:a05c5b5d8562f7e8a62f5334348b406af4930d56d3a65f8021d14af0e22339ae \
     --hash=sha256:abe5c6b94c3b2f0560500add1c42e0a97641752743a5b65588ac2007a6e23eb6

@@ -35,8 +35,8 @@
 ## 平台 Cookie 登录流程
 
 - **哔哩哔哩官方扫码登录**：管理页点击“B站扫码登录”生成官方二维码，手机扫码确认后自动加密入库并在线检测账号状态。
-- **桌面内置浏览器（`pywebview`）登录**：Windows 桌面环境支持点击“内置浏览器登录”唤起独立隔离 Edge WebView2 窗口登录各平台并自动捕获含 `HttpOnly` 在内的完整 Cookie（也会自动遵循当前代理配置）。
-- **多格式导入与检测**：支持上传或粘贴 Netscape `cookies.txt`、HTTP `Cookie:` 请求头及浏览器扩展导出的 JSON 数组。
+- **本地浏览器（Chrome / Edge）独立登录**：桌面环境支持点击“本地浏览器登录”，以隔离临时用户目录启动本机已安装的 Chrome / Microsoft Edge / Chromium（不带任何已装扩展、不触碰用户个人主配置，支持代理设置），通过本机环回 CDP 自动捕获包含 `HttpOnly` 在内的完整 Cookie，并在完成后立即销毁临时配置目录；对于需要先人工完成校验的平台，也可点击“我已登录，抓取保存”。
+- **系统默认浏览器打开与导入**：任何环境均可点击“默认浏览器打开”跳转对应平台官方登录页，或上传/粘贴 Netscape `cookies.txt`、HTTP `Cookie:` 请求头及浏览器扩展导出的 JSON 数组。
 - **严格权限隔离**：仅用户可在管理页登录、导入或重新启用 Cookie；Agent 仅拥有 `list_cookie_statuses`（只读非敏感状态）、`disable_platform_cookie`（禁用）与 `remove_platform_cookie`（移除）权限。
 
 ## 自动识别已接入桥接与 MCP 工具（23 项）

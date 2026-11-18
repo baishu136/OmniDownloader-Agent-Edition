@@ -2,8 +2,8 @@
 const $ = id => document.getElementById(id);
 let settings = {}, bots = [], mcpConfig = {}, sessionsData = [];
 let selectedPlatform = '';
-let noticeTimer, refreshTimer, autoSaveTimer, qrTimer, webviewTimer;
-let activeQrId = '', activeWebviewAttempt = '', activeWebviewPlatform = '';
+let noticeTimer, refreshTimer, autoSaveTimer, qrTimer, browserLoginTimer;
+let activeQrId = '', activeBrowserAttempt = '', activeBrowserPlatform = '';
 let dirModalTargetEl = null, dirModalCurrent = '', dirModalParent = '';
 let savingPromise = Promise.resolve();
 const bytes = v => `${(v / 1024 / 1024).toFixed(1)} MiB`;
@@ -341,11 +341,11 @@ function stopQrLogin() {
   $('qr-login-panel').hidden = true;
 }
 
-function stopWebviewPoll() {
-  clearInterval(webviewTimer);
-  activeWebviewAttempt = '';
-  activeWebviewPlatform = '';
-  $('webview-panel').hidden = true;
+function stopBrowserPoll() {
+  clearInterval(browserLoginTimer);
+  activeBrowserAttempt = '';
+  activeBrowserPlatform = '';
+  $('browser-login-panel').hidden = true;
 }
 
 function drawQrMatrix(matrix) {
@@ -391,30 +391,30 @@ async function startBilibiliQrLogin() {
   }, 1500);
 }
 
-async function startWebviewLogin(platform) {
-  stopWebviewPoll();
-  const res = await api('sessions/' + encodeURIComponent(platform) + '/webview-login', 'POST');
-  activeWebviewAttempt = res.attempt_id;
-  activeWebviewPlatform = platform;
-  $('webview-status-title').textContent = `${platform} · 内置浏览器已启动`;
-  $('webview-status-text').textContent = res.message || '请在打开的内置浏览器窗口中完成登录...';
-  $('webview-panel').hidden = false;
+async function startBrowserLogin(platform) {
+  stopBrowserPoll();
+  const res = await api('sessions/' + encodeURIComponent(platform) + '/browser-login', 'POST');
+  activeBrowserAttempt = res.attempt_id;
+  activeBrowserPlatform = platform;
+  $('browser-status-title').textContent = `${platform} · ${res.browser_name || '本地浏览器'}已打开`;
+  $('browser-status-text').textContent = res.message || '请在打开的本机浏览器独立窗口中完成登录...';
+  $('browser-login-panel').hidden = false;
 
-  webviewTimer = setInterval(async () => {
-    if (!activeWebviewAttempt) return;
+  browserLoginTimer = setInterval(async () => {
+    if (!activeBrowserAttempt) return;
     try {
-      const st = await api('sessions/webview-status/' + encodeURIComponent(activeWebviewAttempt));
-      $('webview-status-text').textContent = st.message || '';
+      const st = await api('sessions/browser-status/' + encodeURIComponent(activeBrowserAttempt));
+      $('browser-status-text').textContent = st.message || '';
       if (st.state === 'COMPLETED') {
-        stopWebviewPoll();
-        notify(st.message || `${platform} Cookie 已通过内置浏览器保存`);
+        stopBrowserPoll();
+        notify(st.message || `${platform} Cookie 已通过本地浏览器保存`);
         await loadSessions();
       } else if (st.state === 'CANCELLED' || st.state === 'FAILED') {
-        stopWebviewPoll();
-        if (st.state === 'FAILED') notify(st.error || st.message || '内置浏览器登录失败', true);
+        stopBrowserPoll();
+        if (st.state === 'FAILED') notify(st.error || st.message || '本地浏览器登录失败', true);
       }
     } catch {
-      stopWebviewPoll();
+      stopBrowserPoll();
     }
   }, 900);
 }
@@ -488,20 +488,27 @@ function renderSessionCard() {
   $('session-clear').disabled = current.state === 'MISSING' && current.enabled;
   $('session-verify').disabled = current.state === 'MISSING' || !current.enabled;
   $('session-qr-login').hidden = !current.has_qr;
-  const wvBtn = $('session-webview-login');
-  wvBtn.disabled = current.webview_available === false;
-  wvBtn.title = current.webview_available === false ? '当前为无桌面环境（如 Docker），请使用扫码或导入' : '打开桌面内置 WebView 浏览器完成登录';
+  const brBtn = $('session-browser-login');
+  brBtn.disabled = current.local_browser_available === false;
+  brBtn.title = current.local_browser_available === false
+    ? '当前环境未检测到本机 Chrome / Edge / Chromium，请使用默认浏览器打开后导入，或使用官方扫码'
+    : `使用本机 ${current.local_browser_name || 'Chrome / Edge'} 打开独立临时窗口并自动读取 Cookie`;
+  const openBtn = $('session-open-browser');
+  openBtn.disabled = !current.login_url;
+  openBtn.title = current.login_url ? `使用系统默认浏览器打开 ${current.login_url}` : '当前平台暂无直达登录地址';
 
   if (current.platform !== '哔哩哔哩' && activeQrId) stopQrLogin();
 
   if (current.platform === 'YouTube') {
-    $('session-extra-hint').textContent = 'YouTube 可尝试“内置浏览器登录”；如 Google 限制嵌入式登录，请通过浏览器插件导出 cookies.txt 或 JSON 导入。';
+    $('session-extra-hint').textContent = 'YouTube 如遇 Google 登录拦截，建议先点“默认浏览器打开”完成登录，再通过浏览器插件导出 cookies.txt 或 Cookie-Editor JSON 导入。';
   } else if (current.platform === '哔哩哔哩') {
-    $('session-extra-hint').textContent = '哔哩哔哩支持“B站扫码登录”、“内置浏览器登录”及导入 Cookie；获取凭据后可点击“检测”验证登录有效性。';
+    $('session-extra-hint').textContent = '哔哩哔哩支持“B站扫码登录”、“本地浏览器登录”及多格式导入；获取凭据后可点击“检测”验证账号有效性。';
   } else if (current.platform === 'Pixiv') {
-    $('session-extra-hint').textContent = 'Pixiv 推荐通过“内置浏览器登录”登录后点击“我已登录，抓取保存”，再点“检测”确认账号状态。';
+    $('session-extra-hint').textContent = 'Pixiv 推荐通过“本地浏览器登录”完成登录后自动读取（或点击“我已登录，抓取保存”），再点“检测”确认账号状态。';
+  } else if (current.login_hint) {
+    $('session-extra-hint').textContent = `${current.login_hint}；凭据仅本地加密保存，不会回显明文。`;
   } else {
-    $('session-extra-hint').textContent = '推荐使用“内置浏览器登录”，也可粘贴请求头、Netscape 文件或 Cookie-Editor JSON 数组；凭据仅本地加密保存。';
+    $('session-extra-hint').textContent = '推荐使用“本地浏览器登录”，也可点“默认浏览器打开”登录后粘贴请求头、Netscape 文件或 Cookie-Editor JSON 数组。';
   }
 }
 
@@ -750,7 +757,7 @@ async function refresh(syncBots = true) {
     ['下载中的任务', String((status.tasks.DOWNLOADING || 0) + (status.tasks.PROCESSING || 0))],
     ['等待交付的任务', String(status.tasks.READY || 0)],
     ['缓存占用', bytes(status.cache_bytes) + ' / ' + bytes(settings.max_cache_bytes || 1)],
-    ['FFmpeg / WebView', `${cap.ffmpeg ? 'FFmpeg 可用' : 'FFmpeg 不可用'} · ${cap.browser_assisted_login ? '支持桌面 WebView 登录' : '无桌面 WebView'}`],
+    ['FFmpeg / 本地浏览器', `${cap.ffmpeg ? 'FFmpeg 可用' : 'FFmpeg 不可用'} · ${cap.local_browser ? '检测到 ' + cap.local_browser : '未检测到 Chrome/Edge（可默认浏览器打开后导入）'}`],
   ];
   $('service-status').replaceChildren();
   for (const [key, value] of entries) {
@@ -939,20 +946,29 @@ $('session-verify').addEventListener('click', () => action($('session-verify'), 
   await loadSessions();
 }));
 
-$('session-webview-login').addEventListener('click', () => action($('session-webview-login'), async () => {
-  await startWebviewLogin(selectedPlatform);
+$('session-browser-login').addEventListener('click', () => action($('session-browser-login'), async () => {
+  await startBrowserLogin(selectedPlatform);
 }));
 
-$('webview-manual-capture').addEventListener('click', () => action($('webview-manual-capture'), async () => {
-  if (!activeWebviewPlatform) return;
-  await api('sessions/' + encodeURIComponent(activeWebviewPlatform) + '/webview-capture', 'POST');
-  $('webview-status-text').textContent = '已发送抓取保存指令，正在保存 Cookie...';
+$('session-open-browser').addEventListener('click', () => action($('session-open-browser'), async () => {
+  const res = await api('sessions/' + encodeURIComponent(selectedPlatform) + '/open-login', 'POST');
+  if (res.opened === false) {
+    notify('无法自动拉起系统默认浏览器，请手动访问：' + res.url, true);
+  } else {
+    notify(`已在系统默认浏览器打开 ${selectedPlatform} 登录页；登录后可使用 Cookie-Editor 等插件导出并粘贴导入`);
+  }
 }));
 
-$('webview-cancel').addEventListener('click', () => action($('webview-cancel'), async () => {
-  const target = activeWebviewPlatform || selectedPlatform;
-  await api('sessions/' + encodeURIComponent(target) + '/webview-cancel', 'POST');
-  stopWebviewPoll();
+$('browser-manual-capture').addEventListener('click', () => action($('browser-manual-capture'), async () => {
+  if (!activeBrowserPlatform) return;
+  await api('sessions/' + encodeURIComponent(activeBrowserPlatform) + '/browser-capture', 'POST');
+  $('browser-status-text').textContent = '已发送抓取保存指令，正在读取 Cookie 并加密保存...';
+}));
+
+$('browser-cancel').addEventListener('click', () => action($('browser-cancel'), async () => {
+  const target = activeBrowserPlatform || selectedPlatform;
+  await api('sessions/' + encodeURIComponent(target) + '/browser-cancel', 'POST');
+  stopBrowserPoll();
 }));
 
 $('session-qr-login').addEventListener('click', () => action($('session-qr-login'), startBilibiliQrLogin));

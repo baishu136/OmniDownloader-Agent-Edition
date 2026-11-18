@@ -1,31 +1,29 @@
-"""完善平台 Cookie 导入格式兼容、B站扫码登录、以及桌面 pywebview 内置浏览器登录。"""
+"""完善平台 Cookie 导入格式兼容、B站扫码登录、以及本地桌面浏览器（Chrome / Edge）隔离登录流程。"""
+import asyncio
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
-import http.cookiejar
-import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
 import uuid
+import webbrowser
 
 import httpx
 import qrcode
 import requests
+import websockets
 
 from .errors import AgentError, safe_text
 
 DESKTOP_UA = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
     '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0'
-)
-MOBILE_UA = (
-    'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36'
 )
 
 # 参照 Android PlatformLoginPolicy.kt 统一维护各平台登录入口与关键会话字段
@@ -35,107 +33,173 @@ PLATFORM_LOGIN_POLICIES = {
         'cookie_urls': ('https://www.youtube.com/', 'https://youtube.com/', 'https://accounts.google.com/'),
         'markers': ('SID', 'SAPISID', '__Secure-3PAPISID', 'LOGIN_INFO'),
         'auto_capture': True,
-        'desktop': True,
-        'hint': 'Google 可能限制部分嵌入式环境，若被拒绝登录可点击“关闭窗口”后使用浏览器导出的 cookies.txt / JSON 导入。',
+        'hint': '将启动本机真实浏览器独立窗口登录 Google / YouTube；登录完成后自动捕获完整 Cookie，也可从常用浏览器导出 JSON / cookies.txt 导入。',
     },
     'X (Twitter)': {
         'start_url': 'https://x.com/i/flow/login',
         'cookie_urls': ('https://x.com/', 'https://twitter.com/'),
         'markers': ('auth_token',),
         'auto_capture': True,
-        'desktop': True,
-        'hint': '在内置窗口完成 X 登录后将自动捕获 auth_token 等完整会话 Cookie。',
+        'hint': '使用本地浏览器独立窗口完成 X 登录后会自动捕获 auth_token 等完整会话 Cookie。',
     },
     '小红书': {
         'start_url': 'https://www.xiaohongshu.com/explore',
         'cookie_urls': ('https://www.xiaohongshu.com/',),
         'markers': ('web_session',),
         'auto_capture': False,
-        'desktop': True,
-        'hint': '小红书访客态也可能生成 web_session，请在内置窗口确认登录账号后点击“我已登录，保存 Cookie”。',
+        'hint': '小红书访客态也可能存在 web_session，请在本地浏览器确认登录账号后点击“我已登录，抓取保存”。',
     },
     '小黑盒': {
         'start_url': 'https://www.xiaoheihe.cn/',
         'cookie_urls': ('https://www.xiaoheihe.cn/', 'https://www.heybox.cn/'),
         'markers': ('heybox_id', 'user_id', 'sessionid'),
         'auto_capture': True,
-        'desktop': True,
-        'hint': '在内置窗口完成小黑盒登录后将自动捕获并加密保存会话。',
+        'hint': '使用本地浏览器独立窗口完成小黑盒登录后会自动捕获并加密保存会话。',
     },
     'Pixiv': {
         'start_url': 'https://accounts.pixiv.net/login',
         'cookie_urls': ('https://www.pixiv.net/', 'https://accounts.pixiv.net/'),
         'markers': ('PHPSESSID',),
         'auto_capture': False,
-        'desktop': True,
-        'hint': 'Pixiv 匿名访问也存在 PHPSESSID；请在内置窗口完成账号登录后点击“我已登录，保存 Cookie”，随后可点“检测”。',
+        'hint': 'Pixiv 匿名访问也存在 PHPSESSID；请在本地浏览器完成账号登录后点击“我已登录，抓取保存”，随后可点“检测”。',
     },
     '抖音': {
         'start_url': 'https://www.douyin.com/',
         'cookie_urls': ('https://www.douyin.com/',),
         'markers': ('sessionid', 'sessionid_ss'),
         'auto_capture': False,
-        'desktop': True,
-        'hint': '请在内置窗口扫码或登录后点击“我已登录，保存 Cookie”。',
+        'hint': '请在本地浏览器独立窗口扫码或登录后点击“我已登录，抓取保存”。',
     },
     '哔哩哔哩': {
         'start_url': 'https://passport.bilibili.com/login',
         'cookie_urls': ('https://www.bilibili.com/', 'https://passport.bilibili.com/', 'https://api.bilibili.com/'),
         'markers': ('SESSDATA',),
         'auto_capture': True,
-        'desktop': True,
-        'hint': '支持“官方扫码登录”与“内置浏览器登录”；取得 SESSDATA 后会自动加密保存并验证登录态。',
+        'hint': '支持“B站扫码登录”与“本地浏览器登录”；取得 SESSDATA 后会自动加密保存并验证登录态。',
     },
     'Pinterest': {
         'start_url': 'https://www.pinterest.com/login/',
         'cookie_urls': ('https://www.pinterest.com/',),
         'markers': ('_pinterest_sess',),
         'auto_capture': True,
-        'desktop': True,
-        'hint': '在内置窗口登录 Pinterest 后将自动保存会话。',
+        'hint': '使用本地浏览器独立窗口登录 Pinterest 后将自动保存会话。',
     },
     'Instagram': {
         'start_url': 'https://www.instagram.com/accounts/login/',
         'cookie_urls': ('https://www.instagram.com/',),
         'markers': ('sessionid',),
         'auto_capture': True,
-        'desktop': True,
-        'hint': '在内置窗口登录 Instagram 后将自动捕获 sessionid 并保存。',
+        'hint': '使用本地浏览器独立窗口登录 Instagram 后将自动捕获 sessionid 并保存。',
     },
     'Facebook': {
         'start_url': 'https://www.facebook.com/login/',
         'cookie_urls': ('https://www.facebook.com/',),
         'markers': ('c_user',),
         'auto_capture': True,
-        'desktop': True,
-        'hint': '在内置窗口登录 Facebook 后将自动捕获 c_user 等凭据并保存。',
+        'hint': '使用本地浏览器独立窗口登录 Facebook 后将自动捕获 c_user 等凭据并保存。',
     },
     'TikTok': {
         'start_url': 'https://www.tiktok.com/login',
         'cookie_urls': ('https://www.tiktok.com/',),
         'markers': ('sessionid', 'sessionid_ss'),
         'auto_capture': True,
-        'desktop': True,
-        'hint': '在内置窗口登录 TikTok 后将自动捕获会话并保存。',
+        'hint': '使用本地浏览器独立窗口登录 TikTok 后将自动捕获会话并保存。',
     },
     '快手': {
         'start_url': 'https://www.kuaishou.com/new-reco',
         'cookie_urls': ('https://www.kuaishou.com/',),
         'markers': ('userId',),
         'auto_capture': False,
-        'desktop': True,
-        'hint': '请在内置窗口完成快手登录后点击“我已登录，保存 Cookie”。',
+        'hint': '请在本地浏览器独立窗口完成快手登录后点击“我已登录，抓取保存”。',
     },
 }
 
 
-def webview_available() -> bool:
-    """检查当前环境是否支持启动 pywebview 桌面内置登录窗口。"""
-    if importlib.util.find_spec('webview') is None:
-        return False
-    if os.name == 'nt' or sys.platform == 'darwin':
-        return True
-    return bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
+def find_local_browser() -> dict | None:
+    """探测本机已安装的 Chrome / Microsoft Edge / Chromium 可执行文件。"""
+    override = os.environ.get('OMNI_BROWSER_PATH', '').strip()
+    if override and Path(override).is_file():
+        return {'path': override, 'name': Path(override).stem}
+
+    if os.name != 'nt' and sys.platform != 'darwin' and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+        return None
+
+    candidates: list[tuple[str, str]] = []
+    if os.name == 'nt':
+        try:
+            import winreg
+            for exe, label in (('msedge.exe', 'Microsoft Edge'), ('chrome.exe', 'Google Chrome'), ('brave.exe', 'Brave')):
+                for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                    try:
+                        with winreg.OpenKey(hive, rf'SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}') as key:
+                            val, _ = winreg.QueryValueEx(key, '')
+                            if val:
+                                candidates.append((label, str(val).strip('"')))
+                    except OSError:
+                        pass
+        except ImportError:
+            pass
+        env_dirs = [
+            os.environ.get('PROGRAMFILES', r'C:\Program Files'),
+            os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)'),
+            os.environ.get('LOCALAPPDATA', ''),
+        ]
+        rel_paths = (
+            ('Microsoft Edge', r'Microsoft\Edge\Application\msedge.exe'),
+            ('Google Chrome', r'Google\Chrome\Application\chrome.exe'),
+            ('Brave', r'BraveSoftware\Brave-Browser\Application\brave.exe'),
+        )
+        for base in env_dirs:
+            if not base:
+                continue
+            for label, rel in rel_paths:
+                candidates.append((label, str(Path(base) / rel)))
+        for label, cmd in (('Microsoft Edge', 'msedge'), ('Google Chrome', 'chrome')):
+            found = shutil.which(cmd)
+            if found:
+                candidates.append((label, found))
+    elif sys.platform == 'darwin':
+        candidates.extend([
+            ('Google Chrome', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+            ('Microsoft Edge', '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'),
+            ('Chromium', '/Applications/Chromium.app/Contents/MacOS/Chromium'),
+        ])
+    else:
+        for label, cmd in (
+            ('Google Chrome', 'google-chrome'),
+            ('Google Chrome', 'google-chrome-stable'),
+            ('Microsoft Edge', 'microsoft-edge'),
+            ('Microsoft Edge', 'microsoft-edge-stable'),
+            ('Chromium', 'chromium'),
+            ('Chromium', 'chromium-browser'),
+        ):
+            found = shutil.which(cmd)
+            if found:
+                candidates.append((label, found))
+
+    seen = set()
+    for label, raw_path in candidates:
+        norm = str(raw_path or '').strip()
+        if not norm or norm.lower() in seen:
+            continue
+        seen.add(norm.lower())
+        if Path(norm).is_file():
+            return {'path': norm, 'name': label}
+    return None
+
+
+def local_browser_available() -> bool:
+    """检查当前环境是否支持启动本机 Chrome / Edge 独立窗口捕获 Cookie。"""
+    return find_local_browser() is not None
+
+
+def open_in_default_browser(platform: str) -> dict:
+    """使用操作系统默认浏览器打开目标平台登录页。"""
+    policy = PLATFORM_LOGIN_POLICIES.get(platform)
+    if not policy:
+        raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
+    opened = webbrowser.open(policy['start_url'], new=2)
+    return {'opened': bool(opened), 'url': policy['start_url']}
 
 
 def _domain_matches(domain: str, allowed_domains: tuple[str, ...]) -> bool:
@@ -146,7 +210,7 @@ def _domain_matches(domain: str, allowed_domains: tuple[str, ...]) -> bool:
 
 
 def _expiry_to_epoch(raw_expiry) -> int:
-    if raw_expiry in (None, '', 0, '0'):
+    if raw_expiry in (None, '', 0, '0', -1):
         return 0
     if isinstance(raw_expiry, (int, float)):
         ts = int(raw_expiry)
@@ -158,7 +222,6 @@ def _expiry_to_epoch(raw_expiry) -> int:
     try:
         dt = parsedate_to_datetime(text)
         ts = int(dt.timestamp())
-        # WebView2 会将退出清理的会话 Cookie 设为 1970/0001 等过去默认值，这里按 0 处理
         return ts if ts > 1_000_000 else 0
     except (TypeError, ValueError, OSError, OverflowError):
         return 0
@@ -167,10 +230,7 @@ def _expiry_to_epoch(raw_expiry) -> int:
 def format_netscape_row(domain: str, path: str, secure: bool, expires: int, name: str, value: str, *, httponly: bool = False) -> str:
     """格式化单条标准 Netscape Cookie 行（含 #HttpOnly_ 前缀以保留 HttpOnly 属性）。"""
     clean_domain = str(domain or '').strip()
-    if not clean_domain.startswith('.'):
-        include_subdomains = 'FALSE'
-    else:
-        include_subdomains = 'TRUE'
+    include_subdomains = 'TRUE' if clean_domain.startswith('.') else 'FALSE'
     prefix = '#HttpOnly_' if httponly else ''
     clean_path = str(path or '/').strip() or '/'
     sec_flag = 'TRUE' if secure else 'FALSE'
@@ -189,11 +249,9 @@ def normalize_cookie_text(platform: str, raw_text: str, domains: dict) -> str:
         raise AgentError('INVALID_COOKIE', 'Cookie 内容不能为空')
 
     allowed = domains[platform]
-    # 1. 标准 Netscape 头部
     if text.startswith(('# Netscape HTTP Cookie File', '# HTTP Cookie File')):
         return text
 
-    # 2. JSON 数组格式（Cookie-Editor / EditThisCookie / CDP）
     if text.startswith('['):
         try:
             items = json.loads(text)
@@ -229,12 +287,10 @@ def normalize_cookie_text(platform: str, raw_text: str, domains: dict) -> str:
             raise AgentError('INVALID_COOKIE', f'JSON 中没有属于 {platform} 域名的有效未过期 Cookie')
         return '# Netscape HTTP Cookie File\n' + '\n'.join(rows) + '\n'
 
-    # 3. 缺省文件头的 7 列 Netscape 行
     lines = [ln for ln in text.splitlines() if ln.strip() and not (ln.startswith('#') and not ln.startswith('#HttpOnly_'))]
     if lines and all(len(ln.split('\t')) == 7 for ln in lines):
         return '# Netscape HTTP Cookie File\n' + '\n'.join(lines) + '\n'
 
-    # 4. HTTP Cookie 请求头字符串（允许带 "Cookie:" 前缀）
     if text.lower().startswith('cookie:'):
         text = text.split(':', 1)[1].strip()
     rows = []
@@ -249,6 +305,80 @@ def normalize_cookie_text(platform: str, raw_text: str, domains: dict) -> str:
     if not rows:
         raise AgentError('INVALID_COOKIE', 'Cookie 格式无效')
     return '# Netscape HTTP Cookie File\n' + '\n'.join(rows) + '\n'
+
+
+def cdp_cookies_to_netscape(cookies: list[dict], policy: dict, allowed_domains: tuple[str, ...]) -> tuple[str, bool]:
+    """将浏览器 CDP 返回的 Cookie 列表过滤为指定平台 Netscape 格式，并判断是否出现关键登录标记。"""
+    dedup = {}
+    marker_set = set(policy.get('markers') or ())
+    marker_hit = False
+    now = time.time()
+    for item in cookies:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get('name') or '').strip()
+        value = str(item.get('value') or '')
+        domain = str(item.get('domain') or '').strip()
+        if not name or not _domain_matches(domain, allowed_domains):
+            continue
+        exp = _expiry_to_epoch(item.get('expires'))
+        if exp and exp <= now:
+            continue
+        if name in marker_set and value:
+            marker_hit = True
+        norm_domain = domain if domain.startswith('.') else '.' + domain
+        try:
+            dedup[(norm_domain, item.get('path') or '/', name)] = format_netscape_row(
+                norm_domain,
+                item.get('path') or '/',
+                bool(item.get('secure', True)),
+                exp,
+                name,
+                value,
+                httponly=bool(item.get('httpOnly', False)),
+            )
+        except ValueError:
+            continue
+    if not dedup:
+        return '', False
+    return '# Netscape HTTP Cookie File\n' + '\n'.join(dedup.values()) + '\n', marker_hit
+
+
+async def fetch_cdp_cookies(port: int, browser_ws_path: str) -> list[dict]:
+    """通过本机环回 CDP 端口读取隔离浏览器实例的完整 Cookie（含 HttpOnly）。"""
+    ws_url = f'ws://127.0.0.1:{port}{browser_ws_path}'
+    async with websockets.connect(ws_url, proxy=None, max_size=8 * 1024 * 1024, open_timeout=3) as ws:
+        await ws.send(json.dumps({'id': 1, 'method': 'Storage.getCookies'}))
+        while True:
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
+            if msg.get('id') != 1:
+                continue
+            if 'result' in msg and isinstance(msg['result'].get('cookies'), list):
+                return msg['result']['cookies']
+            break
+
+    # 兼容不支持浏览器级 Storage.getCookies 的旧版 Chromium 内核：退回页面会话 Network.getAllCookies
+    async with httpx.AsyncClient(trust_env=False, timeout=3) as client:
+        targets = (await client.get(f'http://127.0.0.1:{port}/json/list')).json()
+    for target in targets:
+        page_ws = target.get('webSocketDebuggerUrl')
+        if page_ws:
+            async with websockets.connect(page_ws, proxy=None, max_size=8 * 1024 * 1024, open_timeout=3) as ws:
+                await ws.send(json.dumps({'id': 2, 'method': 'Network.getAllCookies'}))
+                while True:
+                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
+                    if msg.get('id') == 2:
+                        return (msg.get('result') or {}).get('cookies') or []
+    return []
+
+
+async def close_cdp_browser(port: int, browser_ws_path: str) -> None:
+    try:
+        ws_url = f'ws://127.0.0.1:{port}{browser_ws_path}'
+        async with websockets.connect(ws_url, proxy=None, open_timeout=2) as ws:
+            await ws.send(json.dumps({'id': 9, 'method': 'Browser.close'}))
+    except Exception:
+        pass
 
 
 def inspect_cookie_meta(sessions, platform: str) -> dict:
@@ -364,7 +494,6 @@ class BilibiliQRLoginManager:
         if code != 0:
             return {'status': 'error', 'message': safe_text(data.get('message') or 'B 站扫码登录返回异常')}
 
-        # 登录确认成功：收集 Set-Cookie 与回跳 URL 中的会话字段并补足首页 Cookie
         try:
             client.get('https://www.bilibili.com/', proxies=entry['proxies'], headers={'User-Agent': DESKTOP_UA}, timeout=10)
         except Exception:
@@ -378,7 +507,6 @@ class BilibiliQRLoginManager:
                 httponly = bool(getattr(c, '_rest', {}).get('HttpOnly') is not None or c.name == 'SESSDATA')
                 rows[(dom, c.name)] = format_netscape_row(dom, c.path or '/', bool(c.secure), exp, c.name, c.value or '', httponly=httponly)
 
-        # 回跳 URL 有时额外携带 SESSDATA / bili_jct / DedeUserID
         callback_url = data.get('url') or ''
         if callback_url:
             qs = parse_qs(urlsplit(callback_url).query)
@@ -400,61 +528,33 @@ class BilibiliQRLoginManager:
 
 
 @dataclass
-class WebViewAttempt:
+class BrowserLoginAttempt:
     attempt_id: str
     platform: str
-    nonce: str
+    browser_name: str
     proxy: str
     state: str = 'OPENING'
-    message: str = '正在打开内置登录浏览器...'
+    message: str = '正在启动本地浏览器登录窗口...'
     error: str = ''
     manual_capture_requested: bool = False
     cancel_requested: bool = False
     created_at: float = 0.0
     updated_at: float = 0.0
     process: object = None
+    task: object = None
 
 
-class WebViewLoginManager:
-    """协调主服务与独立 --webview-login 子进程间的隔离认证通信。"""
+class LocalBrowserLoginManager:
+    """使用本机 Chrome / Edge 独立隔离窗口完成平台登录并经由环回 CDP 捕获完整 Cookie。"""
 
     def __init__(self):
         self._lock = threading.RLock()
-        self._attempts: dict[str, WebViewAttempt] = {}
+        self._attempts: dict[str, BrowserLoginAttempt] = {}
 
-    def create(self, platform: str, proxy: str = '') -> WebViewAttempt:
-        if platform not in PLATFORM_LOGIN_POLICIES:
-            raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
-        if not webview_available():
-            raise AgentError('CAPABILITY_UNAVAILABLE', '当前环境不支持桌面内置浏览器（请使用扫码登录或粘贴/导入 Cookie）')
-        now = time.time()
-        with self._lock:
-            # 清理同一平台或过期的旧尝试标记
-            for aid, item in list(self._attempts.items()):
-                if now - item.created_at > 900 or item.state in ('COMPLETED', 'CANCELLED', 'FAILED'):
-                    if now - item.updated_at > 60:
-                        self._attempts.pop(aid, None)
-            attempt = WebViewAttempt(
-                attempt_id=uuid.uuid4().hex,
-                platform=platform,
-                nonce=uuid.uuid4().hex,
-                proxy=proxy,
-                created_at=now,
-                updated_at=now,
-            )
-            self._attempts[attempt.attempt_id] = attempt
-            return attempt
-
-    def get(self, attempt_id: str) -> WebViewAttempt:
+    def get(self, attempt_id: str) -> BrowserLoginAttempt:
         attempt = self._attempts.get(attempt_id)
         if not attempt:
             raise AgentError('NOT_FOUND', '登录会话已结束或不存在')
-        return attempt
-
-    def verify_internal(self, attempt_id: str, nonce: str) -> WebViewAttempt:
-        attempt = self.get(attempt_id)
-        if not nonce or nonce != attempt.nonce:
-            raise AgentError('PERMISSION_DENIED', '内部登录校验令牌无效')
         return attempt
 
     def public_status(self, attempt_id: str) -> dict:
@@ -462,6 +562,7 @@ class WebViewLoginManager:
         return {
             'attempt_id': a.attempt_id,
             'platform': a.platform,
+            'browser_name': a.browser_name,
             'state': a.state,
             'message': a.message,
             'error': a.error,
@@ -471,7 +572,7 @@ class WebViewLoginManager:
         with self._lock:
             active = [a for a in self._attempts.values() if a.platform == platform and a.state in ('OPENING', 'WAITING')]
             if not active:
-                raise AgentError('NOT_FOUND', '当前没有正在进行的内置浏览器登录窗口')
+                raise AgentError('NOT_FOUND', '当前没有正在进行的本地浏览器登录窗口')
             target = max(active, key=lambda a: a.created_at)
             target.manual_capture_requested = True
             target.updated_at = time.time()
@@ -485,224 +586,148 @@ class WebViewLoginManager:
             target = max(active, key=lambda a: a.created_at)
             target.cancel_requested = True
             target.state = 'CANCELLED'
-            target.message = '已取消内置浏览器登录'
+            target.message = '已关闭本地浏览器登录窗口'
             target.updated_at = time.time()
             return {'attempt_id': target.attempt_id, 'cancelled': True}
 
+    async def start(self, platform: str, proxy: str, allowed_domains: tuple[str, ...], *, on_capture) -> dict:
+        if platform not in PLATFORM_LOGIN_POLICIES:
+            raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
+        browser = find_local_browser()
+        if not browser:
+            raise AgentError('CAPABILITY_UNAVAILABLE', '未检测到本机 Chrome 或 Edge 浏览器，可点击“在默认浏览器打开”完成登录后导入或粘贴 Cookie')
 
-def _collect_cookies_from_window(window, policy: dict, allowed_domains: tuple[str, ...]) -> tuple[list[tuple[str, str, str]], bool]:
-    """从 WebView2 CookieManager 或 pywebview API 提取完整 Cookie（含 HttpOnly）并转为 Netscape 行。"""
-    raw_items = []
-    # 优先直接访问 Windows Edge WebView2 CoreWebView2CookieManager 以跨越跳转子域名获取 Cookie
-    native = getattr(window, 'native', None)
-    browser = getattr(native, 'browser', None) if native is not None else None
-    core_wv2 = getattr(getattr(browser, 'webview', None), 'CoreWebView2', None) if browser is not None else None
-
-    if native is not None and core_wv2 is not None:
-        try:
-            from System import Action, Func, Object
-            from System.Collections.Generic import List
-            from System.Globalization import CultureInfo
-            from System.Threading.Tasks import Task
-            from Microsoft.Web.WebView2.Core import CoreWebView2Cookie
-
-            done = threading.Event()
-            extracted = []
-            scheduler = browser.syncContextTaskScheduler
-
-            def _fetch():
-                def _on_done(task):
-                    try:
-                        for c in task.Result:
-                            extracted.append({
-                                'name': c.Name,
-                                'value': c.Value or '',
-                                'domain': c.Domain or '',
-                                'path': c.Path or '/',
-                                'secure': bool(c.IsSecure),
-                                'httponly': bool(c.IsHttpOnly),
-                                'expires_raw': c.Expires.ToString('r', CultureInfo.GetCultureInfo('en-US')),
-                            })
-                    finally:
-                        done.set()
-
-                core_wv2.CookieManager.GetCookiesAsync('').ContinueWith(
-                    Action[Task[List[CoreWebView2Cookie]]](_on_done),
-                    scheduler,
-                )
-
-            native.Invoke(Func[Object](_fetch))
-            done.wait(timeout=4.0)
-            raw_items = extracted
-        except Exception:
-            raw_items = []
-
-    if not raw_items:
-        # 通用回退：使用 pywebview 跨平台 get_cookies()
-        try:
-            simple_cookies = window.get_cookies() or []
-        except Exception:
-            simple_cookies = []
-        for cookie_obj in simple_cookies:
-            for name, morsel in cookie_obj.items():
-                raw_items.append({
-                    'name': name,
-                    'value': morsel.value or '',
-                    'domain': morsel.get('domain') or ('.' + allowed_domains[0]),
-                    'path': morsel.get('path') or '/',
-                    'secure': bool(morsel.get('secure')),
-                    'httponly': bool(morsel.get('httponly')),
-                    'expires_raw': morsel.get('expires') or '',
-                })
-
-    dedup = {}
-    marker_set = set(policy.get('markers') or ())
-    marker_hit = False
-    now = time.time()
-    for item in raw_items:
-        name = str(item.get('name') or '').strip()
-        value = str(item.get('value') or '')
-        domain = str(item.get('domain') or '').strip()
-        if not name or not _domain_matches(domain, allowed_domains):
-            continue
-        exp = _expiry_to_epoch(item.get('expires_raw'))
-        if exp and exp <= now:
-            continue
-        if name in marker_set and value:
-            marker_hit = True
-        norm_domain = domain if domain.startswith('.') else '.' + domain
-        try:
-            row = format_netscape_row(
-                norm_domain,
-                item.get('path') or '/',
-                bool(item.get('secure', True)),
-                exp,
-                name,
-                value,
-                httponly=bool(item.get('httponly', False)),
+        now = time.time()
+        with self._lock:
+            for aid, item in list(self._attempts.items()):
+                if now - item.created_at > 900 or item.state in ('COMPLETED', 'CANCELLED', 'FAILED'):
+                    if now - item.updated_at > 60:
+                        self._attempts.pop(aid, None)
+            attempt = BrowserLoginAttempt(
+                attempt_id=uuid.uuid4().hex,
+                platform=platform,
+                browser_name=browser['name'],
+                proxy=proxy,
+                created_at=now,
+                updated_at=now,
             )
-            dedup[(norm_domain, item.get('path') or '/', name)] = row
-        except ValueError:
-            continue
-    return list(dedup.items()), marker_hit
+            self._attempts[attempt.attempt_id] = attempt
 
+        policy = PLATFORM_LOGIN_POLICIES[platform]
+        temp_profile = tempfile.TemporaryDirectory(prefix='omni-browser-login-', ignore_cleanup_errors=True)
+        cmd = [
+            browser['path'],
+            f'--user-data-dir={temp_profile.name}',
+            '--remote-debugging-port=0',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-default-apps',
+        ]
+        if proxy:
+            cmd.append(f'--proxy-server={proxy}')
+        cmd.extend(['--new-window', policy['start_url']])
 
-def run_webview_login_cli(server_url: str, attempt_id: str, nonce: str) -> None:
-    """运行隔离桌面 pywebview 登录窗口并在登录后经由本机回环回传 Cookie。"""
-    headers = {'X-Omni-Webview-Nonce': nonce}
-    base = server_url.rstrip('/')
-    with httpx.Client(trust_env=False, timeout=10) as client:
-        resp = client.get(f'{base}/api/internal/webview-login/{attempt_id}', headers=headers)
-        resp.raise_for_status()
-        cfg = resp.json()
-
-    platform = cfg['platform']
-    policy = PLATFORM_LOGIN_POLICIES[platform]
-    allowed_domains = tuple(cfg['domains'])
-    proxy = str(cfg.get('proxy') or '').strip()
-    if proxy:
-        existing_args = os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', '')
-        os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = f'{existing_args} --proxy-server={proxy}'.strip()
-
-    import webview
-    from webview.menu import Menu, MenuAction
-
-    state = {'done': False, 'desktop': bool(policy.get('desktop', True))}
-
-    def _post(action: str, payload: dict | None = None) -> dict:
-        try:
-            with httpx.Client(trust_env=False, timeout=15) as client:
-                r = client.post(f'{base}/api/internal/webview-login/{attempt_id}/{action}', headers=headers, json=payload or {})
-                return r.json() if r.content else {}
-        except Exception:
-            return {}
-
-    def _save_now(force: bool) -> bool:
-        if state['done']:
-            return True
-        entries, marker_hit = _collect_cookies_from_window(window, policy, allowed_domains)
-        if not entries:
-            return False
-        if not force and not (policy.get('auto_capture') and marker_hit):
-            return False
-        netscape = '# Netscape HTTP Cookie File\n' + '\n'.join(row for _, row in entries) + '\n'
-        result = _post('capture', {'netscape': netscape})
-        if result.get('ok'):
-            state['done'] = True
-            try:
-                window.destroy()
-            except Exception:
-                pass
-            return True
-        return False
-
-    def _manual_save():
-        if not _save_now(force=True):
-            window.set_title(f'登录 {platform} · 尚未检测到可用 Cookie，请先完成登录')
-
-    def _reload_start():
-        window.load_url(policy['start_url'])
-
-    def _close_window():
-        state['done'] = True
-        _post('cancel')
-        window.destroy()
-
-    def _on_closed():
-        if not state['done']:
-            _post('cancel')
-
-    def _watcher():
-        _post('heartbeat', {'state': 'WAITING', 'message': f'请在打开的内置浏览器中完成 {platform} 登录...'})
-        time.sleep(1.5)
-        while not state['done']:
-            # 1. 自动识别关键登录标志 Cookie
-            if policy.get('auto_capture') and _save_now(force=False):
-                return
-            # 2. 响应管理页发起的远程“立即抓取”或“关闭窗口”指令
-            try:
-                with httpx.Client(trust_env=False, timeout=5) as client:
-                    cmd_resp = client.get(f'{base}/api/internal/webview-login/{attempt_id}/commands', headers=headers)
-                    if cmd_resp.status_code == 200:
-                        cmd = cmd_resp.json()
-                        if cmd.get('cancel'):
-                            state['done'] = True
-                            window.destroy()
-                            return
-                        if cmd.get('capture') and _save_now(force=True):
-                            return
-            except Exception:
-                pass
-            time.sleep(1.0)
-
-    menu_items = [
-        Menu('Cookie 登录操作', [
-            MenuAction('我已登录，保存当前 Cookie', _manual_save),
-            MenuAction('重新加载登录首页', _reload_start),
-            MenuAction('关闭登录窗口', _close_window),
-        ])
-    ]
-
-    with tempfile.TemporaryDirectory(prefix='omni-wv-') as profile_dir:
-        icon_candidate = Path(__file__).resolve().parents[2] / 'windows' / 'app.ico'
-        if getattr(sys, 'frozen', False):
-            icon_candidate = Path(sys._MEIPASS) / 'app.ico'
-        icon_arg = str(icon_candidate) if icon_candidate.is_file() else None
-        window = webview.create_window(
-            title=f'登录 {platform} · OmniDownloader Cookie 登录',
-            url=policy['start_url'],
-            width=1020,
-            height=760,
-            min_size=(760, 560),
-            text_select=True,
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
         )
-        window.events.closed += _on_closed
-        webview.start(
-            func=_watcher,
-            gui='edgechromium' if os.name == 'nt' else None,
-            user_agent=DESKTOP_UA if state['desktop'] else MOBILE_UA,
-            private_mode=True,
-            storage_path=profile_dir,
-            menu=menu_items,
-            icon=icon_arg,
-        )
+        attempt.process = proc
+
+        async def _monitor():
+            cdp_port = None
+            cdp_ws = ''
+            try:
+                port_file = Path(temp_profile.name) / 'DevToolsActivePort'
+                for _ in range(150):
+                    if attempt.cancel_requested or proc.returncode is not None:
+                        break
+                    if port_file.is_file():
+                        lines = port_file.read_text('utf-8', errors='ignore').strip().splitlines()
+                        if len(lines) >= 2 and lines[0].isdigit():
+                            cdp_port = int(lines[0])
+                            cdp_ws = lines[1].strip()
+                            break
+                    await asyncio.sleep(0.1)
+
+                if attempt.cancel_requested or proc.returncode is not None:
+                    attempt.state = 'CANCELLED'
+                    attempt.message = '本地浏览器窗口已关闭'
+                    attempt.updated_at = time.time()
+                    return
+                if not cdp_port:
+                    raise RuntimeError('未能与本地浏览器建立 Cookie 读取通道，请关闭已存在的同内核隔离实例或改用默认浏览器打开后导入')
+
+                attempt.state = 'WAITING'
+                attempt.message = (
+                    f'已启动本地 {browser["name"]} 独立登录窗口；登录后将自动保存 Cookie'
+                    if policy.get('auto_capture')
+                    else f'已启动本地 {browser["name"]} 独立登录窗口；请完成账号登录后点击“我已登录，抓取保存”'
+                )
+                attempt.updated_at = time.time()
+
+                while not attempt.cancel_requested and proc.returncode is None:
+                    await asyncio.sleep(1.0)
+                    if attempt.cancel_requested or proc.returncode is not None:
+                        break
+                    try:
+                        cookies = await fetch_cdp_cookies(cdp_port, cdp_ws)
+                    except Exception:
+                        continue
+                    netscape, marker_hit = cdp_cookies_to_netscape(cookies, policy, allowed_domains)
+                    force = attempt.manual_capture_requested
+                    if force:
+                        attempt.manual_capture_requested = False
+                    if netscape and (force or (policy.get('auto_capture') and marker_hit)):
+                        await on_capture(platform, netscape)
+                        attempt.state = 'COMPLETED'
+                        attempt.message = f'{platform} Cookie 已通过本地 {browser["name"]} 加密保存并启用'
+                        attempt.updated_at = time.time()
+                        return
+                    if force:
+                        attempt.message = '尚未检测到有效平台 Cookie，请确认已在打开的浏览器窗口完成登录后再点抓取'
+                        attempt.updated_at = time.time()
+
+                if attempt.state not in ('COMPLETED', 'FAILED'):
+                    attempt.state = 'CANCELLED'
+                    attempt.message = '本地浏览器窗口已关闭'
+                    attempt.updated_at = time.time()
+            except asyncio.CancelledError:
+                attempt.state = 'CANCELLED'
+                attempt.message = '本地浏览器登录已中止'
+                raise
+            except Exception as exc:
+                attempt.state = 'FAILED'
+                attempt.error = safe_text(exc)
+                attempt.message = attempt.error
+                attempt.updated_at = time.time()
+            finally:
+                if cdp_port and cdp_ws:
+                    await close_cdp_browser(cdp_port, cdp_ws)
+                if proc.returncode is None:
+                    try:
+                        proc.terminate()
+                        await asyncio.wait_for(proc.wait(), timeout=3)
+                    except Exception:
+                        try:
+                            proc.kill()
+                            await proc.wait()
+                        except Exception:
+                            pass
+                try:
+                    temp_profile.cleanup()
+                except Exception:
+                    pass
+
+        attempt.task = asyncio.create_task(_monitor())
+        return self.public_status(attempt.attempt_id)
+
+    async def close_all(self):
+        for attempt in list(self._attempts.values()):
+            attempt.cancel_requested = True
+            if attempt.task and not attempt.task.done():
+                attempt.task.cancel()
+        tasks = [a.task for a in self._attempts.values() if a.task]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)

@@ -135,7 +135,7 @@
               <button type="button" class="clear-dir" data-target="proxy">清空</button>
             </div>
             <div id="proxy-test-result" class="probe-result" hidden></div>
-            <small>不接受 URL 中的账号密码；内置 WebView 登录与下载核心都会自动遵循此代理配置（兼容 Fake-IP / TUN）。</small>
+            <small>不接受 URL 中的账号密码；本地浏览器登录、代理探测与下载核心都会自动遵循此代理配置（兼容 Fake-IP / TUN）。</small>
           </label>
         </div>
       </section>
@@ -235,7 +235,7 @@
     </form>
 
     <section id="sessions">
-      <div class="section-heading"><span>05</span><div><h2>平台 Cookie 与会话登录</h2><p>支持官方扫码、桌面内置 WebView 浏览器自动捕获以及多格式加密导入；Agent 仅可查看非敏感状态、禁用或移除。</p></div></div>
+      <div class="section-heading"><span>05</span><div><h2>平台 Cookie 与会话登录</h2><p>支持官方扫码、拉起本机 Chrome / Edge 临时会话自动读取、默认浏览器打开以及多格式加密导入；Agent 仅可查看非敏感状态、禁用或移除。</p></div></div>
       <div class="session-card">
         <div class="session-picker-row">
           <div>
@@ -257,7 +257,8 @@
             <small id="session-meta-hint" class="session-meta-hint"></small>
           </div>
           <div class="actions tight">
-            <button id="session-webview-login" type="button" class="primary">内置浏览器登录</button>
+            <button id="session-browser-login" type="button" class="primary">本地浏览器登录</button>
+            <button id="session-open-browser" type="button">默认浏览器打开</button>
             <button id="session-qr-login" type="button" hidden>B站扫码登录</button>
             <button id="session-verify" type="button">检测</button>
             <button id="session-clear" type="button">清除</button>
@@ -265,15 +266,15 @@
           </div>
         </div>
 
-        <div id="webview-panel" class="login-subpanel" hidden>
+        <div id="browser-login-panel" class="login-subpanel" hidden>
           <div class="login-subpanel-head">
-            <strong id="webview-status-title">内置浏览器登录窗口已打开</strong>
+            <strong id="browser-status-title">本地浏览器登录窗口已打开</strong>
             <div class="actions tight">
-              <button id="webview-manual-capture" type="button" class="primary">我已登录，抓取保存</button>
-              <button id="webview-cancel" type="button">关闭窗口</button>
+              <button id="browser-manual-capture" type="button" class="primary">我已登录，抓取保存</button>
+              <button id="browser-cancel" type="button">关闭窗口</button>
             </div>
           </div>
-          <p id="webview-status-text" class="hint">请在弹出的内置浏览器窗口中完成登录；具备明确登录标记的平台会在登录完成后自动保存并关闭窗口。</p>
+          <p id="browser-status-text" class="hint">请在弹出的本机浏览器独立临时窗口中完成登录；具备明确登录标记的平台会在登录完成后自动读取保存并关闭窗口。</p>
         </div>
 
         <div id="qr-login-panel" class="login-subpanel qr-panel" hidden>

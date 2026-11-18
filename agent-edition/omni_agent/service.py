@@ -17,10 +17,13 @@ from .bridges import BridgeRegistry
 from .config import Config, Settings
 from .cookie_login import (
     BilibiliQRLoginManager,
-    WebViewLoginManager,
+    LocalBrowserLoginManager,
+    PLATFORM_LOGIN_POLICIES,
+    find_local_browser,
     inspect_cookie_meta,
+    local_browser_available,
     normalize_cookie_text,
-    webview_available,
+    open_in_default_browser,
 )
 from .credentials import Vault
 from .delivery import BotConfig, make_adapter
@@ -118,7 +121,7 @@ class Service:
         self.analysis_slots = asyncio.Semaphore(2)
         self.bridges = BridgeRegistry()
         self.qr_logins = BilibiliQRLoginManager()
-        self.webview_logins = WebViewLoginManager()
+        self.browser_logins = LocalBrowserLoginManager()
         self._startup_probe = None
 
     async def start(self):
@@ -150,6 +153,7 @@ class Service:
         if self._startup_probe:
             self._startup_probe.cancel()
             await asyncio.gather(self._startup_probe, return_exceptions=True)
+        await self.browser_logins.close_all()
         if self.dispatcher:
             self.dispatcher.cancel()
             await asyncio.gather(self.dispatcher, return_exceptions=True)
@@ -301,8 +305,12 @@ class Service:
             'validation': clean_validation,
         }
         if include_ui:
+            browser = find_local_browser()
             info['ui'] = inspect_cookie_meta(self.sessions, platform)
-            info['webview_available'] = webview_available()
+            info['local_browser_available'] = browser is not None
+            info['local_browser_name'] = browser['name'] if browser else ''
+            info['login_url'] = PLATFORM_LOGIN_POLICIES.get(platform, {}).get('start_url', '')
+            info['login_hint'] = PLATFORM_LOGIN_POLICIES.get(platform, {}).get('hint', '')
             info['has_qr'] = platform == '哔哩哔哩'
         return info
 
@@ -360,7 +368,7 @@ class Service:
         self.vault.put(self._validation_key(platform), json.dumps(result))
         return result
 
-    # -------------------- 扫码 / 桌面 WebView 登录与桥接自动发现 --------------------
+    # -------------------- 扫码 / 本地浏览器登录与桥接自动发现 --------------------
 
     async def start_bilibili_qr(self):
         return await asyncio.to_thread(self.qr_logins.generate, self.config.settings.proxy)
@@ -377,37 +385,27 @@ class Service:
             pass
         return {'status': 'confirmed', 'message': '哔哩哔哩扫码登录成功并已加密保存', 'session': session}
 
-    async def start_webview_login(self, platform: str, server_url: str):
-        attempt = self.webview_logins.create(platform, self.config.settings.proxy)
-        if getattr(sys, 'frozen', False):
-            cmd = [str(Path(sys.executable).with_name('OmniDownloaderAgent.exe'))]
-        else:
-            cmd = [sys.executable, '-m', 'omni_agent']
-        cmd += ['--webview-login', '--server', server_url.rstrip('/'), '--attempt', attempt.attempt_id]
-        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]), OMNI_WEBVIEW_NONCE=attempt.nonce)
-        kwargs = {'creationflags': 0x08000000} if os.name == 'nt' else {}
-        attempt.process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            stdin=asyncio.subprocess.DEVNULL,
-            env=env,
-            **kwargs,
-        )
-        return self.webview_logins.public_status(attempt.attempt_id)
+    async def start_browser_login(self, platform: str):
+        if platform not in self.domains:
+            raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
 
-    async def complete_webview_capture(self, attempt_id: str, nonce: str, netscape: str):
-        attempt = self.webview_logins.verify_internal(attempt_id, nonce)
-        self.import_cookie(attempt.platform, netscape)
-        if attempt.platform in ('哔哩哔哩', 'Pixiv'):
-            try:
-                await self.verify_cookie(attempt.platform)
-            except AgentError:
-                pass
-        attempt.state = 'COMPLETED'
-        attempt.message = f'{attempt.platform} Cookie 已通过内置浏览器加密保存并启用'
-        attempt.updated_at = time.time()
-        return {'ok': True, 'session': self._session_info(attempt.platform, include_ui=True)}
+        async def _on_capture(target_platform: str, netscape: str):
+            self.import_cookie(target_platform, netscape)
+            if target_platform in ('哔哩哔哩', 'Pixiv'):
+                try:
+                    await self.verify_cookie(target_platform)
+                except AgentError:
+                    pass
+
+        return await self.browser_logins.start(
+            platform,
+            self.config.settings.proxy,
+            self.domains[platform],
+            on_capture=_on_capture,
+        )
+
+    async def open_login_page(self, platform: str):
+        return await asyncio.to_thread(open_in_default_browser, platform)
 
     async def scan_bridges(self, *, probe_bots: bool = True):
         if probe_bots:
@@ -765,6 +763,7 @@ class Service:
         except (ImportError, RuntimeError):
             pass
         s = self.config.settings
+        browser = find_local_browser()
         return {
             'edition': 'OmniDownloader Agent Edition',
             'version': __version__,
@@ -775,7 +774,8 @@ class Service:
             'ffmpeg': ffmpeg,
             'deno': bool(native_runtime('deno')),
             'headless': True,
-            'browser_assisted_login': webview_available(),
+            'browser_assisted_login': browser is not None,
+            'local_browser': browser['name'] if browser else '',
             'arbitrary_video_reencode': False,
             'drm_bypass': False,
             'auth_required': False,

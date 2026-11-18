@@ -11,7 +11,7 @@ dependencies = [
   "mcp>=2.3,<3", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "httpx>=0.28,<1",
   "cryptography>=44", "requests>=2.32,<3", "yt-dlp[default]", "PySocks>=1.7",
   "imageio-ffmpeg>=0.6", "pillow>=11", "gallery-dl==1.32.20",
-  "qrcode>=8,<9", "pywebview>=6,<7; sys_platform == 'win32'"
+  "qrcode>=8,<9", "websockets>=13"
 ]
 
 [project.optional-dependencies]

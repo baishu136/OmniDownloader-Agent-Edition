@@ -5,13 +5,14 @@ import json
 from pathlib import Path
 import sys
 import threading
+import time
 import types
 
 from fastapi.testclient import TestClient
 import pytest
 
 from omni_agent.api import create_app
-from omni_agent.cookie_login import normalize_cookie_text
+from omni_agent.cookie_login import PLATFORM_LOGIN_POLICIES, cdp_cookies_to_netscape, normalize_cookie_text
 from omni_agent.errors import AgentError
 from omni_agent.visualization import build_visualization
 
@@ -77,7 +78,7 @@ def test_proxy_connectivity_check_and_validation(service, monkeypatch):
         thread.join(timeout=2)
 
 
-def test_cookie_multi_format_webview_and_qr_login(service, monkeypatch):
+def test_cookie_multi_format_local_browser_cdp_and_qr_login(service, monkeypatch):
     # JSON Cookie 数组格式导入并正确加密，不泄漏给 Agent
     json_cookies = json.dumps([
         {'name': 'SESSDATA', 'value': 'json-secret-sess', 'domain': '.bilibili.com', 'path': '/', 'httpOnly': True, 'secure': True},
@@ -87,9 +88,23 @@ def test_cookie_multi_format_webview_and_qr_login(service, monkeypatch):
     netscape = normalize_cookie_text('哔哩哔哩', json_cookies, service.domains)
     assert '#HttpOnly_.bilibili.com' in netscape and 'json-secret-sess' in netscape and 'evil.example' not in netscape
 
-    # WebView 登录管理 + 内部 nonce 隔离 + 扫码状态轮询
-    monkeypatch.setattr('omni_agent.cookie_login.webview_available', lambda: True)
-    monkeypatch.setattr('omni_agent.service.webview_available', lambda: True)
+    # CDP Cookie 过滤与转换应保留 HttpOnly 并检测关键登录标记
+    cdp_netscape, marker_hit = cdp_cookies_to_netscape(
+        [
+            {'name': 'auth_token', 'value': 'x-cdp-secret', 'domain': '.x.com', 'path': '/', 'httpOnly': True, 'secure': True, 'expires': int(time.time()) + 3600},
+            {'name': 'guest', 'value': '1', 'domain': '.other.com', 'path': '/'},
+        ],
+        PLATFORM_LOGIN_POLICIES['X (Twitter)'],
+        service.domains['X (Twitter)'],
+    )
+    assert marker_hit is True
+    assert '#HttpOnly_.x.com' in cdp_netscape and 'x-cdp-secret' in cdp_netscape and 'other.com' not in cdp_netscape
+
+    # 本地未检测到浏览器时应优雅降级为 CAPABILITY_UNAVAILABLE (400)，并保留默认浏览器打开能力
+    monkeypatch.setattr('omni_agent.cookie_login.find_local_browser', lambda: None)
+    monkeypatch.setattr('omni_agent.service.find_local_browser', lambda: None)
+    opened_urls = []
+    monkeypatch.setattr('omni_agent.cookie_login.webbrowser.open', lambda url, new=2: opened_urls.append(url) or True)
 
     with TestClient(create_app(service)) as client:
         res = client.post('/api/admin/sessions', json={'platform': '哔哩哔哩', 'text': json_cookies})
@@ -97,28 +112,96 @@ def test_cookie_multi_format_webview_and_qr_login(service, monkeypatch):
         ui_info = next(s for s in client.get('/api/admin/sessions').json() if s['platform'] == '哔哩哔哩')
         assert ui_info['ui']['cookie_count'] == 2
         assert ui_info['ui']['marker_present'] is True
+        assert ui_info['local_browser_available'] is False
+        assert ui_info['login_url'].startswith('https://')
 
-        # Agent 视角绝不能包含任何 Cookie 键名或明文或 UI 元字段
+        # Agent 视角绝不能包含任何 Cookie 键名、明文或 UI 元字段
         agent_resp = client.post('/api/tools/list_cookie_statuses', json={}).json()
         assert agent_resp['ok']
         assert 'SESSDATA' not in json.dumps(agent_resp)
         assert 'json-secret-sess' not in json.dumps(agent_resp)
         assert 'ui' not in agent_resp['result']['platforms'][0]
 
-        # WebView 内部认证边界：缺少正确 nonce 须拒绝
-        attempt = service.webview_logins.create('X (Twitter)', '')
-        assert client.get(f'/api/internal/webview-login/{attempt.attempt_id}').status_code == 400
-        cfg = client.get(f'/api/internal/webview-login/{attempt.attempt_id}', headers={'X-Omni-Webview-Nonce': attempt.nonce})
-        assert cfg.status_code == 200 and cfg.json()['platform'] == 'X (Twitter)'
+        # 默认浏览器打开接口与无本地浏览器错误提示
+        opened = client.post('/api/admin/sessions/X (Twitter)/open-login')
+        assert opened.status_code == 200 and opened.json()['opened'] is True and opened_urls == ['https://x.com/i/flow/login']
+        no_browser = client.post('/api/admin/sessions/X (Twitter)/browser-login')
+        assert no_browser.status_code == 400 and no_browser.json()['error']['code'] == 'CAPABILITY_UNAVAILABLE'
 
-        captured = client.post(
-            f'/api/internal/webview-login/{attempt.attempt_id}/capture',
-            headers={'X-Omni-Webview-Nonce': attempt.nonce},
-            json={'netscape': json.dumps([{'name': 'auth_token', 'value': 'x-wv-secret', 'domain': '.x.com', 'httpOnly': True}])},
-        )
-        assert captured.status_code == 200 and captured.json()['ok']
-        assert service.webview_logins.public_status(attempt.attempt_id)['state'] == 'COMPLETED'
+        # 模拟本地已安装 Chrome：验证 CDP 自动抓取、加密保存、手动抓取和关闭窗口取消
+        fake_browser = {'name': 'Google Chrome', 'path': 'mock-chrome'}
+        monkeypatch.setattr('omni_agent.cookie_login.find_local_browser', lambda: fake_browser)
+        monkeypatch.setattr('omni_agent.service.find_local_browser', lambda: fake_browser)
+
+        real_sleep = asyncio.sleep
+        real_exec = asyncio.create_subprocess_exec
+        monkeypatch.setattr('omni_agent.cookie_login.asyncio.sleep', lambda sec: real_sleep(0.01 if sec >= 0.9 else sec))
+
+        class FakeProc:
+            def __init__(self):
+                self.returncode = None
+
+            def terminate(self):
+                self.returncode = 0
+
+            def kill(self):
+                self.returncode = -9
+
+            async def wait(self):
+                return self.returncode
+
+        async def fake_exec(*cmd, **kwargs):
+            if cmd and str(cmd[0]) == 'mock-chrome':
+                for arg in cmd:
+                    if str(arg).startswith('--user-data-dir='):
+                        profile_dir = Path(str(arg).split('=', 1)[1])
+                        (profile_dir / 'DevToolsActivePort').write_text('9229\n/devtools/browser/mock\n', encoding='utf-8')
+                return FakeProc()
+            return await real_exec(*cmd, **kwargs)
+
+        poll_counter = {'n': 0}
+
+        async def fake_fetch(port, ws_path):
+            assert port == 9229
+            poll_counter['n'] += 1
+            if poll_counter['n'] == 1:
+                return [{'name': 'guest_id', 'value': 'guest-1', 'domain': '.x.com', 'path': '/'}]
+            return [{'name': 'auth_token', 'value': 'x-cdp-secret', 'domain': '.x.com', 'path': '/', 'httpOnly': True, 'secure': True}]
+
+        async def fake_close(port, ws_path):
+            return None
+
+        monkeypatch.setattr('omni_agent.cookie_login.asyncio.create_subprocess_exec', fake_exec)
+        monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_cookies', fake_fetch)
+        monkeypatch.setattr('omni_agent.cookie_login.close_cdp_browser', fake_close)
+
+        started = client.post('/api/admin/sessions/X (Twitter)/browser-login')
+        assert started.status_code == 200
+        attempt_id = started.json()['attempt_id']
+
+        final_status = {}
+        for _ in range(40):
+            final_status = client.get(f'/api/admin/sessions/browser-status/{attempt_id}').json()
+            if final_status['state'] == 'COMPLETED':
+                break
+            time.sleep(0.02)
+
+        assert final_status['state'] == 'COMPLETED'
+        assert 'x-cdp-secret' not in json.dumps(final_status)
         assert service.sessions.status('X (Twitter)')['state'] == 'IMPORTED'
+
+        # 测试等待期间的手动抓取与取消
+        async def empty_cookies(port, ws_path):
+            return [{'name': 'PHPSESSID', 'value': 'px-manual-secret', 'domain': '.pixiv.net', 'path': '/'}]
+
+        monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_cookies', empty_cookies)
+        px = client.post('/api/admin/sessions/Pixiv/browser-login')
+        assert px.status_code == 200
+        px_id = px.json()['attempt_id']
+        time.sleep(0.03)
+        cancel_res = client.post('/api/admin/sessions/Pixiv/browser-cancel')
+        assert cancel_res.status_code == 200 and cancel_res.json()['cancelled'] is True
+        assert client.get(f'/api/admin/sessions/browser-status/{px_id}').json()['state'] == 'CANCELLED'
 
         # 模拟 B 站二维码生成与扫码确认流程
         monkeypatch.setattr(service.qr_logins, 'generate', lambda proxy='': {'qr_id': 'mock-qr', 'matrix': [[1, 0], [0, 1]], 'expires_in': 180})
