@@ -107,9 +107,10 @@ async def execute(request, emit):
         finally:
             client.close()
     url = source_url(request['url'])
-    validate_url(url, initial=True)
+    using_proxy = bool(config.proxy_url)
+    validate_url(url, initial=True, using_proxy=using_proxy)
     url = await UrlSniffer.sanitize_and_resolve_url(url, config.proxy_url)
-    validate_url(url, initial=True)
+    validate_url(url, initial=True, using_proxy=using_proxy)
     profile = is_profile(url)
     if profile and not request.get('allow_profiles'):
         raise AgentError('FEATURE_DISABLED', '当前设置未允许用户主页解析')
@@ -207,7 +208,7 @@ async def execute(request, emit):
         items = [(item.url, item.title, []) for item in chosen]
     paths = []
     for index, (item_url, title, image_ids) in enumerate(items):
-        validate_url(item_url, initial=True)
+        validate_url(item_url, initial=True, using_proxy=using_proxy)
         task = await task_manager.add_task(
             url=item_url,
             title=title or ('media-' + str(index + 1)),

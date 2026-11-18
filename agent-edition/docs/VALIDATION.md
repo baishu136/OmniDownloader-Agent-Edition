@@ -10,7 +10,7 @@
   - 图文下载与打包压缩包分离，`/us`、`/zip` 与 `/us /zip` 链接前缀解析与多集视频/全图执行验证；
   - QQ 视频/图片消息与群文件发送切换、`.zip` 强制文件上传、合集/图集打包为合并转发聊天记录（`send_group_forward_msg`）及 Bot 连接信息探测；
   - Cookie 严格隔离权限：Agent 仅可读取非敏感状态、禁用与移除，绝无读取明文、填写/导入或重新启用权限；
-  - 本机 `Host`/`Origin` 防护、SSRF、受控路径边界、文件引用账本、异步取消进程树与核心 TaskManager 桥接。
+  - 本机 `Host`/`Origin` 防护、兼容 Fake-IP / TUN（放行 `198.18.0.0/15` 与 `fc00::/18`，继续阻断本机回环/私网/云元数据与显式代理本地 DNS 误判）的精细化 SSRF 防护、受控路径边界、文件引用账本、异步取消进程树与核心 TaskManager 桥接。
 - 真实浏览器 UI 验证：通过无头 Edge Playwright 实测深浅色切换真实反转与自动保存持久化、自定义下拉菜单动画打开与选择、自动保存、重置设置、Android 风格 Cookie 焦点卡片（导入/禁用开关/清除）、Bot 摘要卡片及 390px 窄屏无横向溢出与零控制台报错。
 - Windows 便携包：PyInstaller 实际构建；`tools/portable_smoke.py` 实测通过。
 - Linux/Docker 部署：由 GitHub Actions `.github/workflows/agent-edition.yml` 与 `tools/docker_smoke.py` 执行构建与验证。

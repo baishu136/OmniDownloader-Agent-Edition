@@ -1,4 +1,4 @@
-"""Process-scoped outbound guard. Never installed in the legacy GUI process."""
+"""Process-scoped outbound guard compatible with Fake-IP / TUN proxies."""
 import ipaddress
 import re
 import socket
@@ -17,15 +17,28 @@ HOSTS = {
     'facebook.com', 'fb.watch', 'fb.me', 'pinterest.com', 'pin.it',
 }
 RAW_GETADDRINFO = socket.getaddrinfo
+_ORIG_CONNECT = socket.socket.connect
+_ORIG_CONNECT_EX = socket.socket.connect_ex
+_ORIG_POPEN = subprocess.Popen
+
+# 标准 Fake-IP 虚拟网段（Clash / Mihomo / sing-box 等 TUN 代理常用）
+FAKE_IP_NETWORKS = (
+    ipaddress.ip_network('198.18.0.0/15'),
+    ipaddress.ip_network('fc00::/18'),
+)
 
 
 def public_ip(value):
+    """兼容 Fake-IP 段（198.18.0.0/15 与 fc00::/18），严格拦截本机回环、真实私网与云元数据。"""
     address = ipaddress.ip_address(str(value).split('%')[0])
-    if address.version == 6 and address.ipv4_mapped: address = address.ipv4_mapped
+    if address.version == 6 and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    if any(address in net for net in FAKE_IP_NETWORKS):
+        return True
     return address.is_global and not address.is_multicast and not address.is_unspecified
 
 
-def validate_url(url, *, initial=False, resolve=True):
+def validate_url(url, *, initial=False, resolve=True, using_proxy=False):
     try:
         p = urlsplit(url)
         if p.scheme not in ('http', 'https') or not p.hostname or p.username or p.password or p.port not in (None, 80, 443):
@@ -34,17 +47,21 @@ def validate_url(url, *, initial=False, resolve=True):
         if initial and not any(host == h or host.endswith('.' + h) for h in HOSTS):
             raise AgentError('UNSUPPORTED_PLATFORM', '仅接受已配置媒体平台的作品链接')
         try:
-            if not public_ip(host): raise AgentError('SSRF_BLOCKED', '不允许访问本机、私网或特殊地址')
+            if not public_ip(host):
+                raise AgentError('SSRF_BLOCKED', '不允许访问本机、私网或特殊地址')
         except ValueError:
             if host in ('localhost',) or host.endswith(('.localhost', '.local', '.internal')):
                 raise AgentError('SSRF_BLOCKED', '不允许访问本机、私网或特殊地址')
-        if resolve:
+        # 配置显式代理时域名由代理端解析，跳过本地 DNS 预校验；直连/TUN 模式允许公网及 Fake-IP
+        if resolve and not using_proxy:
             rows = RAW_GETADDRINFO(host, p.port or (443 if p.scheme == 'https' else 80), type=socket.SOCK_STREAM)
             if not rows or any(not public_ip(row[4][0]) for row in rows):
-                raise AgentError('SSRF_BLOCKED', '目标解析到非公共地址')
+                raise AgentError('SSRF_BLOCKED', '目标解析到非许可内网或保留地址')
         return url
-    except AgentError: raise
-    except (ValueError, OSError): raise AgentError('INVALID_URL', '链接格式无效或域名无法解析') from None
+    except AgentError:
+        raise
+    except (ValueError, OSError):
+        raise AgentError('INVALID_URL', '链接格式无效或域名无法解析') from None
 
 
 def parse_download_command(raw):
@@ -68,7 +85,8 @@ def parse_download_command(raw):
 def source_url(text):
     clean, _, _ = parse_download_command(text)
     match = re.search(r'https?://[^\s<>"\u201d]+', clean)
-    if not match: raise AgentError('INVALID_URL', '请提供HTTP(S)作品或合集链接')
+    if not match:
+        raise AgentError('INVALID_URL', '请提供HTTP(S)作品或合集链接')
     return validate_url(match[0].rstrip('。，,;；!！)]}'), initial=True, resolve=False)
 
 
@@ -76,14 +94,19 @@ def is_profile(url):
     p = urlsplit(url)
     path = p.path.rstrip('/')
     host = (p.hostname or '').lower()
-    # Fail closed for known home/profile/search/feed forms, including encoded paths.
+    # 识别常见用户主页/频道/搜索/动态链接形式（含 URL 编码路径）
     from urllib.parse import unquote
     path = unquote(path)
-    if re.search(r'/(?:user|users|u|channel|channels|profile|search|feed|home|space)(?:/|$)', path, re.I): return True
-    if host.endswith('bilibili.com') and host.startswith('space.'): return True
-    if host.endswith(('x.com', 'twitter.com')) and not re.search(r'/status/\d+', path): return True
-    if host.endswith(('youtube.com', 'tiktok.com')) and '/@' in path and not re.search(r'/(video|shorts|watch)/', path): return True
-    if host.endswith('instagram.com') and not re.search(r'/(p|reel|reels|tv)/', path): return True
+    if re.search(r'/(?:user|users|u|channel|channels|profile|search|feed|home|space)(?:/|$)', path, re.I):
+        return True
+    if host.endswith('bilibili.com') and host.startswith('space.'):
+        return True
+    if host.endswith(('x.com', 'twitter.com')) and not re.search(r'/status/\d+', path):
+        return True
+    if host.endswith(('youtube.com', 'tiktok.com')) and '/@' in path and not re.search(r'/(video|shorts|watch)/', path):
+        return True
+    if host.endswith('instagram.com') and not re.search(r'/(p|reel|reels|tv)/', path):
+        return True
     return False
 
 
@@ -101,23 +124,23 @@ def controlled(root, path):
 
 
 def install_network_guard(proxy=''):
-    """Validate each DNS resolution AND actual socket destination, including redirects.
+    """安装兼容 Fake-IP / TUN 与显式代理的出站防护。
 
-    Administrator-configured proxy is the only private socket exception. URL
-    validation remains enabled; SOCKS remote-DNS is disabled so IP checks persist.
-    FFmpeg is restricted to local protocols; browser capture is disabled.
+    - 显式代理端口仅作为唯一可信本地回环/私网出口；
+    - 放行公网 IP 与标准 Fake-IP 网段（198.18.0.0/15、fc00::/18），继续拦截本机、真实私网与云元数据；
+    - 限制 FFmpeg 仅使用本地协议，并禁止工作进程启动 Shell 命令。
     """
     proxy_destinations = set()
+    has_proxy = bool(proxy)
     if proxy:
         p = urlsplit(proxy)
         if p.scheme not in ('http', 'https', 'socks5') or not p.hostname or not p.port:
             raise AgentError('INVALID_PROXY', '代理须为带端口的 http/https/socks5 地址')
         proxy_destinations = {(r[4][0], p.port) for r in RAW_GETADDRINFO(p.hostname, p.port, type=socket.SOCK_STREAM)}
 
-    original_connect, original_connect_ex = socket.socket.connect, socket.socket.connect_ex
-
     def guard(address):
-        if not isinstance(address, tuple): return address
+        if not isinstance(address, tuple):
+            return address
         host, port = address[:2]
         rows = RAW_GETADDRINFO(host, port, type=socket.SOCK_STREAM)
         if any(not public_ip(row[4][0]) and (row[4][0], port) not in proxy_destinations for row in rows):
@@ -126,39 +149,51 @@ def install_network_guard(proxy=''):
 
     def connect(sock, address):
         rows = guard(address)
-        pinned = next((row[4] for row in rows if row[0] == sock.family), address) if isinstance(address,tuple) else address
-        return original_connect(sock, pinned)
+        pinned = next((row[4] for row in rows if row[0] == sock.family), address) if isinstance(address, tuple) else address
+        return _ORIG_CONNECT(sock, pinned)
 
     def connect_ex(sock, address):
         rows = guard(address)
-        pinned = next((row[4] for row in rows if row[0] == sock.family), address) if isinstance(address,tuple) else address
-        return original_connect_ex(sock, pinned)
+        pinned = next((row[4] for row in rows if row[0] == sock.family), address) if isinstance(address, tuple) else address
+        return _ORIG_CONNECT_EX(sock, pinned)
 
     socket.socket.connect, socket.socket.connect_ex = connect, connect_ex
+
     import requests
-    original_send = requests.Session.send
+    if not getattr(requests.Session.send, '_omni_guarded', False):
+        orig_send = requests.Session.send
+    else:
+        orig_send = requests.Session.send._omni_orig
 
     def send(session, request, **kwargs):
-        validate_url(request.url)
-        return original_send(session, request, **kwargs)
+        validate_url(request.url, using_proxy=has_proxy or bool(getattr(session, 'proxies', None)))
+        return orig_send(session, request, **kwargs)
 
+    send._omni_guarded = True
+    send._omni_orig = orig_send
     requests.Session.send = send
+
     import yt_dlp
-    original_open = yt_dlp.YoutubeDL.urlopen
+    if not getattr(yt_dlp.YoutubeDL.urlopen, '_omni_guarded', False):
+        orig_open = yt_dlp.YoutubeDL.urlopen
+    else:
+        orig_open = yt_dlp.YoutubeDL.urlopen._omni_orig
 
     def urlopen(engine, request):
-        validate_url(request if isinstance(request, str) else request.url)
-        return original_open(engine, request)
+        validate_url(request if isinstance(request, str) else request.url, using_proxy=has_proxy)
+        return orig_open(engine, request)
 
+    urlopen._omni_guarded = True
+    urlopen._omni_orig = orig_open
     yt_dlp.YoutubeDL.urlopen = urlopen
-    original_popen = subprocess.Popen
 
-    def popen(args, *positional, **kwargs):
-        if isinstance(args, (str, bytes)) or kwargs.get('shell'):
-            raise AgentError('PROCESS_DENIED', '工作进程禁止Shell命令')
-        name = Path(str(args[0])).name.lower()
-        if 'ffmpeg' in name or 'ffprobe' in name:
-            args = [args[0], '-protocol_whitelist', 'file,pipe,crypto,data', *args[1:]]
-        return original_popen(args, *positional, **kwargs)
+    class GuardedPopen(_ORIG_POPEN):
+        def __init__(self, args, *positional, **kwargs):
+            if isinstance(args, (str, bytes)) or kwargs.get('shell'):
+                raise AgentError('PROCESS_DENIED', '工作进程禁止Shell命令')
+            name = Path(str(args[0])).name.lower()
+            if 'ffmpeg' in name or 'ffprobe' in name:
+                args = [args[0], '-protocol_whitelist', 'file,pipe,crypto,data', *args[1:]]
+            super().__init__(args, *positional, **kwargs)
 
-    subprocess.Popen = popen
+    subprocess.Popen = GuardedPopen
