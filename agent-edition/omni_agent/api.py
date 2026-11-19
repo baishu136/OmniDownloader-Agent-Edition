@@ -124,6 +124,11 @@ class BrowserNavigateArgs(Input):
     target: Literal['google', 'platform', 'reload']
 
 
+class BrowserPrefsUpdateArgs(Input):
+    browser: Literal['auto', 'chrome', 'edge', 'brave', 'chromium'] | None = None
+    mode: Literal['auto', 'clean', 'cdp'] | None = None
+
+
 class Retry(Input):
     reconciled_allow_retry: bool = False
 
@@ -425,7 +430,7 @@ def create_app(service=None):
             'bots': service.get_bot_configs(),
             'bridges': service.bridges.list_bridges(),
             'bridge_hints': service.bridges.local_hints,
-            'local_browser': (find_local_browser() or {}).get('name', ''),
+            'local_browser': service.get_browser_preferences().get('resolved_name') or ((find_local_browser() or {}).get('name', '')),
         }
 
     @app.get('/api/admin/bridges')
@@ -538,9 +543,21 @@ def create_app(service=None):
     async def browser_manage_google(body: ManageGoogleArgs | None = None):
         return await service.start_manage_google(body.account_id if body else '')
 
+    @app.get('/api/admin/sessions/browser-prefs')
+    async def browser_prefs_get():
+        return service.get_browser_preferences()
+
+    @app.post('/api/admin/sessions/browser-prefs')
+    async def browser_prefs_update(body: BrowserPrefsUpdateArgs):
+        return service.update_browser_preferences(browser=body.browser, mode=body.mode)
+
     @app.post('/api/admin/sessions/browser-login/{attempt_id}/navigate')
     async def browser_login_navigate(attempt_id: str, body: BrowserNavigateArgs):
         return await service.navigate_browser_login(attempt_id, body.target)
+
+    @app.post('/api/admin/sessions/browser-login/{attempt_id}/relaunch-clean')
+    async def browser_login_relaunch_clean(attempt_id: str):
+        return await service.relaunch_browser_login_clean(attempt_id)
 
     @app.post('/api/admin/sessions/{platform}/browser-login')
     async def browser_login_start(platform: str):

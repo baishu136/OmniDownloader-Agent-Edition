@@ -10,7 +10,7 @@
 - 自动识别已接入桥接：自动追踪与扫描 Streamable HTTP (`/mcp`)、MCP stdio (`--stdio`)、AstrBot 插件及本地 Bot 连接状态。
 - 图文与打包分离 + 下载指令前缀：支持 `/us`（下载合集、分集视频、全部图片）与 `/zip`（打包成 ZIP 压缩包发送），支持独立设置媒体下载保存目录、图文保存目录与服务缓存目录。
 - QQ / OneBot 11 / NapCat 消息发送设置：支持配置视频/图片以聊天消息或群/私聊文件发送，支持将合集/图集打包为合并转发聊天记录（`send_*_forward_msg`），并展示实时 Bot 连接与账号详情。
-- 完善 Cookie 登录流程与多账号隔离容器：对齐 Android 版「登录获取会话 / 重新验证登录」与防自动覆盖策略、清除后 `manage_only` Google 账号管理、页内快捷跳转导航、多账号独立浏览器容器隔离与所有权安全退出、哔哩哔哩官方扫码、持久托管 Chrome / Edge 免密同步与 Netscape / 请求头 / JSON 数组导入；Agent 无法读取 Cookie 明文、来源或独立档案，仅可查看非敏感状态、禁用或移除。
+- 完善 Cookie 登录流程与多账号隔离容器：对齐 Android 版「登录获取会话 / 重新验证登录」与防自动覆盖策略，支持 Chrome 优先与本机 Edge/Chrome/Brave 选择及**纯净无调试模式**（Google 登录流程自动屏蔽调试特征与 `--remote-debugging-port`，彻底解决 Edge / Chrome 无法登录 Google 问题）、清除后 `manage_only` Google 账号管理、页内快捷跳转与一键纯净重开、多账号独立浏览器容器隔离与所有权安全退出、哔哩哔哩官方扫码、持久档案免密同步与多格式导入；Agent 无法读取 Cookie 明文、来源、浏览器偏好或独立档案，仅可查看非敏感状态、禁用或移除。
 - 独立本地工作目录：源码运行默认使用工程根目录下的 `./data/`，独立便携包使用工作区或 EXE 同级 `./data/`，不再写入 `%LOCALAPPDATA%`。
 
 [下载发行包](https://github.com/baishu136/OmniDownloader-Agent-Edition/releases) · [完整部署与接入](agent-edition/docs/OPERATIONS.md) · [验证记录](agent-edition/docs/VALIDATION.md) · [模块结构](agent-edition/README.md)

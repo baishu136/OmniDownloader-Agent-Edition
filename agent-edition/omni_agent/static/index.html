@@ -254,6 +254,21 @@
           </label>
         </div>
 
+        <div class="browser-prefs-grid">
+          <label>登录浏览器偏好
+            <select id="browser-pref-select" aria-label="选择本地登录浏览器">
+              <option value="auto">自动（优先 Google Chrome）</option>
+            </select>
+          </label>
+          <label>Google 登录防风控模式
+            <select id="browser-mode-select" aria-label="选择防风控模式">
+              <option value="auto">智能模式（Google 流程自动无调试纯净启动）</option>
+              <option value="clean">始终纯净无调试（解决 Edge/Chrome Google 拦截）</option>
+              <option value="cdp">始终实时监听（支持自动捕获与快捷页内跳转）</option>
+            </select>
+          </label>
+        </div>
+
         <div class="session-status-row">
           <div>
             <span id="session-pill" class="status-pill">未导入</span>
@@ -297,6 +312,7 @@
               <button id="browser-nav-google" type="button" hidden>Google 账号页</button>
               <button id="browser-nav-platform" type="button" hidden>平台登录页</button>
               <button id="browser-nav-reload" type="button">重新加载登录页</button>
+              <button id="browser-relaunch-clean" type="button" hidden>纯净模式重开</button>
               <button id="browser-cancel" type="button">取消</button>
             </div>
           </div>

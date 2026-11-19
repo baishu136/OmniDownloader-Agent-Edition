@@ -767,6 +767,8 @@ async def test_android_style_explicit_reverify_manage_only_and_multi_account_pro
             return Path(path).read_text('utf-8') if path else ''
 
     with TestClient(app) as client:
+        # 显式设为 cdp 模式以测验实时远程控制、页内导航与显式保存逻辑
+        assert client.post('/api/admin/sessions/browser-prefs', json={'mode': 'cdp'}).status_code == 200
         # 1. X (Twitter) 已有凭据时，重新验证登录必须 require_explicit_save=True，不自动覆盖，关窗也不覆盖
         service.import_cookie('X (Twitter)', 'auth_token=old-x-auth; ct0=old-x-ct0')
         relogin = client.post('/api/admin/sessions/X%20(Twitter)/browser-login').json()
@@ -914,3 +916,197 @@ async def test_android_style_explicit_reverify_manage_only_and_multi_account_pro
             assert set(item['validation'].keys()).issubset({'state', 'checked_at'})
         for forbidden in ('owner_token', 'source', 'browser_profile', 'browser_accounts', '主号', 'yt-main', 'px-overwritten'):
             assert forbidden not in serialized
+
+
+@pytest.mark.asyncio
+async def test_edge_clean_mode_bypass_browser_priority_and_relaunch(service, monkeypatch, tmp_path):
+    """验证 Chrome > Edge 浏览器优先级、纯净无调试模式彻底绕过 Edge/Google 拦截、偏好切换与一键纯净重开。"""
+    from starlette.testclient import TestClient
+    from omni_agent.api import create_app, invoke
+    from omni_agent.cookie_login import LocalBrowserLoginManager, read_profile_browser_key
+
+    edge_browser = {'key': 'edge', 'name': 'Microsoft Edge', 'path': 'mock-edge'}
+    chrome_browser = {'key': 'chrome', 'name': 'Google Chrome', 'path': 'mock-chrome'}
+    # 验证本机若存在 Chrome 与 Edge，list_local_browsers 默认首选 Chrome
+    monkeypatch.setattr(
+        'omni_agent.cookie_login.list_local_browsers',
+        lambda: [chrome_browser, edge_browser],
+    )
+    monkeypatch.setattr('omni_agent.cookie_login.find_local_browser', lambda: edge_browser)
+    monkeypatch.setattr('omni_agent.service.find_local_browser', lambda: edge_browser)
+    monkeypatch.setattr(service.browser_logins, 'POLL_INTERVAL_SEC', 0.01)
+    monkeypatch.setattr(service.browser_logins, 'PORT_WAIT_STEP_SEC', 0.01)
+    monkeypatch.setattr(service.browser_logins, 'CONFIRM_WINDOW_SEC', 0.01)
+
+    mgr = service.browser_logins
+    # _build_browser_cmd 必须屏蔽 navigator.webdriver、关闭后台驻留，且不带易触发风控的标志；Clean 模式严禁带 --remote-debugging-port
+    clean_cmd = mgr._build_browser_cmd('mock-edge', tmp_path / 'p', '', 'https://accounts.google.com/', clean_mode=True)
+    assert '--disable-blink-features=AutomationControlled' in clean_cmd
+    assert '--disable-background-mode' in clean_cmd
+    assert '--disable-features=msEdgeFirstRunExperiences' in clean_cmd
+    assert not any(arg.startswith('--remote-debugging-port') for arg in clean_cmd)
+    for risky in ('--disable-background-networking', '--disable-sync', '--disable-default-apps'):
+        assert risky not in clean_cmd
+
+    headless_cmd = mgr._build_browser_cmd('mock-edge', tmp_path / 'p', '', 'about:blank', headless=True)
+    assert '--headless=new' in headless_cmd and '--remote-debugging-port=0' in headless_cmd
+
+    launch_records = []
+    procs = []
+    real_exec = asyncio.create_subprocess_exec
+
+    class FakeProc:
+        def __init__(self):
+            self.returncode = None
+            self.pid = None
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_exec(*cmd, **kwargs):
+        if cmd and str(cmd[0]) in ('mock-edge', 'mock-chrome'):
+            data_dir = None
+            for arg in cmd:
+                if str(arg).startswith('--user-data-dir='):
+                    data_dir = Path(str(arg).split('=', 1)[1])
+                    data_dir.mkdir(parents=True, exist_ok=True)
+                    (data_dir / 'Local State').write_text('{"os_crypt":{}}', encoding='utf-8')
+                    if '--remote-debugging-port=0' in cmd:
+                        (data_dir / 'DevToolsActivePort').write_text('9444\n/devtools/browser/clean\n', encoding='utf-8')
+            launch_records.append({
+                'exe': str(cmd[0]),
+                'cmd': list(cmd),
+                'headless': '--headless=new' in cmd,
+                'has_debug_port': any(str(a).startswith('--remote-debugging-port') for a in cmd),
+                'profile_dir': data_dir,
+            })
+            proc = FakeProc()
+            procs.append(proc)
+            return proc
+        return await real_exec(*cmd, **kwargs)
+
+    snap_cookies = [
+        {'name': 'SID', 'value': 'edge-yt-sid', 'domain': '.youtube.com', 'path': '/', 'httpOnly': True, 'secure': True},
+        {'name': 'SAPISID', 'value': 'edge-yt-sapi', 'domain': '.youtube.com', 'path': '/', 'httpOnly': False, 'secure': True},
+    ]
+
+    async def fake_snapshot(port, ws_path, cookie_urls=()):
+        return {'cdp_connected': True, 'current_host': 'www.youtube.com', 'cookies': list(snap_cookies)}
+
+    monkeypatch.setattr('omni_agent.cookie_login.asyncio.create_subprocess_exec', fake_exec)
+    monkeypatch.setattr('omni_agent.cookie_login.close_cdp_browser', lambda p, w: asyncio.sleep(0))
+    monkeypatch.setattr('omni_agent.cookie_login.fetch_cdp_snapshot', fake_snapshot)
+    monkeypatch.setattr(service, 'verify_cookie', lambda p: asyncio.sleep(0, result={'state': 'VALID'}))
+
+    def read_cookie_text(plat):
+        with service.sessions.cookie_file(plat) as path:
+            return Path(path).read_text('utf-8') if path else ''
+
+    with TestClient(create_app(service)) as client:
+        # 1. 验证默认偏好持久化与查询（仅返回非敏感 key/name，不含路径）
+        prefs0 = client.get('/api/admin/sessions/browser-prefs').json()
+        assert prefs0['browser'] == 'auto' and prefs0['mode'] == 'auto'
+        assert {b['key'] for b in prefs0['available_browsers']} == {'chrome', 'edge'}
+        updated = client.post('/api/admin/sessions/browser-prefs', json={'browser': 'edge', 'mode': 'auto'}).json()
+        assert updated['browser'] == 'edge' and updated['mode'] == 'auto'
+
+        # 2. 首次 YouTube 登录在智能模式下自动采用 Edge Clean Mode（无调试端口），关窗后后台 headless 无损提取入库
+        yt = client.post('/api/admin/sessions/YouTube/browser-login').json()
+        assert yt['clean_mode'] is True and yt['browser_key'] == 'edge'
+        yt_id = yt['attempt_id']
+        for _ in range(25):
+            if client.get(f'/api/admin/sessions/browser-status/{yt_id}').json()['state'] == 'WAITING':
+                break
+            time.sleep(0.01)
+        clean_gui_launch = launch_records[-1]
+        assert clean_gui_launch['headless'] is False and clean_gui_launch['has_debug_port'] is False
+        assert '--disable-blink-features=AutomationControlled' in clean_gui_launch['cmd']
+        # 用户完成 Edge 登录后直接关闭窗口 -> 自动触发 headless 提取并保存
+        procs[-1].returncode = 0
+        yt_done = {}
+        for _ in range(40):
+            yt_done = client.get(f'/api/admin/sessions/browser-status/{yt_id}').json()
+            if yt_done['state'] == 'COMPLETED':
+                break
+            time.sleep(0.01)
+        assert yt_done['state'] == 'COMPLETED' and yt_done['capture_mode'] == 'salvaged'
+        assert launch_records[-1]['headless'] is True and launch_records[-1]['has_debug_port'] is True
+        assert 'edge-yt-sid' in read_cookie_text('YouTube')
+        assert read_profile_browser_key(service.browser_logins.profile_dir) == 'edge'
+
+        # 3. 独立账号容器打开在 auto 下同样自动使用 Clean Mode，且关窗后必须显式确认才会覆盖凭据
+        service.import_cookie('YouTube', 'SID=existing-yt-old; SAPISID=existing-sapi-old', source='import')
+        acc = client.post('/api/admin/sessions/accounts', json={'label': 'Edge 账号'}).json()
+        aid = acc['accounts'][0]['id']
+        opened = client.post(f'/api/admin/sessions/accounts/{aid}/open', json={'platform': 'YouTube'}).json()
+        assert opened['clean_mode'] is True and opened['require_explicit_save'] is True
+        o_id = opened['attempt_id']
+        for _ in range(25):
+            if client.get(f'/api/admin/sessions/browser-status/{o_id}').json()['state'] == 'WAITING':
+                break
+            time.sleep(0.01)
+        assert launch_records[-1]['has_debug_port'] is False
+        # 先关闭浏览器窗口：绝不能自动覆盖 existing-yt-old，而是进入 clean_waiting_confirm
+        procs[-1].returncode = 0
+        wait_confirm = {}
+        for _ in range(30):
+            wait_confirm = client.get(f'/api/admin/sessions/browser-status/{o_id}').json()
+            if wait_confirm.get('clean_waiting_confirm'):
+                break
+            time.sleep(0.01)
+        assert wait_confirm['clean_waiting_confirm'] is True and wait_confirm['state'] == 'WAITING'
+        assert 'existing-yt-old' in read_cookie_text('YouTube')
+        # 用户点击明确确认按钮后才执行后台 headless 读取并替换保存
+        assert client.post('/api/admin/sessions/YouTube/browser-capture').status_code == 200
+        for _ in range(40):
+            if client.get(f'/api/admin/sessions/browser-status/{o_id}').json()['state'] == 'COMPLETED':
+                break
+            time.sleep(0.01)
+        assert 'edge-yt-sid' in read_cookie_text('YouTube')
+
+        # 4. manage-google 在 Clean Mode 下直接关窗即可完成且绝不改动任何已保存凭据
+        service.import_cookie('YouTube', 'SID=stay-untouched; SAPISID=stay-sapi', source='import')
+        mg = client.post('/api/admin/sessions/manage-google', json={'account_id': aid}).json()
+        assert mg['clean_mode'] is True and mg['manage_only'] is True
+        mg_id = mg['attempt_id']
+        for _ in range(25):
+            if client.get(f'/api/admin/sessions/browser-status/{mg_id}').json()['state'] == 'WAITING':
+                break
+            time.sleep(0.01)
+        procs[-1].returncode = 0
+        for _ in range(30):
+            if client.get(f'/api/admin/sessions/browser-status/{mg_id}').json()['state'] == 'COMPLETED':
+                break
+            time.sleep(0.01)
+        assert 'stay-untouched' in read_cookie_text('YouTube')
+
+        # 5. 非 Google 平台（X）在 auto 下走实时 CDP，支持一键 /relaunch-clean 切换为纯净模式重开
+        x_cdp = client.post('/api/admin/sessions/X%20(Twitter)/browser-login').json()
+        assert x_cdp['clean_mode'] is False
+        x_id = x_cdp['attempt_id']
+        for _ in range(25):
+            if client.get(f'/api/admin/sessions/browser-status/{x_id}').json()['cdp_connected']:
+                break
+            time.sleep(0.01)
+        switched = client.post(f'/api/admin/sessions/browser-login/{x_id}/relaunch-clean').json()
+        assert switched['clean_mode'] is True
+        sw_id = switched['attempt_id']
+        for _ in range(25):
+            if client.get(f'/api/admin/sessions/browser-status/{sw_id}').json()['state'] == 'WAITING':
+                break
+            time.sleep(0.01)
+        assert launch_records[-1]['has_debug_port'] is False
+        client.post('/api/admin/sessions/X%20(Twitter)/browser-cancel')
+
+        # 6. 严格隔离：Agent 查询工具绝不泄露浏览器偏好、Edge/Chrome 或凭据路径
+        agent_settings = json.dumps(await invoke(service, 'agent', 'get_settings', {}), ensure_ascii=False)
+        agent_cookies = json.dumps(await invoke(service, 'agent', 'list_cookie_statuses', {}), ensure_ascii=False)
+        for blob in (agent_settings, agent_cookies):
+            for forbidden in ('browser-preferences', 'clean_mode', 'edge-yt-sid', 'stay-untouched', 'Edge 账号'):
+                assert forbidden not in blob

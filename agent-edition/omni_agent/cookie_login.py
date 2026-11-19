@@ -115,20 +115,34 @@ PLATFORM_LOGIN_POLICIES = {
 }
 
 
-def find_local_browser() -> dict | None:
-    """探测本机已安装的 Chrome / Microsoft Edge / Chromium 可执行文件。"""
+def _browser_key(label: str, path: str = '') -> str:
+    combined = f'{label} {Path(path).stem if path else ""}'.lower()
+    if 'edge' in combined or 'msedge' in combined:
+        return 'edge'
+    if 'brave' in combined:
+        return 'brave'
+    if 'chromium' in combined:
+        return 'chromium'
+    if 'chrome' in combined:
+        return 'chrome'
+    return 'custom'
+
+
+def list_local_browsers() -> list[dict]:
+    """探测本机已安装的所有 Chrome / Microsoft Edge / Brave / Chromium（默认优先 Chrome）。"""
     override = os.environ.get('OMNI_BROWSER_PATH', '').strip()
+    candidates: list[tuple[str, str]] = []
     if override and Path(override).is_file():
-        return {'path': override, 'name': Path(override).stem}
+        candidates.append((Path(override).stem, override))
 
     if os.name != 'nt' and sys.platform != 'darwin' and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
-        return None
+        return []
 
-    candidates: list[tuple[str, str]] = []
     if os.name == 'nt':
+        # 优先探测 Google Chrome，其次 Microsoft Edge，降低 Edge 在 Google OAuth / WebAuthn 下的兼容性问题
         try:
             import winreg
-            for exe, label in (('msedge.exe', 'Microsoft Edge'), ('chrome.exe', 'Google Chrome'), ('brave.exe', 'Brave')):
+            for exe, label in (('chrome.exe', 'Google Chrome'), ('msedge.exe', 'Microsoft Edge'), ('brave.exe', 'Brave')):
                 for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
                     try:
                         with winreg.OpenKey(hive, rf'SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}') as key:
@@ -145,8 +159,8 @@ def find_local_browser() -> dict | None:
             os.environ.get('LOCALAPPDATA', ''),
         ]
         rel_paths = (
-            ('Microsoft Edge', r'Microsoft\Edge\Application\msedge.exe'),
             ('Google Chrome', r'Google\Chrome\Application\chrome.exe'),
+            ('Microsoft Edge', r'Microsoft\Edge\Application\msedge.exe'),
             ('Brave', r'BraveSoftware\Brave-Browser\Application\brave.exe'),
         )
         for base in env_dirs:
@@ -154,7 +168,7 @@ def find_local_browser() -> dict | None:
                 continue
             for label, rel in rel_paths:
                 candidates.append((label, str(Path(base) / rel)))
-        for label, cmd in (('Microsoft Edge', 'msedge'), ('Google Chrome', 'chrome')):
+        for label, cmd in (('Google Chrome', 'chrome'), ('Microsoft Edge', 'msedge')):
             found = shutil.which(cmd)
             if found:
                 candidates.append((label, found))
@@ -178,14 +192,194 @@ def find_local_browser() -> dict | None:
                 candidates.append((label, found))
 
     seen = set()
+    found_list: list[dict] = []
     for label, raw_path in candidates:
         norm = str(raw_path or '').strip()
         if not norm or norm.lower() in seen:
             continue
         seen.add(norm.lower())
         if Path(norm).is_file():
-            return {'path': norm, 'name': label}
-    return None
+            found_list.append({'key': _browser_key(label, norm), 'name': label, 'path': norm})
+    return found_list
+
+
+def find_local_browser() -> dict | None:
+    """探测本机默认首选浏览器（Google Chrome 优先于 Microsoft Edge）。"""
+    browsers = list_local_browsers()
+    return browsers[0] if browsers else None
+
+
+def resolve_local_browser(preferred: str = 'auto') -> dict | None:
+    """按用户偏好或默认策略解析可用本地浏览器，同时兼容测试对 find_local_browser 的注入。"""
+    fallback = find_local_browser()
+    if not fallback:
+        return None
+    fallback_item = dict(fallback)
+    fallback_item.setdefault('key', _browser_key(fallback_item.get('name', ''), fallback_item.get('path', '')))
+    pref = str(preferred or 'auto').strip().lower()
+    if not pref or pref == 'auto' or fallback_item['key'] == pref:
+        return fallback_item
+    # 仅当默认返回真实可执行文件时再遍历 list_local_browsers，防止绕过测试中的 mock
+    if fallback_item.get('path') and Path(str(fallback_item['path'])).is_file():
+        for item in list_local_browsers():
+            if item['key'] == pref:
+                return dict(item)
+    return fallback_item
+
+
+class BrowserPreferenceStore:
+    """管理员专属浏览器与防风控登录模式偏好存储（Vault 隔离，不暴露给 Agent）。"""
+
+    VAULT_KEY = 'browser-preferences'
+    ALLOWED_BROWSERS = ('auto', 'chrome', 'edge', 'brave', 'chromium')
+    ALLOWED_MODES = ('auto', 'clean', 'cdp')
+
+    def __init__(self, vault):
+        self.vault = vault
+        self._lock = threading.RLock()
+
+    def get(self) -> dict:
+        with self._lock:
+            raw = self.vault.get(self.VAULT_KEY)
+            if not raw:
+                return {'browser': 'auto', 'mode': 'auto'}
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                return {'browser': 'auto', 'mode': 'auto'}
+            browser = str(data.get('browser') or 'auto').strip().lower()
+            mode = str(data.get('mode') or 'auto').strip().lower()
+            if browser not in self.ALLOWED_BROWSERS:
+                browser = 'auto'
+            if mode not in self.ALLOWED_MODES:
+                mode = 'auto'
+            return {'browser': browser, 'mode': mode}
+
+    def update(self, *, browser: str | None = None, mode: str | None = None) -> dict:
+        with self._lock:
+            cur = self.get()
+            if browser is not None:
+                b = str(browser).strip().lower()
+                if b not in self.ALLOWED_BROWSERS:
+                    raise AgentError('INVALID_PARAMETER', '不支持的浏览器选项')
+                cur['browser'] = b
+            if mode is not None:
+                m = str(mode).strip().lower()
+                if m not in self.ALLOWED_MODES:
+                    raise AgentError('INVALID_PARAMETER', '不支持的登录模式选项')
+                cur['mode'] = m
+            self.vault.put(self.VAULT_KEY, json.dumps(cur))
+            return cur
+
+
+def record_profile_browser(profile_dir: Path | None, browser: dict | None) -> None:
+    """记录写入该持久化浏览器目录的浏览器类型，确保 App-Bound Cookie 无头读回使用同一内核。"""
+    if not profile_dir or not browser:
+        return
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = Path(profile_dir) / '.omni-browser.json'
+        key = browser.get('key') or _browser_key(browser.get('name', ''), browser.get('path', ''))
+        meta_path.write_text(json.dumps({'key': key, 'name': browser.get('name', '')}, ensure_ascii=False), encoding='utf-8')
+    except OSError:
+        pass
+
+
+def read_profile_browser_key(profile_dir: Path | None) -> str:
+    if not profile_dir:
+        return ''
+    meta_path = Path(profile_dir) / '.omni-browser.json'
+    if not meta_path.is_file():
+        return ''
+    try:
+        data = json.loads(meta_path.read_text('utf-8', errors='ignore'))
+        return str(data.get('key') or '').strip().lower()
+    except (OSError, ValueError):
+        return ''
+
+
+async def graceful_close_browser_process(proc, *, timeout: float = 6.0) -> None:
+    """优雅关闭无调试端口启动的 GUI 浏览器窗口，确保 Cookie 与 Local State 完整刷盘并释放文件锁。"""
+    if not proc or proc.returncode is not None:
+        return
+    pid = getattr(proc, 'pid', None)
+    if os.name == 'nt' and pid:
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            pids = {int(pid)}
+            TH32CS_SNAPPROCESS = 0x00000002
+
+            class PROCESSENTRY32W(ctypes.Structure):
+                _fields_ = [
+                    ('dwSize', ctypes.wintypes.DWORD),
+                    ('cntUsage', ctypes.wintypes.DWORD),
+                    ('th32ProcessID', ctypes.wintypes.DWORD),
+                    ('th32DefaultHeapID', ctypes.POINTER(ctypes.c_ulong)),
+                    ('th32ModuleID', ctypes.wintypes.DWORD),
+                    ('cntThreads', ctypes.wintypes.DWORD),
+                    ('th32ParentProcessID', ctypes.wintypes.DWORD),
+                    ('pcPriClassBase', ctypes.c_long),
+                    ('dwFlags', ctypes.wintypes.DWORD),
+                    ('szExeFile', ctypes.wintypes.WCHAR * 260),
+                ]
+
+            kernel32 = ctypes.windll.kernel32
+            user32 = ctypes.windll.user32
+            snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if snap not in (0, -1, ctypes.c_void_p(-1).value):
+                try:
+                    entry = PROCESSENTRY32W()
+                    entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                    parents: dict[int, list[int]] = {}
+                    if kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+                        while True:
+                            parents.setdefault(int(entry.th32ParentProcessID), []).append(int(entry.th32ProcessID))
+                            if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                                break
+                    queue = [int(pid)]
+                    while queue:
+                        cur = queue.pop(0)
+                        for child in parents.get(cur, ()):
+                            if child not in pids:
+                                pids.add(child)
+                                queue.append(child)
+                finally:
+                    kernel32.CloseHandle(snap)
+
+            WM_CLOSE = 0x0010
+
+            @ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+            def _enum_cb(hwnd, _):
+                win_pid = ctypes.wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+                if int(win_pid.value) in pids and user32.IsWindowVisible(hwnd):
+                    cls_buf = ctypes.create_unicode_buffer(128)
+                    user32.GetClassNameW(hwnd, cls_buf, 128)
+                    if 'Chrome_WidgetWin' in cls_buf.value:
+                        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                return True
+
+            user32.EnumWindows(_enum_cb, 0)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
+                return
+            except asyncio.TimeoutError:
+                pass
+        except Exception:
+            pass
+
+    try:
+        proc.terminate()
+        await asyncio.wait_for(proc.wait(), timeout=3.0)
+        return
+    except Exception:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
 
 
 def local_browser_available() -> bool:
@@ -978,6 +1172,9 @@ class BrowserLoginAttempt:
     platform: str
     browser_name: str
     proxy: str
+    browser_key: str = ''
+    clean_mode: bool = False
+    clean_waiting_confirm: bool = False
     auto_capture: bool = False
     multi_platform: bool = False
     manage_only: bool = False
@@ -1027,11 +1224,14 @@ class LocalBrowserLoginManager:
     def __init__(self, profile_dir: Path | None = None):
         self._lock = threading.RLock()
         self._attempts: dict[str, BrowserLoginAttempt] = {}
+        self._start_specs: dict[str, dict] = {}
         self.profile_dir = Path(profile_dir) if profile_dir else None
         self._shared_proc = None
         self._shared_port: int | None = None
         self._shared_ws: str = ''
         self._shared_profile_dir: Path | None = None
+        self._clean_proc = None
+        self._clean_profile_dir: Path | None = None
         self._launch_lock: asyncio.Lock | None = None
 
     def _get_launch_lock(self) -> asyncio.Lock:
@@ -1076,6 +1276,9 @@ class LocalBrowserLoginManager:
             'attempt_id': a.attempt_id,
             'platform': a.platform,
             'browser_name': a.browser_name,
+            'browser_key': a.browser_key,
+            'clean_mode': a.clean_mode,
+            'clean_waiting_confirm': a.clean_waiting_confirm,
             'multi_platform': a.multi_platform,
             'manage_only': a.manage_only,
             'require_explicit_save': a.require_explicit_save,
@@ -1102,12 +1305,34 @@ class LocalBrowserLoginManager:
     async def navigate_attempt(self, attempt_id: str, url: str) -> dict:
         """在当前活动登录浏览器窗口中跳转至指定 URL（如 Google 账号页、平台登录页或重载）。"""
         a = self.get(attempt_id)
+        if a.clean_mode:
+            raise AgentError('INVALID_STATE', '纯净防风控模式下请直接在已打开的浏览器地址栏操作')
         if a.state not in ('OPENING', 'WAITING') or not a.cdp_port:
             raise AgentError('INVALID_STATE', '当前登录窗口未连接就绪')
         if not str(url).startswith(('https://', 'http://')):
             raise AgentError('INVALID_PARAMETER', '无效导航地址')
         ok = await navigate_cdp_page(a.cdp_port, a.cdp_ws, url)
         return {'navigated': ok}
+
+    async def relaunch_clean(self, attempt_id: str) -> dict:
+        """将当前活动登录窗口切换为纯净无调试模式重新打开（彻底绕过 Google 安全检测）。"""
+        spec = self._start_specs.get(attempt_id)
+        if not spec:
+            raise AgentError('NOT_FOUND', '登录会话已结束，无法切换模式，请重新发起登录')
+        old = self._attempts.get(attempt_id)
+        if old and old.state in ('OPENING', 'WAITING'):
+            old.cancel_requested = True
+            old.state = 'CANCELLED'
+            self.set_stage(old, 'CANCELLED', '正在切换为纯净无调试模式重新打开...')
+            self._wake(old)
+            if old.task and not old.task.done():
+                try:
+                    await asyncio.wait_for(old.task, timeout=4.0)
+                except Exception:
+                    pass
+        next_spec = dict(spec)
+        next_spec['login_mode'] = 'clean'
+        return await self.start(**next_spec)
 
     def request_manual_capture(self, platform: str) -> dict:
         with self._lock:
@@ -1140,18 +1365,29 @@ class LocalBrowserLoginManager:
             return {'cdp_connected': True, 'cookies': cookies or [], 'current_host': ''}
         return await fetch_cdp_snapshot(port, ws_path, cookie_urls)
 
-    def _build_browser_cmd(self, browser_path: str, data_dir: Path, proxy: str, start_url: str, *, headless: bool = False) -> list[str]:
+    def _build_browser_cmd(
+        self,
+        browser_path: str,
+        data_dir: Path,
+        proxy: str,
+        start_url: str,
+        *,
+        headless: bool = False,
+        clean_mode: bool = False,
+    ) -> list[str]:
         cmd = [
             browser_path,
             f'--user-data-dir={data_dir}',
-            '--remote-debugging-port=0',
             '--no-first-run',
             '--no-default-browser-check',
-            '--disable-default-apps',
-            '--disable-background-networking',
-            '--disable-sync',
-            '--disable-features=msEdgeFirstRunExperiences',
+            '--disable-background-mode',
+            '--disable-blink-features=AutomationControlled',
         ]
+        # 纯净无调试 GUI 模式绝不传入 --remote-debugging-port，彻底消除 Edge/Chrome Google 安全拦截
+        if headless or not clean_mode:
+            cmd.append('--remote-debugging-port=0')
+        if 'edge' in Path(browser_path).stem.lower():
+            cmd.append('--disable-features=msEdgeFirstRunExperiences')
         if proxy:
             cmd.append(f'--proxy-server={proxy}')
         if headless:
@@ -1190,6 +1426,50 @@ class LocalBrowserLoginManager:
             self._shared_port = None
             self._shared_ws = ''
             self._shared_profile_dir = None
+        if proc is self._clean_proc:
+            self._clean_proc = None
+            self._clean_profile_dir = None
+
+    async def _extract_cookies_from_dir(
+        self,
+        *,
+        browser_path: str,
+        data_dir: Path,
+        proxy: str,
+        cookie_urls: tuple[str, ...],
+        target_platform: str = '',
+        allowed_domains: tuple[str, ...] = (),
+        policy: dict | None = None,
+    ) -> dict:
+        """从已关闭的纯净浏览器目录通过无头 CDP 安全读取全量 Cookie（含 HttpOnly 与 App-Bound 加密会话）。"""
+        async with self._get_launch_lock():
+            cleanup_stale_profile_locks(data_dir)
+            cmd = self._build_browser_cmd(browser_path, data_dir, proxy, 'about:blank', headless=True)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.DEVNULL,
+            )
+            port, ws_path = None, ''
+            try:
+                port, ws_path = await self._wait_cdp_port_file(data_dir, proc)
+                if not port:
+                    raise AgentError('UPSTREAM_ERROR', '后台读取浏览器档案超时，请确认浏览器窗口已全部关闭后重试')
+                snap = await self._collect_cdp_state(port, ws_path, cookie_urls)
+                cookies = snap.get('cookies') or []
+                if target_platform and policy:
+                    _, marker_hit, _ = analyze_cdp_cookies(cookies, policy, allowed_domains)
+                    target_urls = policy.get('cookie_urls') or ()
+                    if not marker_hit and target_urls:
+                        navigated = await navigate_cdp_page(port, ws_path, target_urls[0])
+                        if navigated:
+                            wait_sec = 0.05 if self.POLL_INTERVAL_SEC < 0.1 else 1.8
+                            await asyncio.sleep(wait_sec)
+                            snap = await self._collect_cdp_state(port, ws_path, cookie_urls)
+                return snap
+            finally:
+                await self._shutdown_browser_process(proc, port, ws_path)
 
     async def _try_reuse_shared_browser(self, target_dir: Path, target_url: str) -> tuple[object, int, str] | None:
         if self._shared_proc is None or self._shared_proc.returncode is not None or not self._shared_port:
@@ -1223,11 +1503,13 @@ class LocalBrowserLoginManager:
         account_id: str = '',
         account_label: str = '',
         account_epoch: int = 0,
+        preferred_browser: str = 'auto',
+        login_mode: str = 'auto',
     ) -> dict:
         is_multi = platform == MULTI_PLATFORM_KEY
         if not is_multi and platform not in PLATFORM_LOGIN_POLICIES:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
-        browser = find_local_browser()
+        browser = resolve_local_browser(preferred_browser)
         if not browser:
             raise AgentError('CAPABILITY_UNAVAILABLE', '未检测到本机 Chrome 或 Edge 浏览器，可点击“默认浏览器打开”完成登录后导入或粘贴 Cookie')
 
@@ -1236,6 +1518,17 @@ class LocalBrowserLoginManager:
         effective_explicit = bool(manage_only or require_explicit_save or is_multi or not policy.get('auto_capture'))
         start_url = initial_url or ('https://www.bilibili.com/' if is_multi else policy['start_url'])
         target_profile_dir = Path(profile_dir_override) if profile_dir_override else self.profile_dir
+        browser_key = browser.get('key') or _browser_key(browser.get('name', ''), browser.get('path', ''))
+        is_google_flow = bool(manage_only or platform == 'YouTube' or 'accounts.google.com' in (start_url or '').lower())
+        mode_pref = str(login_mode or 'auto').strip().lower()
+        if mode_pref == 'clean':
+            clean_mode = True
+        elif mode_pref == 'cdp':
+            clean_mode = False
+        else:
+            # 智能模式：涉及 Google 登录页、YouTube、Google 管理或独立容器启动页时默认关闭远程调试端口，
+            # 彻底避免 Microsoft Edge / Chrome 被 accounts.google.com 拦截报错
+            clean_mode = bool(not is_multi and is_google_flow)
 
         now = time.time()
         loop = asyncio.get_running_loop()
@@ -1248,12 +1541,15 @@ class LocalBrowserLoginManager:
                     self._wake(old)
                 elif now - old.created_at > 900 or (old.state in ('COMPLETED', 'CANCELLED', 'FAILED') and now - old.updated_at > 180):
                     self._attempts.pop(old.attempt_id, None)
+                    self._start_specs.pop(old.attempt_id, None)
 
             attempt = BrowserLoginAttempt(
                 attempt_id=uuid.uuid4().hex,
                 platform=platform,
                 browser_name=browser['name'],
                 proxy=proxy,
+                browser_key=browser_key,
+                clean_mode=clean_mode,
                 auto_capture=bool(not effective_explicit and policy.get('auto_capture')),
                 multi_platform=is_multi,
                 manage_only=manage_only,
@@ -1272,16 +1568,34 @@ class LocalBrowserLoginManager:
             init_msg = (
                 f'正在打开 Google 账号管理页面（此模式仅管理退出，不保存凭据）...'
                 if manage_only
-                else f'正在启动本地 {browser["name"]} 登录 {title_tag}...'
+                else f'正在以{"纯净无调试" if clean_mode else "实时读取"}模式启动 {browser["name"]}（{title_tag}）...'
             )
             self.set_stage(attempt, 'LAUNCHING', init_msg)
             self._attempts[attempt.attempt_id] = attempt
+            self._start_specs[attempt.attempt_id] = {
+                'platform': platform,
+                'proxy': proxy,
+                'allowed_domains': allowed_domains,
+                'on_capture': on_capture,
+                'domains': domains,
+                'on_capture_many': on_capture_many,
+                'profile_dir_override': profile_dir_override,
+                'initial_url': initial_url,
+                'manage_only': manage_only,
+                'require_explicit_save': require_explicit_save,
+                'account_id': account_id,
+                'account_label': account_label,
+                'account_epoch': account_epoch,
+                'preferred_browser': preferred_browser,
+                'login_mode': login_mode,
+            }
 
         using_persistent = target_profile_dir is not None
         temp_profile = None
         if using_persistent:
             data_dir = target_profile_dir
             data_dir.mkdir(parents=True, exist_ok=True)
+            record_profile_browser(data_dir, browser)
         else:
             temp_profile = tempfile.TemporaryDirectory(prefix='omni-browser-login-', ignore_cleanup_errors=True)
             data_dir = Path(temp_profile.name)
@@ -1341,8 +1655,172 @@ class LocalBrowserLoginManager:
             cdp_ws = ''
             reused = False
             confirm_polls = 0
+            cookie_urls = tuple(
+                url
+                for p_pol in PLATFORM_LOGIN_POLICIES.values()
+                for url in (p_pol.get('cookie_urls') or ())
+            ) if is_multi else (policy.get('cookie_urls') or ())
+
+            async def _run_clean_extract(mode: str) -> str:
+                self.set_stage(attempt, 'CAPTURING', '正在后台无头读取已登录的完整 Cookie（含 HttpOnly）...')
+                snap = await self._extract_cookies_from_dir(
+                    browser_path=browser['path'],
+                    data_dir=data_dir,
+                    proxy=proxy,
+                    cookie_urls=cookie_urls,
+                    target_platform=('' if is_multi else platform),
+                    allowed_domains=allowed_domains,
+                    policy=policy,
+                )
+                cookies = snap.get('cookies') or []
+                if is_multi:
+                    scanned = scan_cookies_by_platform(cookies, all_domains)
+                    attempt.last_scanned = scanned
+                    attempt.cookie_count = sum(item['cookie_count'] for item in scanned)
+                    attempt.marker_detected = any(item['marker_detected'] for item in scanned)
+                    if await _complete_multi(scanned, mode):
+                        return 'completed'
+                    return '纯净浏览器档案中暂未发现已登录平台会话，请重新登录后再试'
+
+                netscape, marker_hit, cookie_count = analyze_cdp_cookies(cookies, policy, allowed_domains)
+                attempt.cookie_count = cookie_count
+                attempt.marker_detected = marker_hit
+                if mode == 'salvaged' and not (netscape and (marker_hit or not policy.get('markers'))):
+                    if cookie_count > 0:
+                        return f'纯净浏览器窗口已关闭（仅捕捉到 {cookie_count} 项访客 Cookie，未检测到账号登录标记，未保存凭据）'
+                    return '纯净浏览器窗口已关闭，未检测到平台会话，未保存凭据'
+                if netscape:
+                    await _complete_single(netscape, cookie_count, mode)
+                    return 'completed'
+                return f'未能从 {browser["name"]} 档案中读取到 {platform} 有效登录 Cookie，请确认已完成网页登录后重试'
+
             try:
+                if clean_mode:
+                    async with self._get_launch_lock():
+                        if self._shared_proc is not None:
+                            await self._shutdown_browser_process(self._shared_proc, self._shared_port, self._shared_ws)
+                        if self._clean_proc is not None and self._clean_proc.returncode is None:
+                            if self._clean_profile_dir and Path(self._clean_profile_dir).resolve() == Path(data_dir).resolve():
+                                helper = await asyncio.create_subprocess_exec(
+                                    browser['path'],
+                                    f'--user-data-dir={data_dir}',
+                                    '--new-window',
+                                    start_url,
+                                    stdout=asyncio.subprocess.DEVNULL,
+                                    stderr=asyncio.subprocess.DEVNULL,
+                                    stdin=asyncio.subprocess.DEVNULL,
+                                )
+                                try:
+                                    await asyncio.wait_for(helper.wait(), timeout=2.0)
+                                except asyncio.TimeoutError:
+                                    pass
+                                proc = self._clean_proc
+                                reused = True
+                            else:
+                                await graceful_close_browser_process(self._clean_proc)
+                                self._clean_proc = None
+                                self._clean_profile_dir = None
+                        if not reused:
+                            cleanup_stale_profile_locks(data_dir)
+                            cmd = self._build_browser_cmd(browser['path'], data_dir, proxy, start_url, clean_mode=True)
+                            proc = await asyncio.create_subprocess_exec(
+                                *cmd,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                                stdin=asyncio.subprocess.DEVNULL,
+                            )
+                            if using_persistent:
+                                self._clean_proc = proc
+                                self._clean_profile_dir = data_dir
+                        attempt.process = proc
+
+                    if attempt.cancel_requested:
+                        attempt.state = 'CANCELLED'
+                        self.set_stage(attempt, 'CANCELLED', '已取消并关闭纯净浏览器登录窗口')
+                        return
+
+                    attempt.state = 'WAITING'
+                    if manage_only:
+                        clean_msg = (
+                            f'已在纯净无调试模式下打开 {browser["name"]} 管理 Google 登录（无安全拦截）。'
+                            '请退出或切换网页账号后直接关闭浏览器窗口，或点击右下“完成”。'
+                        )
+                    elif effective_explicit:
+                        clean_msg = (
+                            f'已在纯净无调试模式下打开 {browser["name"]}（防 Google 安全拦截）。'
+                            f'请登录 Google 并访问 {platform} 确认已登录后，点击右下“保存 {platform} 下载凭据”或先关窗再确认保存。'
+                        )
+                    else:
+                        clean_msg = (
+                            f'已在纯净无调试模式下打开 {browser["name"]}（防 Google 安全拦截）。'
+                            '请完成账号登录，完成后关闭浏览器窗口（或点右下保存按钮）即可自动提取保存。'
+                        )
+                    self.set_stage(attempt, 'WAITING_LOGIN', clean_msg)
+
+                    while not attempt.cancel_requested:
+                        if proc is not None and proc.returncode is not None:
+                            if manage_only:
+                                attempt.state = 'COMPLETED'
+                                self.set_stage(attempt, 'COMPLETED', '已完成网页账号管理（浏览器窗口已关闭，未修改本机下载凭据）')
+                                return
+                            if not effective_explicit:
+                                await asyncio.sleep(0.05 if self.POLL_INTERVAL_SEC < 0.1 else 0.4)
+                                extracted = await _run_clean_extract('salvaged')
+                                if extracted == 'completed':
+                                    return
+                                attempt.state = 'CANCELLED'
+                                self.set_stage(attempt, 'CANCELLED', extracted)
+                                return
+                            if not attempt.clean_waiting_confirm:
+                                attempt.clean_waiting_confirm = True
+                                confirm_msg = (
+                                    f'纯净 {browser["name"]} 窗口已关闭；若已完成登录，请点击右下“保存 {platform} 下载凭据”读取并保存（点“取消”放弃）'
+                                    if not is_multi
+                                    else '纯净浏览器窗口已关闭；若已完成登录，请点击右下“保存全部已登录平台”，或点“取消”放弃'
+                                )
+                                self.set_stage(attempt, 'CONFIRMING', confirm_msg)
+                            if attempt.manual_capture_requested:
+                                attempt.manual_capture_requested = False
+                                await asyncio.sleep(0.05 if self.POLL_INTERVAL_SEC < 0.1 else 0.3)
+                                extracted = await _run_clean_extract('manual')
+                                if extracted == 'completed':
+                                    return
+                                attempt.state = 'FAILED'
+                                attempt.error = extracted
+                                self.set_stage(attempt, 'FAILED', extracted)
+                                return
+                            await _sleep_or_wake(None, self.POLL_INTERVAL_SEC)
+                            continue
+
+                        if attempt.manual_capture_requested:
+                            attempt.manual_capture_requested = False
+                            if manage_only:
+                                await graceful_close_browser_process(proc)
+                                attempt.state = 'COMPLETED'
+                                self.set_stage(attempt, 'COMPLETED', '已完成网页账号管理（未保存或修改本机下载凭据）')
+                                return
+                            self.set_stage(attempt, 'CAPTURING', '正在优雅关闭纯净浏览器窗口，确保会话完整写入磁盘并读取 Cookie...')
+                            await graceful_close_browser_process(proc)
+                            await asyncio.sleep(0.05 if self.POLL_INTERVAL_SEC < 0.1 else 0.4)
+                            extracted = await _run_clean_extract('manual')
+                            if extracted == 'completed':
+                                return
+                            attempt.state = 'FAILED'
+                            attempt.error = extracted
+                            self.set_stage(attempt, 'FAILED', extracted)
+                            return
+
+                        await _sleep_or_wake(proc, self.POLL_INTERVAL_SEC)
+
+                    attempt.state = 'CANCELLED'
+                    self.set_stage(attempt, 'CANCELLED', '已关闭 Google 账号管理窗口' if manage_only else '已取消并关闭本地浏览器登录窗口')
+                    return
+
                 async with self._get_launch_lock():
+                    if self._clean_proc is not None and self._clean_proc.returncode is None:
+                        await graceful_close_browser_process(self._clean_proc)
+                        self._clean_proc = None
+                        self._clean_profile_dir = None
                     if using_persistent and self._shared_proc is not None and self._shared_profile_dir != data_dir:
                         await self._shutdown_browser_process(self._shared_proc, self._shared_port, self._shared_ws)
                     if using_persistent:
@@ -1396,12 +1874,6 @@ class LocalBrowserLoginManager:
                 else:
                     wait_msg = f'请在本地 {browser["name"]} 确认使用目标账号登录后，点击右下“保存 {platform} 下载凭据”'
                 self.set_stage(attempt, 'WAITING_LOGIN', wait_msg)
-
-                cookie_urls = tuple(
-                    url
-                    for p_pol in PLATFORM_LOGIN_POLICIES.values()
-                    for url in (p_pol.get('cookie_urls') or ())
-                ) if is_multi else (policy.get('cookie_urls') or ())
 
                 first_tick = True
                 while not attempt.cancel_requested and proc.returncode is None:
@@ -1557,7 +2029,13 @@ class LocalBrowserLoginManager:
                     )
                 should_close_browser = (not reused and not other_active) or attempt.cancel_requested
                 if proc is not None and should_close_browser and not other_active:
-                    await self._shutdown_browser_process(proc, cdp_port, cdp_ws)
+                    if clean_mode:
+                        await graceful_close_browser_process(proc)
+                        if proc is self._clean_proc:
+                            self._clean_proc = None
+                            self._clean_profile_dir = None
+                    else:
+                        await self._shutdown_browser_process(proc, cdp_port, cdp_ws)
                 if temp_profile is not None:
                     try:
                         temp_profile.cleanup()
@@ -1575,12 +2053,22 @@ class LocalBrowserLoginManager:
         *,
         include_manual: bool = False,
         profile_dir_override: Path | None = None,
+        preferred_browser: str = 'auto',
         on_capture_many,
     ) -> dict:
         """从持久化托管浏览器直接或后台静默无头同步全部已登录平台的 Cookie。"""
         used_headless = False
         cookies: list[dict] = []
         target_dir = Path(profile_dir_override) if profile_dir_override else self.profile_dir
+
+        if (
+            self._clean_proc is not None
+            and self._clean_proc.returncode is None
+            and self._clean_profile_dir is not None
+            and target_dir is not None
+            and Path(self._clean_profile_dir).resolve() == Path(target_dir).resolve()
+        ):
+            raise AgentError('INVALID_STATE', '该独立纯净浏览器窗口仍在打开中，请先关闭窗口或点击登录面板右下角的保存按钮')
 
         same_active = (
             self.is_shared_browser_active()
@@ -1607,31 +2095,21 @@ class LocalBrowserLoginManager:
         if not cookies and not same_active:
             if not profile_has_session_data(target_dir):
                 raise AgentError('NOT_FOUND', '该浏览器档案尚未建立网页登录会话，请先打开完成一次登录')
-            browser = find_local_browser()
+            recorded_key = read_profile_browser_key(target_dir)
+            browser = resolve_local_browser(recorded_key or preferred_browser)
             if not browser:
                 raise AgentError('CAPABILITY_UNAVAILABLE', '未检测到本机 Chrome 或 Edge 浏览器')
             used_headless = True
-            async with self._get_launch_lock():
-                cleanup_stale_profile_locks(target_dir)
-                cmd = self._build_browser_cmd(browser['path'], target_dir, proxy, 'about:blank', headless=True)
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    stdin=asyncio.subprocess.DEVNULL,
-                )
-                port, ws_path = None, ''
-                try:
-                    port, ws_path = await self._wait_cdp_port_file(target_dir, proc)
-                    if not port:
-                        raise AgentError('UPSTREAM_ERROR', '后台读取托管浏览器档案超时，请点“打开”唤醒同步')
-                    cookie_urls = tuple(
-                        url for pol in PLATFORM_LOGIN_POLICIES.values() for url in (pol.get('cookie_urls') or ())
-                    )
-                    snap = await self._collect_cdp_state(port, ws_path, cookie_urls)
-                    cookies = snap.get('cookies') or []
-                finally:
-                    await self._shutdown_browser_process(proc, port, ws_path)
+            cookie_urls = tuple(
+                url for pol in PLATFORM_LOGIN_POLICIES.values() for url in (pol.get('cookie_urls') or ())
+            )
+            snap = await self._extract_cookies_from_dir(
+                browser_path=browser['path'],
+                data_dir=target_dir,
+                proxy=proxy,
+                cookie_urls=cookie_urls,
+            )
+            cookies = snap.get('cookies') or []
 
         scanned = scan_cookies_by_platform(cookies, domains, existing_imported=existing_imported)
         targets = [
@@ -1663,6 +2141,10 @@ class LocalBrowserLoginManager:
                         pass
         if self._shared_proc is not None and self._shared_profile_dir and Path(self._shared_profile_dir).resolve() == resolved:
             await self._shutdown_browser_process(self._shared_proc, self._shared_port, self._shared_ws)
+        if self._clean_proc is not None and self._clean_profile_dir and Path(self._clean_profile_dir).resolve() == resolved:
+            await graceful_close_browser_process(self._clean_proc)
+            self._clean_proc = None
+            self._clean_profile_dir = None
         if not resolved.exists():
             return True
         for attempt_idx in range(6):
@@ -1680,6 +2162,10 @@ class LocalBrowserLoginManager:
         await self.close_all()
         if self._shared_proc is not None:
             await self._shutdown_browser_process(self._shared_proc, self._shared_port, self._shared_ws)
+        if self._clean_proc is not None:
+            await graceful_close_browser_process(self._clean_proc)
+            self._clean_proc = None
+            self._clean_profile_dir = None
         if not self.profile_dir:
             return {'cleared': False}
         await self.delete_profile_dir(self.profile_dir)
@@ -1697,3 +2183,7 @@ class LocalBrowserLoginManager:
             await asyncio.gather(*tasks, return_exceptions=True)
         if self._shared_proc is not None:
             await self._shutdown_browser_process(self._shared_proc, self._shared_port, self._shared_ws)
+        if self._clean_proc is not None:
+            await graceful_close_browser_process(self._clean_proc)
+            self._clean_proc = None
+            self._clean_profile_dir = None

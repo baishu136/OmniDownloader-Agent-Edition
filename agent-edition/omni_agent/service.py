@@ -18,14 +18,17 @@ from .config import Config, Settings, private_dir
 from .cookie_login import (
     MULTI_PLATFORM_KEY,
     BilibiliQRLoginManager,
+    BrowserPreferenceStore,
     LocalBrowserLoginManager,
     ManagedProfileStore,
     PLATFORM_LOGIN_POLICIES,
     find_local_browser,
     inspect_cookie_meta,
+    list_local_browsers,
     local_browser_available,
     normalize_cookie_text,
     open_in_default_browser,
+    resolve_local_browser,
 )
 from .credentials import Vault
 from .delivery import BotConfig, make_adapter
@@ -125,6 +128,7 @@ class Service:
         self.qr_logins = BilibiliQRLoginManager()
         self.browser_logins = LocalBrowserLoginManager(profile_dir=private_dir(self.config.directory / 'browser-profile'))
         self.browser_accounts = ManagedProfileStore(self.vault, self.config.directory)
+        self.browser_prefs = BrowserPreferenceStore(self.vault)
         self._startup_probe = None
 
     async def start(self):
@@ -308,7 +312,14 @@ class Service:
             'validation': clean_validation,
         }
         if include_ui:
-            browser = find_local_browser()
+            mock_probe = find_local_browser()
+            pref_browser = self.browser_prefs.get()['browser']
+            if mock_probe is None:
+                browser = None
+            elif pref_browser != 'auto' and mock_probe.get('path') and Path(str(mock_probe['path'])).is_file():
+                browser = resolve_local_browser(pref_browser) or mock_probe
+            else:
+                browser = mock_probe
             policy = PLATFORM_LOGIN_POLICIES.get(platform, {})
             meta = inspect_cookie_meta(self.sessions, platform)
             meta['source'] = validation.get('source', '') if status['state'] == 'IMPORTED' else ''
@@ -504,6 +515,7 @@ class Service:
                     return '在线校验暂不可达，凭据已保存启用'
             return ''
 
+        prefs = self.browser_prefs.get()
         allowed = () if platform == MULTI_PLATFORM_KEY else self.domains[platform]
         return await self.browser_logins.start(
             platform,
@@ -513,6 +525,8 @@ class Service:
             domains=self.domains,
             on_capture_many=self._save_captured_batch,
             require_explicit_save=require_explicit,
+            preferred_browser=prefs['browser'],
+            login_mode=prefs['mode'],
         )
 
     async def start_multi_browser_login(self):
@@ -520,11 +534,13 @@ class Service:
 
     async def sync_browser_profile(self, *, include_manual: bool = False):
         existing_imported = {p for p in self.domains if self.sessions.status(p)['state'] == 'IMPORTED'}
+        prefs = self.browser_prefs.get()
         return await self.browser_logins.sync_from_profile(
             self.config.settings.proxy,
             self.domains,
             existing_imported,
             include_manual=include_manual,
+            preferred_browser=prefs['browser'],
             on_capture_many=self._save_captured_batch,
         )
 
@@ -561,6 +577,7 @@ class Service:
                     return '已关联到此档案'
             return f'已关联至 {acc.label}'
 
+        prefs = self.browser_prefs.get()
         return await self.browser_logins.start(
             platform,
             self.config.settings.proxy,
@@ -573,11 +590,14 @@ class Service:
             account_id=acc.id,
             account_label=acc.label,
             account_epoch=acc.epoch,
+            preferred_browser=prefs['browser'],
+            login_mode=prefs['mode'],
         )
 
     async def sync_browser_account(self, account_id: str, *, include_manual: bool = False) -> dict:
         acc, target_dir = self.browser_accounts.prepare_open(account_id)
         existing_imported = {p for p in self.domains if self.sessions.status(p)['state'] == 'IMPORTED'}
+        prefs = self.browser_prefs.get()
 
         async def _on_capture_many(targets: list[dict], *, mode: str = 'sync'):
             return await self._save_captured_batch(targets, mode=mode, account_id=acc.id, account_epoch=acc.epoch)
@@ -588,6 +608,7 @@ class Service:
             existing_imported,
             include_manual=include_manual,
             profile_dir_override=target_dir,
+            preferred_browser=prefs['browser'],
             on_capture_many=_on_capture_many,
         )
 
@@ -621,6 +642,7 @@ class Service:
         if account_id:
             acc, target_dir = self.browser_accounts.prepare_open(account_id)
             acc_label = acc.label
+        prefs = self.browser_prefs.get()
         return await self.browser_logins.start(
             'YouTube',
             self.config.settings.proxy,
@@ -631,7 +653,29 @@ class Service:
             manage_only=True,
             account_id=account_id,
             account_label=acc_label,
+            preferred_browser=prefs['browser'],
+            login_mode=prefs['mode'],
         )
+
+    def get_browser_preferences(self) -> dict:
+        """返回本机管理页展示的浏览器首选与防风控模式（仅含抽象名称，不含路径与敏感信息）。"""
+        prefs = self.browser_prefs.get()
+        browsers = [{'key': b['key'], 'name': b['name']} for b in list_local_browsers()]
+        resolved = resolve_local_browser(prefs['browser'])
+        return {
+            'browser': prefs['browser'],
+            'mode': prefs['mode'],
+            'available_browsers': browsers,
+            'resolved_name': resolved['name'] if resolved else '',
+            'resolved_key': resolved.get('key', '') if resolved else '',
+        }
+
+    def update_browser_preferences(self, *, browser: str | None = None, mode: str | None = None) -> dict:
+        self.browser_prefs.update(browser=browser, mode=mode)
+        return self.get_browser_preferences()
+
+    async def relaunch_browser_login_clean(self, attempt_id: str) -> dict:
+        return await self.browser_logins.relaunch_clean(attempt_id)
 
     async def navigate_browser_login(self, attempt_id: str, action: str) -> dict:
         att = self.browser_logins.get(attempt_id)

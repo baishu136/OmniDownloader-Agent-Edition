@@ -623,6 +623,17 @@ input[type=checkbox]:checked:after { background: #fff; transform: translateX(18p
   gap: 6px;
   margin-bottom: 6px;
 }
+.browser-prefs-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px 14px;
+  margin: 10px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.browser-prefs-grid label { margin: 0; font-size: 12.5px; }
 .primary-login-row {
   display: flex;
   gap: 10px;

@@ -2,6 +2,7 @@
 const $ = id => document.getElementById(id);
 let settings = {}, bots = [], mcpConfig = {}, sessionsData = [];
 let accountsState = {current_id: null, accounts: []};
+let browserPrefsState = {browser: 'auto', mode: 'auto', available_browsers: [], resolved_name: ''};
 let selectedAccountIds = new Set();
 let selectedPlatform = '';
 let noticeTimer, refreshTimer, autoSaveTimer, qrTimer, browserLoginTimer;
@@ -404,16 +405,20 @@ function renderBrowserLoginState(st) {
       : st.account_label
         ? `${st.account_label} · ${st.platform}`
         : st.platform;
-  $('browser-status-title').textContent = `${titleName} · ${st.browser_name || '本地浏览器'}`;
-  $('browser-host-subtitle').textContent = st.current_host
-    ? `当前域：${st.current_host}`
-    : (st.account_label ? `独立容器：${st.account_label}` : '等待页面打开');
-
+  const isClean = Boolean(st.clean_mode);
   const isManage = Boolean(st.manage_only);
   const isMulti = Boolean(st.multi_platform);
-  $('browser-nav-google').hidden = isMulti || (!st.account_id && !st.require_explicit_save && !isManage);
-  $('browser-nav-platform').hidden = isMulti || isManage;
-  $('browser-nav-reload').hidden = isMulti;
+  $('browser-status-title').textContent = `${titleName} · ${st.browser_name || '本地浏览器'}${isClean ? '（纯净模式）' : ''}`;
+  $('browser-host-subtitle').textContent = isClean
+    ? (st.clean_waiting_confirm ? '浏览器窗口已关闭，等待确认读取' : '纯净无调试模式（防 Google 拦截）')
+    : st.current_host
+      ? `当前域：${st.current_host}`
+      : (st.account_label ? `独立容器：${st.account_label}` : '等待页面打开');
+
+  $('browser-nav-google').hidden = isClean || isMulti || (!st.account_id && !st.require_explicit_save && !isManage);
+  $('browser-nav-platform').hidden = isClean || isMulti || isManage;
+  $('browser-nav-reload').hidden = isClean || isMulti;
+  $('browser-relaunch-clean').hidden = isClean || isMulti || (st.state !== 'OPENING' && st.state !== 'WAITING');
 
   const stagePill = $('browser-stage-pill');
   const stageClassMap = {
@@ -453,28 +458,38 @@ function renderBrowserLoginState(st) {
 
   const telemetry = $('browser-telemetry');
   telemetry.replaceChildren();
-  const chips = isManage
+  const chips = isClean
     ? [
-        [st.cdp_connected ? 'ok' : '', st.cdp_connected ? '浏览器通道已连接' : '正在建立通道'],
-        [st.current_host ? 'ok' : '', st.current_host ? `当前域：${st.current_host}` : '等待 Google 账号页'],
-        ['', '只管理网页登录（不改动下载凭据）'],
+        ['ok', '纯净无调试启动（无 WebDriver 标记）'],
+        [
+          st.clean_waiting_confirm ? 'ok' : '',
+          st.clean_waiting_confirm ? '窗口已关闭 · 待点保存' : '请在打开窗口内使用原生地址栏登录',
+        ],
+        isManage ? ['', '只管理网页登录（不改动下载凭据）'] : ['', '支持关闭窗口或点击右下按钮提取 Cookie'],
         ['', `已用 ${st.elapsed_seconds || 0}s`],
       ]
-    : [
-        [st.cdp_connected ? 'ok' : '', st.cdp_connected ? 'CDP 通道已连接' : '正在建立通道'],
-        [st.current_host ? 'ok' : '', st.current_host ? `当前域：${st.current_host}` : '等待页面域'],
-        [
-          st.cookie_count > 0 ? (st.marker_detected ? 'ok' : '') : '',
-          st.cookie_count > 0 ? `已捕获 ${st.cookie_count} 项 Cookie` : '尚未检测到平台 Cookie',
-        ],
-        [
-          st.marker_detected ? 'ok' : '',
-          st.marker_detected
-            ? (isMulti ? '已识别平台登录态' : (st.require_explicit_save ? '已识别登录态（待点击保存）' : '已识别核心登录标记'))
-            : (isMulti ? '等待任意平台登录' : ((st.auto_capture && !st.require_explicit_save) ? '等待登录态标记' : '需点击保存按钮确认')),
-        ],
-        ['', `已用 ${st.elapsed_seconds || 0}s`],
-      ];
+    : isManage
+      ? [
+          [st.cdp_connected ? 'ok' : '', st.cdp_connected ? '浏览器通道已连接' : '正在建立通道'],
+          [st.current_host ? 'ok' : '', st.current_host ? `当前域：${st.current_host}` : '等待 Google 账号页'],
+          ['', '只管理网页登录（不改动下载凭据）'],
+          ['', `已用 ${st.elapsed_seconds || 0}s`],
+        ]
+      : [
+          [st.cdp_connected ? 'ok' : '', st.cdp_connected ? 'CDP 通道已连接' : '正在建立通道'],
+          [st.current_host ? 'ok' : '', st.current_host ? `当前域：${st.current_host}` : '等待页面域'],
+          [
+            st.cookie_count > 0 ? (st.marker_detected ? 'ok' : '') : '',
+            st.cookie_count > 0 ? `已捕获 ${st.cookie_count} 项 Cookie` : '尚未检测到平台 Cookie',
+          ],
+          [
+            st.marker_detected ? 'ok' : '',
+            st.marker_detected
+              ? (isMulti ? '已识别平台登录态' : (st.require_explicit_save ? '已识别登录态（待点击保存）' : '已识别核心登录标记'))
+              : (isMulti ? '等待任意平台登录' : ((st.auto_capture && !st.require_explicit_save) ? '等待登录态标记' : '需点击保存按钮确认')),
+          ],
+          ['', `已用 ${st.elapsed_seconds || 0}s`],
+        ];
   for (const [cls, text] of chips) {
     const chip = document.createElement('span');
     chip.className = 'probe-chip' + (cls ? ' ' + cls : '');
@@ -499,13 +514,15 @@ function renderBrowserLoginState(st) {
 
   $('browser-manual-capture').textContent = isManage
     ? '完成'
-    : isMulti
-      ? '保存全部已登录平台'
-      : (st.account_id || st.require_explicit_save)
-        ? `保存 ${st.platform} 下载凭据`
-        : !st.auto_capture
-          ? '我已登录，保存会话'
-          : '完成（可手动确认）';
+    : st.clean_waiting_confirm
+      ? (isMulti ? '确认读取并保存全部已登录平台' : `确认保存 ${st.platform} 下载凭据`)
+      : isMulti
+        ? '保存全部已登录平台'
+        : (st.account_id || st.require_explicit_save)
+          ? `保存 ${st.platform} 下载凭据`
+          : !st.auto_capture
+            ? '我已登录，保存会话'
+            : '完成（可手动确认）';
   $('browser-status-text').textContent = st.message || '';
 }
 
@@ -953,6 +970,43 @@ async function submitNewAccount() {
   notify(`已添加独立登录档案「${label}」，点击“打开”即可隔离登录`);
 }
 
+function renderBrowserPrefs() {
+  const browserSel = $('browser-pref-select');
+  const modeSel = $('browser-mode-select');
+  if (!browserSel || !modeSel) return;
+  const avail = browserPrefsState?.available_browsers || [];
+  const resolvedName = browserPrefsState?.resolved_name || '';
+  browserSel.replaceChildren();
+  const autoOpt = document.createElement('option');
+  autoOpt.value = 'auto';
+  autoOpt.textContent = resolvedName ? `自动（当前：${resolvedName}）` : '自动（优先 Google Chrome）';
+  browserSel.append(autoOpt);
+  for (const item of avail) {
+    const opt = document.createElement('option');
+    opt.value = item.key;
+    opt.textContent = item.name;
+    browserSel.append(opt);
+  }
+  if (!avail.length) {
+    const fallbackHint = document.createElement('option');
+    fallbackHint.value = 'chrome';
+    fallbackHint.textContent = 'Google Chrome（未检测到安装）';
+    fallbackHint.disabled = true;
+    browserSel.append(fallbackHint);
+  }
+  browserSel.value = browserPrefsState?.browser || 'auto';
+  if (!browserSel.value) browserSel.value = 'auto';
+  browserSel._syncSelect?.();
+
+  modeSel.value = browserPrefsState?.mode || 'auto';
+  modeSel._syncSelect?.();
+}
+
+async function loadBrowserPrefs() {
+  browserPrefsState = await api('sessions/browser-prefs');
+  renderBrowserPrefs();
+}
+
 async function performLogoutAccounts(ids, descLabel) {
   if (!ids.length) return;
   if (!confirm(`确定退出${descLabel}吗？\n仅由该档案保存且未被覆盖的下载凭据将被移除，对应浏览器目录也会隔离重置（重新“打开”可重登）。`)) return;
@@ -1249,7 +1303,7 @@ async function init() {
   settings = await api('config');
   populate();
   setSaveStatus('saved', '已保存');
-  await Promise.all([loadSessions(), loadAccounts(), loadBots(), refresh()]);
+  await Promise.all([loadSessions(), loadBrowserPrefs(), loadAccounts(), loadBots(), refresh()]);
   mcpConfig = await api('mcp-config');
   clearInterval(refreshTimer);
   refreshTimer = setInterval(() => {
@@ -1504,6 +1558,44 @@ $('browser-nav-reload').addEventListener('click', () => action($('browser-nav-re
   $('browser-status-text').textContent = '正在重新加载平台登录页...';
 }));
 
+$('browser-relaunch-clean').addEventListener('click', () => action($('browser-relaunch-clean'), async () => {
+  if (!activeBrowserAttempt) return;
+  const oldId = activeBrowserAttempt;
+  const targetPlat = activeBrowserPlatform || selectedPlatform;
+  stopBrowserPoll();
+  setSessionActivity(targetPlat, 'info', '切换纯净模式', '正在切换为无调试端口的纯净浏览器窗口（彻底防 Google 拦截）...');
+  const res = await api('sessions/browser-login/' + encodeURIComponent(oldId) + '/relaunch-clean', 'POST');
+  pollBrowserAttempt(res, res.platform || targetPlat, Boolean(res.multi_platform));
+}));
+
+$('browser-pref-select').addEventListener('change', async e => {
+  try {
+    browserPrefsState = await api('sessions/browser-prefs', 'POST', {browser: e.target.value});
+    renderBrowserPrefs();
+    await loadSessions();
+    notify(`已设置登录浏览器：${browserPrefsState.resolved_name || e.target.value}`);
+  } catch (err) {
+    notify(err.message, true);
+    renderBrowserPrefs();
+  }
+});
+
+$('browser-mode-select').addEventListener('change', async e => {
+  try {
+    browserPrefsState = await api('sessions/browser-prefs', 'POST', {mode: e.target.value});
+    renderBrowserPrefs();
+    const labelMap = {
+      auto: '智能防风控（Google 流程自动无调试启动）',
+      clean: '始终纯净无调试模式',
+      cdp: '始终实时 CDP 监听模式',
+    };
+    notify(`已切换登录保护模式：${labelMap[browserPrefsState.mode] || e.target.value}`);
+  } catch (err) {
+    notify(err.message, true);
+    renderBrowserPrefs();
+  }
+});
+
 $('browser-manual-capture').addEventListener('click', () => action($('browser-manual-capture'), async () => {
   if (!activeBrowserAttempt) return;
   const path = activeBrowserMulti
@@ -1626,7 +1718,7 @@ $('scan-bridges').addEventListener('click', () => action($('scan-bridges'), asyn
 $('refresh').addEventListener('click', () => action($('refresh'), async () => {
   settings = await api('config');
   populate();
-  await Promise.all([loadSessions(), loadAccounts(), loadBots(), refresh()]);
+  await Promise.all([loadSessions(), loadBrowserPrefs(), loadAccounts(), loadBots(), refresh()]);
   notify('状态已同步');
 }));
 
