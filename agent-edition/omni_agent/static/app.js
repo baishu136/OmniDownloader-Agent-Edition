@@ -311,6 +311,36 @@ function renderProxyTestResult(res) {
   }
 }
 
+function renderVisualTestResult(res) {
+  const box = $('visual-test-result');
+  box.hidden = false;
+  const hasErr = Boolean(res.delivery_error);
+  box.className = 'probe-result ' + (hasErr ? 'err' : 'ok');
+  box.replaceChildren();
+  const head = document.createElement('div');
+  if (res.delivered) {
+    head.textContent = '可视化模板预览已生成，并已通过机器人适配器成功试发一条测试通知。';
+  } else if (res.delivery_error) {
+    head.textContent = '预览已生成，但直发测试通知失败：' + res.delivery_error;
+  } else {
+    head.textContent = '可视化阶段预览（配置机器人允许目标并填写默认通知目标后可真实试发）：';
+  }
+  box.append(head);
+  const chips = document.createElement('div');
+  chips.className = 'probe-chips';
+  const labels = {receive: '收到链接', start: '开始下载', complete: '下载完成', error: '报错直出'};
+  for (const [stage, label] of Object.entries(labels)) {
+    const item = res.previews?.[stage];
+    if (!item) continue;
+    const chip = document.createElement('span');
+    chip.className = 'probe-chip ' + (stage === 'error' ? 'err' : 'ok');
+    const stateText = item.should_reply ? (item.message || '（由 Agent 自由组织）') : '（已设为静默不发）';
+    chip.textContent = `${label}：${stateText}`;
+    chips.append(chip);
+  }
+  box.append(chips);
+}
+
 // -------------------- 辅助渲染 --------------------
 
 function row(container, text, buttonText, callback) {
@@ -1316,7 +1346,7 @@ async function init() {
 // -------------------- 事件绑定 --------------------
 
 const formEl = $('settings-form');
-const manualSaveFields = new Set(['download_dir', 'image_dir', 'cache_dir', 'proxy']);
+const manualSaveFields = new Set(['download_dir', 'image_dir', 'cache_dir', 'proxy', 'visual_notify_target']);
 formEl.addEventListener('change', e => {
   const t = e.target;
   if (!t || !t.name) return;
@@ -1365,6 +1395,24 @@ document.querySelectorAll('.clear-dir').forEach(btn => {
 $('save-visual').addEventListener('click', () => action($('save-visual'), async () => {
   clearTimeout(autoSaveTimer);
   await saveSettingsNow(true, true, '下载可视化通知规则已保存');
+}));
+
+$('test-visual').addEventListener('click', () => action($('test-visual'), async () => {
+  clearTimeout(autoSaveTimer);
+  const saved = await saveSettingsNow(false, false);
+  if (!saved) {
+    notify('请检查设置或默认通知目标格式（如 telegram:123 或 onebot:group:123）', true);
+    return;
+  }
+  const res = await api('visual/test', 'POST', {});
+  renderVisualTestResult(res);
+  if (res.delivery_error) {
+    notify('预览成功，但试发失败：' + res.delivery_error, true);
+  } else if (res.delivered) {
+    notify('测试通知已成功发送');
+  } else {
+    notify('已生成各阶段状态文案预览');
+  }
 }));
 
 $('test-proxy').addEventListener('click', () => action($('test-proxy'), async () => {

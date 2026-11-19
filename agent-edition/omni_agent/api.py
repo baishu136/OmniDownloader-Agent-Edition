@@ -20,6 +20,7 @@ from .desktop_tools import create_directory, list_directories, pick_directory, p
 from .errors import AgentError
 from .mcp_server import create_mcp
 from .service import BotConfigUpdate, DownloadOptions, Service, SettingsUpdate
+from .visualization import build_visualization
 
 
 principal = contextvars.ContextVar('omni_agent_principal', default='agent')
@@ -39,6 +40,8 @@ class Download(Input):
     options: DownloadOptions = Field(default_factory=DownloadOptions)
     request_key: str | None = Field(None, max_length=128)
     approval_id: str | None = Field(None, max_length=64)
+    notify_adapter: Literal['telegram', 'onebot'] | None = None
+    notify_target: str | None = Field(None, max_length=128)
 
 
 class Collection(Download):
@@ -49,6 +52,8 @@ class Collection(Download):
 
 class TaskID(Input):
     task_id: str = Field(min_length=1, max_length=64)
+    after_seq: int | None = Field(None, ge=0)
+    wait_seconds: float = Field(0.0, ge=0.0, le=30.0)
 
 
 class FileID(Input):
@@ -57,6 +62,8 @@ class FileID(Input):
 
 class DeliveryID(Input):
     delivery_id: str = Field(min_length=1, max_length=64)
+    after_seq: int | None = Field(None, ge=0)
+    wait_seconds: float = Field(0.0, ge=0.0, le=30.0)
 
 
 class ListTasks(Input):
@@ -64,11 +71,13 @@ class ListTasks(Input):
     limit: int = Field(50, ge=1, le=100)
 
 
-class Deliver(TaskID):
+class Deliver(Input):
+    task_id: str = Field(min_length=1, max_length=64)
     adapter: Literal['telegram', 'onebot']
     target: str = Field(min_length=1, max_length=128)
     request_key: str = Field(min_length=1, max_length=128)
     kind: Literal['auto', 'video', 'audio', 'photo', 'document'] = 'auto'
+    after_seq: int | None = Field(None, ge=0)
 
 
 class UpdateSettingsArgs(Input):
@@ -127,6 +136,11 @@ class BrowserNavigateArgs(Input):
 class BrowserPrefsUpdateArgs(Input):
     browser: Literal['auto', 'chrome', 'edge', 'brave', 'chromium'] | None = None
     mode: Literal['auto', 'clean', 'cdp'] | None = None
+
+
+class VisualTestArgs(Input):
+    adapter: str = ''
+    target: str = ''
 
 
 class Retry(Input):
@@ -203,12 +217,24 @@ async def invoke(service, owner, name, arguments):
         if name == 'analyze_media':
             result = await service.analyze(owner, args.url, args.media_type)
         elif name == 'download_media':
-            result = await service.download(owner, args.url, args.options, args.request_key, approval_id=args.approval_id)
+            result = await service.download(
+                owner, args.url, args.options, args.request_key,
+                approval_id=args.approval_id,
+                notify_adapter=args.notify_adapter,
+                notify_target=args.notify_target,
+            )
         elif name == 'download_collection':
-            result = await service.download(owner, args.url, args.options, args.request_key,
-                                            collection=True, start=args.start, count=args.count, approval_id=args.approval_id)
+            result = await service.download(
+                owner, args.url, args.options, args.request_key,
+                collection=True, start=args.start, count=args.count,
+                approval_id=args.approval_id,
+                notify_adapter=args.notify_adapter,
+                notify_target=args.notify_target,
+            )
         elif name == 'get_task_status':
-            result = service.store.public_job(args.task_id, owner)
+            result = await service.wait_task_status(
+                owner, args.task_id, after_seq=args.after_seq, wait_seconds=args.wait_seconds
+            )
         elif name == 'cancel_task':
             result = await service.cancel(owner, args.task_id)
         elif name == 'list_tasks':
@@ -222,9 +248,13 @@ async def invoke(service, owner, name, arguments):
         elif name == 'list_bridges':
             result = {'bridges': service.bridges.list_bridges(), 'hints': service.bridges.local_hints, 'bots': service.get_bot_configs()}
         elif name == 'deliver_media':
-            result = await service.deliver(owner, args.task_id, args.adapter, args.target, args.kind, args.request_key)
+            result = await service.deliver(
+                owner, args.task_id, args.adapter, args.target, args.kind, args.request_key, after_seq=args.after_seq
+            )
         elif name == 'get_delivery_status':
-            result = service.store.public_delivery(args.delivery_id, owner)
+            result = await service.wait_delivery_status(
+                owner, args.delivery_id, after_seq=args.after_seq, wait_seconds=args.wait_seconds
+            )
         elif name == 'get_settings':
             result = service.get_settings()
         elif name == 'update_settings':
@@ -251,7 +281,12 @@ async def invoke(service, owner, name, arguments):
             result = service.remove_cookie(args.platform)
         return {'ok': True, 'result': result}
     except AgentError as error:
-        return error.result()
+        res = error.result()
+        if name in ('analyze_media', 'download_media', 'download_collection', 'get_task_status', 'deliver_media', 'get_delivery_status', 'cancel_task'):
+            res['visualization'] = build_visualization(
+                service.config.settings, 'error', error_code=error.code, error_message=error.message
+            )
+        return res
     except ValidationError:
         return AgentError('INVALID_PARAMETER', '参数不符合工具 Schema').result()
     except Exception:
@@ -405,6 +440,13 @@ def create_app(service=None):
     @app.post('/api/admin/proxy/test')
     async def admin_test_proxy(body: ProxyTestArgs):
         return await probe_proxy_connectivity(body.proxy, body.target)
+
+    @app.post('/api/admin/visual/test')
+    async def admin_test_visualization(body: VisualTestArgs | None = None):
+        return await service.test_visualization(
+            adapter=(body.adapter if body else ''),
+            target=(body.target if body else ''),
+        )
 
     @app.get('/api/admin/status')
     async def status():

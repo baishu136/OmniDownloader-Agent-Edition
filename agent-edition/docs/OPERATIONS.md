@@ -26,11 +26,12 @@
 
 ## 下载可视化与报错直出
 
-在“04 下载可视化与消息反馈设置”或通过 `update_settings` 可配置桥接对话与 MCP 调用中的阶段反馈策略：
+在“04 下载可视化与消息反馈设置”或通过 `update_settings` 可配置防消息忽略的状态直发通道、事件流通知策略与报错直出模板：
 - `visual_enabled`：总开关；关闭或取消勾选全部节点即可静默不返回过程状态。
-- `visual_on_receive` / `visual_on_start` / `visual_on_complete`：分别控制「收到链接时」「下载开始时」「下载完成时（正在发送）」是否返回文字状态。
+- `visual_on_receive` / `visual_on_start` / `visual_on_complete`：分别控制「收到链接时」「下载开始时」「下载完成时（正在发送）」是否返回文字状态；服务端采用 SQLite 持久化里程碑事件表 `visual_events`，配合 `after_seq` 游标与 `wait_seconds` 长轮询，即使缓存秒命中或极速下载也不会丢失或重复阶段状态。
+- `visual_notify_channel` / `visual_notify_target`：支持 `auto`（智能协同：传入 `notify_adapter`/`notify_target` 或已配置 `visual_notify_target` 时服务端直发，否则走事件流与 MCP 进度通知）、`server_bot`（服务端通过已在 `allowed_targets` 白名单内的 QQ/Telegram 机器人即时推送文本进度，不等待 LLM 回合汇总）与 `caller_only`（仅通过 `pending_events` 与 MCP `notifications/progress` 返回）；可开启 `visual_reuse_message`（Telegram 下优先原地 `editMessageText` 刷新同任务首条消息）。
 - `visual_mode`：`agent`（由 Agent 结合阶段和元数据自主组织反馈）或 `custom`（严格按 `visual_receive_template` / `visual_start_template` / `visual_complete_template` 渲染输出）。
-- `visual_error_template`：无论过程通知是否开启，任务下载或发送报错时都会在 `error_message` 与 `visualization.message` 中直接输出完整脱敏报错原因。
+- `visual_error_template`：无论过程通知是否开启，任务下载或发送报错时都会在 `error_message`、`AgentError` 的 `visualization` 载荷与直发通道中直接输出完整脱敏报错原因；管理页提供“预览并测试状态通知”（`POST /api/admin/visual/test`）一键预览四阶段文案并在已配目标时真实验证发送。
 
 ## 平台 Cookie 登录流程
 

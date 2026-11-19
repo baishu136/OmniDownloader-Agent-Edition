@@ -36,6 +36,7 @@ from .errors import AgentError, safe_text
 from .runner import Runner
 from .security import is_profile, parse_download_command, source_url
 from .store import ACTIVE, Store
+from .visualization import build_visualization, format_error_detail, stage_from_task_state
 
 
 class DownloadOptions(BaseModel):
@@ -89,6 +90,9 @@ class SettingsUpdate(BaseModel):
     visual_on_start: bool | None = None
     visual_on_complete: bool | None = None
     visual_mode: Literal['agent', 'custom'] | None = None
+    visual_notify_channel: Literal['auto', 'server_bot', 'caller_only'] | None = None
+    visual_notify_target: str | None = Field(None, max_length=160)
+    visual_reuse_message: bool | None = None
     visual_receive_template: str | None = Field(None, max_length=500)
     visual_start_template: str | None = Field(None, max_length=500)
     visual_complete_template: str | None = Field(None, max_length=500)
@@ -129,6 +133,8 @@ class Service:
         self.browser_logins = LocalBrowserLoginManager(profile_dir=private_dir(self.config.directory / 'browser-profile'))
         self.browser_accounts = ManagedProfileStore(self.vault, self.config.directory)
         self.browser_prefs = BrowserPreferenceStore(self.vault)
+        self._notify_locks: dict[str, asyncio.Lock] = {}
+        self._notify_inflight: dict[str, asyncio.Event] = {}
         self._startup_probe = None
 
     async def start(self):
@@ -766,9 +772,26 @@ class Service:
             'GIF': 'video', 'AUDIO_ONLY': 'audio', 'COVER': 'covers', 'IMAGE': 'images', 'IMAGE_ZIP': 'images'}[o])]
         return result
 
-    async def download(self, owner, raw_url, options, request_key=None, *, collection=False, start=1, count=1, approval_id=None):
+    async def download(
+        self,
+        owner,
+        raw_url,
+        options,
+        request_key=None,
+        *,
+        collection=False,
+        start=1,
+        count=1,
+        approval_id=None,
+        notify_adapter: str | None = None,
+        notify_target: str | None = None,
+    ):
         url, cmd_all, cmd_zip = self.check_url(raw_url)
         s = self.config.settings
+        if bool(notify_adapter) != bool(notify_target):
+            raise AgentError('INVALID_PARAMETER', '指定直发状态通知时须同时提供 notify_adapter 与 notify_target')
+        if notify_adapter and notify_target:
+            make_adapter(self.bot_config(notify_adapter)).check_target(notify_target)
         resolved = self.resolve_options(options, cmd_all=cmd_all, cmd_zip=cmd_zip)
         if (collection or resolved['all_items']) and not s.collections and resolved['download_type'] != 'IMAGE':
             raise AgentError('FEATURE_DISABLED', '当前设置关闭了合集下载')
@@ -826,9 +849,11 @@ class Service:
             raise AgentError('QUEUE_FULL', '下载队列已满')
         if self.store.usage() + s.max_file_bytes * count > s.max_cache_bytes or shutil.disk_usage(self.config.cache).free < s.max_file_bytes * count:
             raise AgentError('CACHE_FULL', '缓存配额或磁盘剩余空间不足，请先清理或调低文件上限')
-        row, new = self.store.create_job(owner, payload, key, request_key)
+        notify_meta = {'notify_adapter': notify_adapter, 'notify_target': notify_target} if (notify_adapter and notify_target) else None
+        row, new = self.store.create_job(owner, payload, key, request_key, notify_meta=notify_meta)
         if approval:
             self.store.db.execute('UPDATE approvals SET used=1 WHERE id=?', (approval['id'],))
+        await self._dispatch_visual_events(row['id'], owner)
         return self.store.public_job(row['id'], owner)
 
     def _export_to_storage(self, payload, paths):
@@ -891,8 +916,203 @@ class Service:
                 last_cleanup = time.monotonic()
             await asyncio.sleep(.2)
 
+    def _resolve_notify_target(self, job_row: dict, *, adapter_override: str = '', target_override: str = '') -> tuple[str, str] | None:
+        s = self.config.settings
+        if s.visual_notify_channel == 'caller_only':
+            return None
+        meta = self.store._parsed_meta(job_row)
+        adapter_name = adapter_override or meta.get('notify_adapter') or ''
+        target = target_override or meta.get('notify_target') or ''
+
+        if not (adapter_name and target):
+            if s.visual_notify_target:
+                ad, _, tg = s.visual_notify_target.partition(':')
+                if ad in ('telegram', 'onebot') and tg:
+                    adapter_name, target = ad, tg
+            elif s.visual_notify_channel == 'server_bot':
+                raw_ad = str(meta.get('adapter') or '')
+                norm_ad = 'onebot' if raw_ad in ('onebot', 'QQ / OneBot') else ('telegram' if raw_ad in ('telegram', 'Telegram') else '')
+                if norm_ad and meta.get('target'):
+                    adapter_name, target = norm_ad, str(meta['target'])
+                else:
+                    enabled = [(name, self.bot_config(name)) for name in ('onebot', 'telegram') if self.bot_config(name).enabled]
+                    if len(enabled) == 1 and len(enabled[0][1].allowed_targets) == 1:
+                        adapter_name, target = enabled[0][0], enabled[0][1].allowed_targets[0]
+
+        if not (adapter_name in ('telegram', 'onebot') and target):
+            return None
+        cfg = self.bot_config(adapter_name)
+        if not cfg.enabled or target not in cfg.allowed_targets:
+            return None
+        return adapter_name, target
+
+    async def _dispatch_visual_events(
+        self,
+        job_id: str,
+        owner: str,
+        *,
+        adapter_override: str = '',
+        target_override: str = '',
+        stages_filter: set[str] | None = None,
+    ) -> bool:
+        lock = self._notify_locks.setdefault(job_id, asyncio.Lock())
+        async with lock:
+            events = self.store.visual_events_for(job_id, owner)
+            already_notified = {ev['stage'] for ev in events if ev['server_notified'] and ev['stage'] != 'error'}
+            batch_dups: dict[str, list[int]] = {}
+            to_send: list[dict] = []
+            seen_in_call: set[str] = set()
+            for ev in events:
+                if not ev['should_reply'] or ev['server_notified'] or not ev['message']:
+                    continue
+                if ev['stage'] in already_notified:
+                    self.store.mark_visual_event_notified(ev['seq'])
+                    continue
+                if stages_filter is not None and ev['stage'] not in stages_filter:
+                    continue
+                if ev['stage'] != 'error' and ev['stage'] in seen_in_call:
+                    batch_dups.setdefault(ev['stage'], []).append(ev['seq'])
+                    continue
+                to_send.append(ev)
+                if ev['stage'] != 'error':
+                    seen_in_call.add(ev['stage'])
+            if not to_send:
+                return False
+            job_row = self.store.job(job_id, owner)
+            resolved = self._resolve_notify_target(job_row, adapter_override=adapter_override, target_override=target_override)
+            if not resolved:
+                return False
+            adapter_name, target = resolved
+            adapter = make_adapter(self.bot_config(adapter_name))
+            meta = self.store._parsed_meta(job_row)
+            msg_id = meta.get('notify_message_id') if self.config.settings.visual_reuse_message else None
+            any_sent = False
+            for ev in to_send:
+                try:
+                    receipt = await adapter.send_text(target, ev['message'], message_id=msg_id)
+                except AgentError:
+                    break
+                self.store.mark_visual_event_notified(ev['seq'])
+                for dup_seq in batch_dups.get(ev['stage'], ()):
+                    self.store.mark_visual_event_notified(dup_seq)
+                any_sent = True
+                if self.config.settings.visual_reuse_message and isinstance(receipt, dict) and receipt.get('message_id'):
+                    msg_id = receipt['message_id']
+                    self.store.merge_job_metadata(job_id, {'notify_message_id': msg_id})
+            return any_sent
+
+    async def _await_inflight_notify(self, task_id: str, timeout: float = 3.0) -> None:
+        gate = self._notify_inflight.get(task_id)
+        if gate is not None and not gate.is_set():
+            try:
+                await asyncio.wait_for(gate.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+
+    async def wait_task_status(self, owner: str, task_id: str, *, after_seq: int | None = None, wait_seconds: float = 0.0, on_progress=None) -> dict:
+        """查询任务状态，支持以游标返回未消费里程碑并可短阻塞等待状态/进度变化。"""
+        res = self.store.public_job(task_id, owner, after_seq=after_seq)
+        bounded = min(max(float(wait_seconds or 0.0), 0.0), 30.0)
+        if bounded <= 0:
+            if on_progress and res['visualization']['pending_events']:
+                last_ev = res['visualization']['pending_events'][-1]
+                if last_ev['should_reply']:
+                    await on_progress(float(res['progress']), 100.0, last_ev['message'])
+            return res
+
+        init_seq = res['visualization']['latest_seq']
+        init_state = res['state']
+        if init_state not in ACTIVE and init_state != 'SENDING':
+            await self._await_inflight_notify(task_id, min(bounded, 3.0))
+            res = self.store.public_job(task_id, owner, after_seq=after_seq)
+            if on_progress and res['visualization']['pending_events']:
+                last_ev = res['visualization']['pending_events'][-1]
+                if last_ev['should_reply']:
+                    await on_progress(float(res['progress']), 100.0, last_ev['message'])
+            return res
+
+        deadline = time.monotonic() + bounded
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(0.25, max(0.05, deadline - time.monotonic())))
+            res = self.store.public_job(task_id, owner, after_seq=after_seq)
+            if res['visualization']['latest_seq'] > init_seq or res['state'] != init_state or res['state'] not in ACTIVE:
+                if res['state'] not in ACTIVE:
+                    await self._await_inflight_notify(task_id, min(max(deadline - time.monotonic(), 0.2), 3.0))
+                    res = self.store.public_job(task_id, owner, after_seq=after_seq)
+                if on_progress:
+                    msg = res['visualization']['message']
+                    for ev in res['visualization']['pending_events']:
+                        if ev['should_reply'] and ev['message']:
+                            msg = ev['message']
+                    if msg:
+                        await on_progress(float(res['progress']), 100.0, msg)
+                return res
+        return res
+
+    async def wait_delivery_status(self, owner: str, delivery_id: str, *, after_seq: int | None = None, wait_seconds: float = 0.0, on_progress=None) -> dict:
+        """查询交付状态，支持短阻塞等待交付回执或失败结果并触发 MCP 进度通知。"""
+        res = self.store.public_delivery(delivery_id, owner, after_seq=after_seq)
+        bounded = min(max(float(wait_seconds or 0.0), 0.0), 30.0)
+        if bounded <= 0 or res['state'] not in ('QUEUED', 'SENDING'):
+            if on_progress and res['visualization']['message']:
+                await on_progress(100.0 if res['state'] == 'SENT' else 85.0, 100.0, res['visualization']['message'])
+            return res
+        init_state = res['state']
+        init_seq = res['visualization']['latest_seq']
+        deadline = time.monotonic() + bounded
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(0.25, max(0.05, deadline - time.monotonic())))
+            res = self.store.public_delivery(delivery_id, owner, after_seq=after_seq)
+            if res['state'] != init_state or res['visualization']['latest_seq'] > init_seq or res['state'] not in ('QUEUED', 'SENDING'):
+                if on_progress and res['visualization']['message']:
+                    await on_progress(100.0 if res['state'] == 'SENT' else 90.0, 100.0, res['visualization']['message'])
+                return res
+        return res
+
+    async def test_visualization(self, *, adapter: str = '', target: str = '') -> dict:
+        """生成当前可视化规则的多阶段预览；若配置或指定了合法机器人目标，则实际试发一条验证通知。"""
+        s = self.config.settings
+        previews = {
+            stage: build_visualization(
+                s,
+                stage,
+                context={
+                    'task_id': 'demo1234',
+                    'platform': '哔哩哔哩',
+                    'title': '下载可视化测试示例视频',
+                    'author': 'UP 主示例',
+                    'file_count': 2,
+                    'progress': 65 if stage == 'start' else 100,
+                    'target': target or s.visual_notify_target or '当前聊天会话',
+                    'command_summary': '合集全量 /us',
+                },
+                error_code='COOKIE_EXPIRED' if stage == 'error' else '',
+                error_message='登录凭据已过期，请重新扫码登录' if stage == 'error' else '',
+            )
+            for stage in ('receive', 'start', 'complete', 'error')
+        }
+        send_adapter = adapter.strip().lower()
+        send_target = target.strip()
+        if not (send_adapter and send_target) and s.visual_notify_target:
+            ad, _, tg = s.visual_notify_target.partition(':')
+            if ad in ('telegram', 'onebot') and tg:
+                send_adapter, send_target = ad, tg
+
+        delivered = None
+        delivery_error = ''
+        if send_adapter in ('telegram', 'onebot') and send_target:
+            try:
+                bot = make_adapter(self.bot_config(send_adapter))
+                sample = previews['receive']['message'] or '[测试] OmniDownloader 下载可视化状态通知测试'
+                delivered = await bot.send_text(send_target, f'[测试通知] {sample}')
+            except AgentError as exc:
+                delivery_error = exc.message
+        return {'previews': previews, 'delivered': delivered, 'delivery_error': delivery_error}
+
     async def run_job(self, row):
         identifier = row['id']
+        loop = asyncio.get_running_loop()
+        pending_bg: list[asyncio.Task] = []
         try:
             payload = self.store.payload(row)
             saved_opts = payload['options']
@@ -916,6 +1136,9 @@ class Service:
                     return
                 if event.get('kind') == 'metadata':
                     self.store.merge_job_metadata(identifier, event.get('metadata') or {})
+                    ev = self.store.record_visual_event(identifier, 'start', 'DOWNLOADING')
+                    if ev:
+                        pending_bg.append(loop.create_task(self._dispatch_visual_events(identifier, row['owner'])))
                     return
                 self.store.update_job(
                     identifier,
@@ -924,10 +1147,28 @@ class Service:
                     speed=safe_text(event.get('speed', '')),
                     visual_stage='start',
                 )
+                ev = self.store.record_visual_event(identifier, 'start', 'DOWNLOADING')
+                if ev:
+                    pending_bg.append(loop.create_task(self._dispatch_visual_events(identifier, row['owner'])))
 
             result = await self.runner.call(payload, identifier, progress)
             self._export_to_storage(payload, result['paths'])
-            self.store.finish(identifier, result['paths'], metadata=result.get('metadata'))
+            if result.get('metadata'):
+                self.store.merge_job_metadata(identifier, result['metadata'])
+            self.store.record_visual_event(identifier, 'start', 'DOWNLOADING')
+            gate = asyncio.Event()
+            self._notify_inflight[identifier] = gate
+            try:
+                self.store.finish(identifier, result['paths'], metadata=result.get('metadata'))
+                if pending_bg:
+                    await asyncio.gather(*pending_bg, return_exceptions=True)
+                await self._dispatch_visual_events(identifier, row['owner'])
+                followers = self.store.db.execute("SELECT id, owner FROM jobs WHERE source_id=? AND state='READY'", (identifier,)).fetchall()
+                for fol in followers:
+                    await self._dispatch_visual_events(fol['id'], fol['owner'])
+            finally:
+                gate.set()
+                self._notify_inflight.pop(identifier, None)
         except asyncio.CancelledError:
             if self.stopping:
                 self.store.fail(identifier, 'RESTART_INTERRUPTED', 'FAILED', error_message='服务重启导致下载任务中断，请重新发起下载')
@@ -935,9 +1176,29 @@ class Service:
                 self.store.fail(identifier, 'CANCELLED', 'CANCELLED', error_message='任务已取消')
             raise
         except AgentError as error:
-            self.store.fail(identifier, error.code, error_message=safe_text(error.message))
+            gate = asyncio.Event()
+            self._notify_inflight[identifier] = gate
+            try:
+                self.store.fail(identifier, error.code, error_message=safe_text(error.message))
+                if pending_bg:
+                    await asyncio.gather(*pending_bg, return_exceptions=True)
+                await self._dispatch_visual_events(identifier, row['owner'])
+            finally:
+                gate.set()
+                self._notify_inflight.pop(identifier, None)
         except Exception:
-            self.store.fail(identifier, 'INTERNAL_ERROR', error_message='下载核心发生内部错误，请查看服务日志或重试')
+            gate = asyncio.Event()
+            self._notify_inflight[identifier] = gate
+            try:
+                self.store.fail(identifier, 'INTERNAL_ERROR', error_message='下载核心发生内部错误，请查看服务日志或重试')
+                if pending_bg:
+                    await asyncio.gather(*pending_bg, return_exceptions=True)
+                await self._dispatch_visual_events(identifier, row['owner'])
+            finally:
+                gate.set()
+                self._notify_inflight.pop(identifier, None)
+        finally:
+            self._notify_locks.pop(identifier, None)
 
     async def cancel(self, owner, identifier):
         job = self.store.job(identifier, owner)
@@ -966,12 +1227,13 @@ class Service:
         data = self.vault.get('bot-' + name)
         return BotConfig.model_validate_json(data) if data else BotConfig(adapter=name)
 
-    async def deliver(self, owner, identifier, adapter, target, kind, request_key):
+    async def deliver(self, owner, identifier, adapter, target, kind, request_key, *, after_seq: int | None = None):
         config = self.bot_config(adapter)
         bot = make_adapter(config)
         bot.check_target(target)
         row, new = self.store.create_delivery(identifier, owner, adapter, target, kind, request_key)
-        return self.store.public_delivery(row['id'], owner, include_receipts=False)
+        await self._dispatch_visual_events(identifier, owner, stages_filter={'complete', 'error'})
+        return self.store.public_delivery(row['id'], owner, include_receipts=False, after_seq=after_seq)
 
     async def run_delivery(self, row):
         identifier = row['id']
@@ -1015,16 +1277,21 @@ class Service:
             msg = '发送任务已中断，请核对平台消息记录'
             self.store.db.execute("UPDATE deliveries SET state='UNCERTAIN',error='SEND_INTERRUPTED',error_message=? WHERE id=?", (msg, identifier))
             self.store.update_job(row['task_id'], 'FAILED', error='DELIVERY_UNCERTAIN', error_message=msg, visual_stage='error')
+            self.store.record_visual_event(row['task_id'], 'error', 'UNCERTAIN', delivery_id=identifier, error_code='DELIVERY_UNCERTAIN', error_message=msg)
             raise
         except AgentError as error:
             state = 'UNCERTAIN' if error.code == 'DELIVERY_UNCERTAIN' else 'FAILED'
             msg = safe_text(error.message)
             self.store.db.execute('UPDATE deliveries SET state=?,error=?,error_message=?,updated=? WHERE id=?', (state, error.code, msg, time.time(), identifier))
             self.store.update_job(row['task_id'], 'FAILED', error=error.code, error_message=msg, visual_stage='error')
+            self.store.record_visual_event(row['task_id'], 'error', state, delivery_id=identifier, error_code=error.code, error_message=msg)
+            await self._dispatch_visual_events(row['task_id'], row['owner'], stages_filter={'error'})
         except Exception:
             msg = '发送阶段出现未预期异常，请核对平台记录'
             self.store.db.execute("UPDATE deliveries SET state='UNCERTAIN',error='SEND_ERROR',error_message=? WHERE id=?", (msg, identifier))
             self.store.update_job(row['task_id'], 'FAILED', error='DELIVERY_UNCERTAIN', error_message=msg, visual_stage='error')
+            self.store.record_visual_event(row['task_id'], 'error', 'UNCERTAIN', delivery_id=identifier, error_code='DELIVERY_UNCERTAIN', error_message=msg)
+            await self._dispatch_visual_events(row['task_id'], row['owner'], stages_filter={'error'})
 
     def retry_delivery(self, identifier, *, reconcile=False):
         row = self.store.delivery(identifier)
@@ -1076,6 +1343,8 @@ class Service:
             'visualization': {
                 'enabled': s.visual_enabled,
                 'mode': s.visual_mode,
+                'notify_channel': s.visual_notify_channel,
+                'reuse_message': s.visual_reuse_message,
                 'on_receive': s.visual_on_receive,
                 'on_start': s.visual_on_start,
                 'on_complete': s.visual_on_complete,

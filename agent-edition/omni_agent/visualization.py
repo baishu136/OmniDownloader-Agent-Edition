@@ -77,8 +77,11 @@ def build_visualization(
     context: dict | None = None,
     error_code: str = '',
     error_message: str = '',
+    pending_events: list[dict] | None = None,
+    latest_seq: int = 0,
+    server_notified: bool = False,
 ) -> dict:
-    """根据当前配置构造统一的可视化策略与阶段消息载荷。"""
+    """根据当前配置构造统一的可视化策略、未消费阶段事件流水与阶段消息载荷。"""
     ctx = dict(context or {})
     error_detail = format_error_detail(error_code, error_message) if (error_code or error_message) else ''
     variables = {
@@ -110,7 +113,11 @@ def build_visualization(
         rendered = render_template(template, variables)
         if error_detail and error_detail not in rendered:
             rendered = f'{rendered}：{error_detail}' if rendered else error_detail
-        guidance = 'direct_error: An error occurred. Directly output error_detail / message to the user without hiding the cause.'
+        guidance = (
+            'direct_error_notified: An error occurred and was already delivered by server bot.'
+            if server_notified
+            else 'direct_error: An error occurred. Directly output error_detail / message to the user without hiding the cause.'
+        )
     elif stage in ('receive', 'start', 'complete'):
         current_stage = stage
         should_reply = stages[stage]
@@ -123,6 +130,8 @@ def build_visualization(
         rendered = render_template(template, variables) if should_reply else ''
         if not should_reply:
             guidance = f'silent: User disabled "{stage}" notifications. Do not send an intermediate status message for this stage.'
+        elif server_notified:
+            guidance = f'server_notified: Stage "{stage}" message was already pushed directly by server bot adapter. Do not duplicate.'
         elif settings.visual_mode == 'custom':
             guidance = f'exact_custom: User chose custom content for "{stage}". Reply with visualization.message directly.'
         else:
@@ -138,14 +147,20 @@ def build_visualization(
         rendered = ''
         guidance = 'silent: No active visualization stage.'
 
+    events = list(pending_events or [])
+    max_seq = latest_seq or (events[-1]['seq'] if events else 0)
     return {
         'enabled': bool(settings.visual_enabled),
         'mode': settings.visual_mode,
+        'notify_channel': getattr(settings, 'visual_notify_channel', 'auto'),
         'stages': stages,
         'current_stage': current_stage,
         'should_reply': should_reply,
+        'server_notified': bool(server_notified),
         'message': rendered,
         'agent_instruction': guidance,
         'error_detail': error_detail,
+        'latest_seq': max_seq,
+        'pending_events': events,
         'variables': variables,
     }

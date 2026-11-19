@@ -206,6 +206,10 @@
             <span>下载完成时返回状态（正在发送）<small>媒体下载就绪并开始向 QQ / Telegram 发送时发送提示</small></span>
             <input type="checkbox" name="visual_on_complete" role="switch">
           </label>
+          <label>
+            <span>同任务状态原地编辑刷新<small>开启后（Telegram 支持原地编辑），同一任务的后续阶段优先更新首条状态消息，减少刷屏</small></span>
+            <input type="checkbox" name="visual_reuse_message" role="switch">
+          </label>
         </div>
         <div class="field-grid limits">
           <label class="wide">状态内容生成方式
@@ -213,6 +217,17 @@
               <option value="agent">由 Agent 决定（AI / 机器人结合阶段与媒体信息自由组织反馈）</option>
               <option value="custom">自定义返回内容（严格按下方模板渲染并输出文字状态）</option>
             </select>
+          </label>
+          <label class="wide">状态推送通道（防止阶段消息被 Agent / 对话回合延迟忽略）
+            <select name="visual_notify_channel">
+              <option value="auto">智能协同（调用提供 notify_* 或设置默认目标时服务端直发，否则走事件流与 MCP 进度通知）</option>
+              <option value="server_bot">服务端机器人直发（优先通过已启用的 QQ / Telegram 适配器即时推送文字状态）</option>
+              <option value="caller_only">仅由调用方输出（只通过 pending_events 事件游标与 MCP 进度通知返回给调用方）</option>
+            </select>
+          </label>
+          <label class="wide">默认直发状态通知目标（可选，格式 telegram:&lt;id&gt; 或 onebot:group:&lt;id&gt;）
+            <input name="visual_notify_target" placeholder="留空则优先使用请求参数传入的 notify_target 或当前交付目标">
+            <small>目标必须已在「机器人交付适配器」的允许名单（<code>allowed_targets</code>）中，服务端仅向可信白名单目标直发文本状态。</small>
           </label>
           <label class="wide">收到链接时模板
             <input name="visual_receive_template" placeholder="已收到链接（{command_summary}），正在准备解析与下载...">
@@ -230,7 +245,9 @@
         </div>
         <div class="actions">
           <button type="button" id="save-visual" class="primary">保存可视化规则</button>
+          <button type="button" id="test-visual">预览并测试状态通知</button>
         </div>
+        <div id="visual-test-result" class="probe-result" hidden></div>
       </section>
     </form>
 

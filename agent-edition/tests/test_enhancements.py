@@ -674,6 +674,359 @@ async def test_astrbot_plugin_stage_visualization_and_direct_error(tmp_path, mon
     assert '登录凭证已过期，请扫码重新登录' in err_emitted[-1]
     assert '登录凭证已过期，请扫码重新登录' in err_res
 
+    # 3. 扩展验证：现代 pending_events 事件流在缓存秒命中（state=='READY'）时不丢 receive、尊重 server_notified，且 media_tool 优先使用 context.send_message
+    seen_calls = []
+    cache_hit_seq = [
+        {
+            'id': 't-cache',
+            'state': 'READY',
+            'file_count': 1,
+            'visualization': {
+                'stages': {'receive': True, 'start': True, 'complete': True},
+                'latest_seq': 2,
+                'server_notified': False,
+                'pending_events': [
+                    {'seq': 1, 'stage': 'receive', 'should_reply': True, 'server_notified': False, 'message': '缓存前先回：已收到链接'},
+                    {'seq': 2, 'stage': 'complete', 'should_reply': True, 'server_notified': False, 'message': '本地准备就绪'},
+                ],
+            },
+        },
+        {
+            'id': 'd-cache',
+            'state': 'QUEUED',
+            'visualization': {
+                'stages': {'receive': True, 'start': True, 'complete': True},
+                'latest_seq': 3,
+                'server_notified': False,
+                'pending_events': [
+                    {'seq': 3, 'stage': 'complete', 'should_reply': True, 'server_notified': False, 'message': '下载完成（缓存秒命中），正在发送至 group:123'},
+                ],
+            },
+        },
+        {
+            'id': 'd-cache',
+            'state': 'SENT',
+            'visualization': {'stages': {'receive': True, 'start': True, 'complete': True}, 'latest_seq': 4, 'server_notified': False, 'pending_events': []},
+        },
+    ]
+
+    async def modern_call(name, **kwargs):
+        seen_calls.append((name, kwargs))
+        return cache_hit_seq[len(seen_calls) - 1]
+
+    sent_ctx_msgs = []
+    sent_evt_msgs = []
+
+    class DummyCtx:
+        async def send_message(self, origin, msg):
+            sent_ctx_msgs.append((origin, msg))
+            return True
+
+    class EventWithSend(DummyEvent):
+        async def send(self, msg):
+            sent_evt_msgs.append(msg)
+
+    plugin_with_ctx = module.OmniAgentPlugin(context=DummyCtx())
+    monkeypatch.setattr(plugin_with_ctx, '_ensure_heartbeat', lambda: None)
+    monkeypatch.setattr(plugin_with_ctx, 'call', modern_call)
+    tool_ret = await plugin_with_ctx.media_tool(EventWithSend(), 'https://www.bilibili.com/video/BV1cache', 'default')
+    assert seen_calls[0][0] == 'download_media'
+    assert seen_calls[0][1]['notify_adapter'] == 'onebot' and seen_calls[0][1]['notify_target'] == 'group:123'
+    assert seen_calls[1][0] == 'deliver_media' and seen_calls[1][1]['after_seq'] == 2
+    assert seen_calls[2][0] == 'get_delivery_status' and seen_calls[2][1]['wait_seconds'] == 5.0
+    assert [m for _, m in sent_ctx_msgs] == ['缓存前先回：已收到链接', '下载完成（缓存秒命中），正在发送至 group:123']
+    assert sent_evt_msgs == []
+    assert 'd-cache' in tool_ret
+
+    # 服务端已直发（server_notified=True）时，AstrBot 不重复向对话发出同一阶段状态
+    dup_check_seq = [
+        {
+            'id': 't-srv',
+            'state': 'READY',
+            'file_count': 1,
+            'visualization': {
+                'stages': {'receive': True, 'start': True, 'complete': True},
+                'latest_seq': 2,
+                'server_notified': True,
+                'pending_events': [
+                    {'seq': 1, 'stage': 'receive', 'should_reply': True, 'server_notified': True, 'message': '已收到'},
+                    {'seq': 2, 'stage': 'complete', 'should_reply': True, 'server_notified': True, 'message': '已完成'},
+                ],
+            },
+        },
+        {
+            'id': 'd-srv',
+            'state': 'QUEUED',
+            'visualization': {
+                'stages': {'receive': True, 'start': True, 'complete': True},
+                'latest_seq': 3,
+                'server_notified': True,
+                'pending_events': [
+                    {'seq': 3, 'stage': 'complete', 'should_reply': True, 'server_notified': True, 'message': '正在发送'},
+                ],
+            },
+        },
+        {'id': 'd-srv', 'state': 'SENT', 'visualization': {'latest_seq': 3, 'pending_events': []}},
+    ]
+    srv_idx = 0
+
+    async def srv_call(name, **kwargs):
+        nonlocal srv_idx
+        item = dup_check_seq[srv_idx]
+        srv_idx += 1
+        return item
+
+    monkeypatch.setattr(plugin, 'call', srv_call)
+    srv_emitted = []
+    await plugin.process(DummyEvent(), 'https://www.bilibili.com/video/BV1srv', 'default', emit=lambda m: asyncio.sleep(0, result=srv_emitted.append(m)))
+    assert srv_emitted == []
+
+
+@pytest.mark.asyncio
+async def test_visual_events_outbox_server_bot_notify_and_mcp_progress(service, tmp_path, monkeypatch):
+    from omni_agent.api import invoke
+    from omni_agent.mcp_server import create_mcp
+
+    bot_calls = []
+
+    class BotNotifyHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get('Content-Length') or 0)
+            raw = self.rfile.read(length)
+            content_type = self.headers.get('Content-Type') or ''
+            payload = {}
+            if 'application/json' in content_type:
+                try:
+                    payload = json.loads(raw.decode('utf-8'))
+                except ValueError:
+                    payload = {'raw': raw.decode('utf-8', 'replace')}
+            else:
+                payload = {'multipart_len': len(raw)}
+            bot_calls.append({'path': self.path, 'payload': payload})
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            if self.path.startswith('/bottg-tok/'):
+                action = self.path.split('/')[-1]
+                res_obj = {'message_id': 700 + len(bot_calls), 'chat': {'id': 'tg-chat-1'}} if action in ('sendMessage', 'editMessageText', 'sendPhoto', 'sendVideo', 'sendDocument') else {'ok': True}
+                self.wfile.write(json.dumps({'ok': True, 'result': res_obj}).encode())
+            else:
+                self.wfile.write(json.dumps({
+                    'status': 'ok',
+                    'retcode': 0,
+                    'data': {'message_id': 900 + len(bot_calls), 'file_id': 'f-ob-1', 'online': True, 'app_name': 'NapCat', 'user_id': 10000},
+                }).encode())
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(('127.0.0.1', 0), BotNotifyHandler)
+    srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    srv_thread.start()
+    base_url = f'http://127.0.0.1:{srv.server_port}'
+
+    service.runner = StageRunner(service.config, service.store)
+    dispatch_task = asyncio.create_task(service.dispatch())
+    app = create_app(service)
+    try:
+        # 1. 事件流持久化（visual_events）在极速下载与缓存命中下不丢 receive/start/complete 且支持 after_seq + wait_seconds 长轮询
+        service.update_settings({
+            'confirmation_threshold': 50,
+            'visual_enabled': True,
+            'visual_mode': 'custom',
+            'visual_notify_channel': 'caller_only',
+            'visual_on_receive': True,
+            'visual_on_start': True,
+            'visual_on_complete': True,
+            'visual_receive_template': '已收到-{command_summary}',
+            'visual_start_template': '开下-{platform}-{title}',
+            'visual_complete_template': '就绪-{file_count}个-{target}',
+            'visual_error_template': '失败-{error}',
+        })
+
+        dl_res = await invoke(service, 'agent', 'download_media', {'url': 'https://www.bilibili.com/video/BV1fast99'})
+        assert dl_res['ok'] is True
+        job = dl_res['result']
+        ev1 = job['visualization']['pending_events']
+        assert [e['stage'] for e in ev1] == ['receive']
+        cursor1 = job['visualization']['latest_seq']
+
+        st_res = await invoke(service, 'agent', 'get_task_status', {'task_id': job['id'], 'after_seq': cursor1, 'wait_seconds': 5.0})
+        assert st_res['ok'] is True
+        st = st_res['result']
+        assert st['state'] == 'READY'
+        # 即便 StageRunner 仅耗时 50ms，start 与 complete 均完整按 seq 顺序保留在 pending_events，不重复返回 receive
+        assert [e['stage'] for e in st['visualization']['pending_events']] == ['start', 'complete']
+        assert st['visualization']['latest_seq'] > cursor1
+
+        # 缓存秒命中：同样保留 receive + complete，绝不跳过 receive
+        hit_res = await invoke(service, 'agent', 'download_media', {'url': 'https://www.bilibili.com/video/BV1fast99'})
+        assert hit_res['ok'] is True
+        assert hit_res['result']['state'] == 'READY'
+        assert [e['stage'] for e in hit_res['result']['visualization']['pending_events']] == ['receive', 'complete']
+
+        # 2. Telegram notify_adapter/notify_target 直发 + visual_reuse_message（sendMessage 后原地 editMessageText）+ server_notified=True
+        service.update_bot_config({'adapter': 'telegram', 'enabled': True, 'base_url': base_url, 'local_api': True, 'token': 'tg-tok', 'allowed_targets': ['tg-chat-1']})
+        service.update_bot_config({'adapter': 'onebot', 'enabled': True, 'base_url': base_url, 'token': 'ob-tok', 'allowed_targets': ['group:888'], 'shared_root': str(tmp_path), 'remote_root': '/app'})
+        service.update_settings({'visual_notify_channel': 'auto', 'visual_reuse_message': True})
+
+        # 非白名单 notify_target 必须拒绝，并在 AgentError 响应中携带 visualization
+        denied = await invoke(service, 'agent', 'download_media', {
+            'url': 'https://www.bilibili.com/video/BV1denied',
+            'notify_adapter': 'telegram',
+            'notify_target': 'tg-evil',
+        })
+        assert denied['ok'] is False and denied['error']['code'] == 'TARGET_DENIED'
+        assert denied['visualization']['current_stage'] == 'error' and denied['visualization']['should_reply'] is True
+
+        tg_dl = await invoke(service, 'agent', 'download_media', {
+            'url': 'https://www.bilibili.com/video/BV1tg01',
+            'notify_adapter': 'telegram',
+            'notify_target': 'tg-chat-1',
+        })
+        assert tg_dl['ok'] is True
+        tg_id = tg_dl['result']['id']
+        for _ in range(40):
+            tg_st = (await invoke(service, 'agent', 'get_task_status', {'task_id': tg_id, 'wait_seconds': 5.0}))['result']
+            if tg_st['state'] == 'READY':
+                break
+        assert tg_st['state'] == 'READY'
+        assert all(ev['server_notified'] for ev in tg_st['visualization']['pending_events'] if ev['should_reply'])
+
+        tg_deliv = await invoke(service, 'agent', 'deliver_media', {
+            'task_id': tg_id, 'adapter': 'telegram', 'target': 'tg-chat-1', 'request_key': 'deliv-tg-1',
+        })
+        assert tg_deliv['ok'] is True
+        for _ in range(40):
+            tg_d_st = (await invoke(service, 'agent', 'get_delivery_status', {'delivery_id': tg_deliv['result']['id'], 'wait_seconds': 5.0}))['result']
+            if tg_d_st['state'] == 'SENT':
+                break
+        assert tg_d_st['state'] == 'SENT'
+
+        tg_text_calls = [c for c in bot_calls if c['path'] in ('/bottg-tok/sendMessage', '/bottg-tok/editMessageText')]
+        assert tg_text_calls[0]['path'] == '/bottg-tok/sendMessage' and tg_text_calls[0]['payload']['chat_id'] == 'tg-chat-1'
+        assert any(c['path'] == '/bottg-tok/editMessageText' and c['payload'].get('message_id') for c in tg_text_calls[1:])
+        # receive + start + complete 共 3 条阶段文字推送（finish 与 deliver 不会重发第二次 complete）
+        assert len(tg_text_calls) == 3
+
+        # 3. OneBot server_bot + visual_notify_target + /api/admin/visual/test 预览与真实试发 + 报错直推 QQ
+        bot_calls.clear()
+        service.update_settings({
+            'visual_notify_channel': 'server_bot',
+            'visual_notify_target': 'onebot:group:888',
+            'visual_reuse_message': False,
+        })
+        import httpx as _httpx
+        async def _ob_texts():
+            out = []
+            for c in bot_calls:
+                if c['path'] == '/send_group_msg':
+                    msg_val = c['payload'].get('message')
+                    if isinstance(msg_val, list) and msg_val and msg_val[0].get('type') == 'text':
+                        out.append(msg_val[0]['data']['text'])
+                    elif isinstance(msg_val, str):
+                        out.append(msg_val)
+            return out
+
+        async with _httpx.AsyncClient(transport=_httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as ac:
+            test_resp = await ac.post('/api/admin/visual/test', json={})
+            assert test_resp.status_code == 200
+            test_body = test_resp.json()
+            assert set(test_body['previews'].keys()) == {'receive', 'start', 'complete', 'error'}
+            assert test_body['delivered'] and any('[测试通知]' in t for t in await _ob_texts())
+
+        bot_calls.clear()
+        service.runner = StageRunner(service.config, service.store, fail_error=AgentError('COOKIE_EXPIRED', '登录已失效请重登'))
+        ob_err = (await invoke(service, 'agent', 'download_media', {'url': 'https://www.bilibili.com/video/BV1err99'}))['result']
+        for _ in range(40):
+            ob_st = (await invoke(service, 'agent', 'get_task_status', {'task_id': ob_err['id'], 'wait_seconds': 5.0}))['result']
+            if ob_st['state'] == 'FAILED':
+                break
+        assert ob_st['state'] == 'FAILED'
+        ob_texts = await _ob_texts()
+        assert any('已收到-' in t for t in ob_texts)
+        assert any('登录已失效请重登' in t for t in ob_texts)
+
+        # 4. MCP 保持严格 23 个工具（无 ctx 参数暴露），且调用时触发 Context.report_progress
+        service.update_settings({'visual_notify_channel': 'caller_only'})
+        service.runner = StageRunner(service.config, service.store)
+        mcp_srv = create_mcp(lambda name, args: invoke(service, 'agent', name, args))
+        assert len(mcp_srv._tool_manager._tools) == 23
+        assert 'ctx' not in mcp_srv._tool_manager._tools['download_media'].parameters['properties']
+
+        reported = []
+
+        class RecordingContext:
+            async def report_progress(self, progress, total=None, message=None):
+                reported.append((progress, total, message))
+
+        mcp_dl = await mcp_srv._tool_manager.call_tool(
+            'download_media',
+            {'url': 'https://www.bilibili.com/video/BV1mcp01'},
+            context=RecordingContext(),
+        )
+        assert mcp_dl['ok'] is True
+        mcp_task_id = mcp_dl['result']['id']
+        mcp_seq = mcp_dl['result']['visualization']['latest_seq']
+        mcp_st = await mcp_srv._tool_manager.call_tool(
+            'get_task_status',
+            {'task_id': mcp_task_id, 'after_seq': mcp_seq, 'wait_seconds': 5.0},
+            context=RecordingContext(),
+        )
+        assert mcp_st['result']['state'] == 'READY'
+        assert any('已收到-' in (msg or '') for _, _, msg in reported)
+        assert any('开下-' in (msg or '') for _, _, msg in reported)
+
+        # 5. OmniBotClient 消费真实事件流并在失败时先触发 error 回调再抛出 RuntimeError
+        mod_spec = importlib.util.spec_from_file_location(
+            'test_bot_client_mod',
+            Path(__file__).resolve().parents[1] / 'examples' / 'bot_client.py',
+        )
+        bot_mod = importlib.util.module_from_spec(mod_spec)
+        mod_spec.loader.exec_module(bot_mod)
+        bot_client = bot_mod.OmniBotClient('http://127.0.0.1:58080')
+
+        async def direct_tool(name, **kwargs):
+            resp = await invoke(service, 'agent', name, kwargs)
+            if not resp['ok']:
+                err = resp['error']
+                raise RuntimeError(f"{err['code']}: {err['message']}")
+            return resp['result']
+
+        monkeypatch.setattr(bot_client, 'tool', direct_tool)
+        # 复用上方已成功落库交付的 onebot mock，只看事件流模式 (caller_only + notify_via_server=False)
+        client_events = []
+        deliv_result = await bot_client.download_and_deliver(
+            'https://www.bilibili.com/video/BV1cli01',
+            'onebot',
+            'group:888',
+            on_status=lambda stage, text: client_events.append((stage, text)),
+            notify_via_server=False,
+        )
+        assert deliv_result['state'] == 'SENT'
+        assert [st for st, _ in client_events] == ['receive', 'start', 'complete']
+
+        service.runner = StageRunner(service.config, service.store, fail_error=AgentError('MEDIA_UNAVAILABLE', '视频已下架'))
+        err_events = []
+        with pytest.raises(RuntimeError, match='视频已下架'):
+            await bot_client.download_and_deliver(
+                'https://www.bilibili.com/video/BV1cliFail',
+                'onebot',
+                'group:888',
+                on_status=lambda stage, text: err_events.append((stage, text)),
+                notify_via_server=False,
+            )
+        assert [st for st, _ in err_events] == ['receive', 'error']
+        assert '视频已下架' in err_events[-1][1]
+    finally:
+        service.stopping = True
+        dispatch_task.cancel()
+        await asyncio.gather(dispatch_task, return_exceptions=True)
+        await service.close()
+        srv.shutdown()
+        srv.server_close()
+
 
 @pytest.mark.asyncio
 async def test_android_style_explicit_reverify_manage_only_and_multi_account_profiles(service, monkeypatch):

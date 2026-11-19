@@ -56,6 +56,9 @@ class Settings(BaseModel):
     visual_on_start: bool = True
     visual_on_complete: bool = True
     visual_mode: Literal['agent', 'custom'] = 'agent'
+    visual_notify_channel: Literal['auto', 'server_bot', 'caller_only'] = 'auto'
+    visual_notify_target: str = Field('', max_length=160)
+    visual_reuse_message: bool = False
     visual_receive_template: str = Field('已收到链接（{command_summary}），正在准备解析与下载...', max_length=500)
     visual_start_template: str = Field('开始下载：{platform} · {title}', max_length=500)
     visual_complete_template: str = Field('下载完成（共 {file_count} 个文件），正在发送至 {target}...', max_length=500)
@@ -77,6 +80,17 @@ class Settings(BaseModel):
                     raise ValueError(f'{label}必须填写绝对路径')
                 if p.resolve() == Path(p.resolve().anchor):
                     raise ValueError(f'{label}不能直接使用磁盘或系统根目录')
+        if self.visual_notify_target:
+            nt = self.visual_notify_target.strip()
+            if '\x00' in nt or any(c in nt for c in '\r\n'):
+                raise ValueError('默认直发目标包含非法字符')
+            adapter, sep, target = nt.partition(':')
+            if not sep or adapter not in ('telegram', 'onebot') or not target.strip():
+                raise ValueError('默认直发目标格式须为 onebot:group:群号、onebot:private:QQ号 或 telegram:会话ID')
+            if adapter == 'onebot':
+                chat_type, sep2, num = target.partition(':')
+                if not sep2 or chat_type not in ('group', 'private') or not num.isdigit():
+                    raise ValueError('OneBot 默认直发目标格式须为 onebot:group:群号 或 onebot:private:QQ号')
         validate_proxy_url(self.proxy)
         return self
 

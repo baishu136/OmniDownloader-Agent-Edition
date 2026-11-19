@@ -1,12 +1,38 @@
 from typing import Annotated, Any, Literal
 import json
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp import types
 from pydantic import Field
 
 from . import __version__
 from .service import BotConfigUpdate, DownloadOptions, SettingsUpdate
+
+
+async def _emit_mcp_progress(ctx: Context | None, res: Any) -> None:
+    """将工具返回结果或错误中的可视化阶段事件通过 MCP 进度通知实时发出。"""
+    if ctx is None or not isinstance(res, dict):
+        return
+    payload = res.get('result') if res.get('ok') and isinstance(res.get('result'), dict) else res
+    vis = payload.get('visualization') if isinstance(payload, dict) else None
+    if not isinstance(vis, dict):
+        return
+    try:
+        events = vis.get('pending_events') or []
+        raw_prog = payload.get('progress')
+        if raw_prog is None:
+            raw_prog = (vis.get('variables') or {}).get('progress', 0)
+        prog_val = float(raw_prog or 0)
+        if events:
+            for ev in events:
+                if ev.get('should_reply') and ev.get('message'):
+                    ev_prog = 100.0 if ev.get('stage') in ('complete', 'sent') else prog_val
+                    await ctx.report_progress(ev_prog, 100.0, str(ev['message']))
+        elif vis.get('should_reply') and vis.get('message'):
+            stage_prog = 100.0 if vis.get('current_stage') in ('complete', 'sent') else prog_val
+            await ctx.report_progress(stage_prog, 100.0, str(vis['message']))
+    except Exception:
+        pass
 
 
 class ToolBoundary:
@@ -43,27 +69,49 @@ def create_mcp(invoke, on_session=None):
         middleware=[ToolBoundary(on_session=on_session)],
         instructions='No authorization token is required for local access. You may read, update and reset service settings, manage bot configurations, inspect auto-detected bridges (list_bridges), cache cleanup and approvals. '
                      'URL prefixes supported by analyze_media/download_media: "/us" (download collection, multi-part videos or all images) and "/zip" (send as a ZIP archive). '
-                     'Download visualization: task and delivery results include a "visualization" object reflecting user settings (visual_enabled, visual_on_receive, visual_on_start, visual_on_complete, visual_mode, custom templates). '
-                     'When visualization.should_reply is true: if mode=="custom", use visualization.message directly; if mode=="agent", craft an informative update from stage and metadata. When should_reply is false, omit intermediate notices for disabled stages. '
-                     'Errors: whenever any tool returns ok=false or task/delivery reaches FAILED/UNCERTAIN, ALWAYS output error_message / error.message directly to the user without hiding the failure cause. '
+                     'Download visualization & status delivery: task and delivery results include "visualization" with ordered "pending_events" (each having seq, stage, should_reply, server_notified, message), "latest_seq", and "server_notified". '
+                     'When triggering downloads for QQ / Telegram users, pass notify_adapter and notify_target (if known and permitted) so the server can push status messages immediately via the configured bot without waiting for LLM turn boundaries. '
+                     'When polling get_task_status / get_delivery_status / deliver_media, pass after_seq=visualization.latest_seq and wait_seconds=5 (up to 30) so milestone transitions return immediately without missing fast stages or cache hits. '
+                     'For every event in pending_events where should_reply is true and server_notified is false (or fallback visualization.should_reply): if mode=="custom", send event.message verbatim; if mode=="agent", craft a concise timely update. Skip stages with server_notified=true to avoid duplicates. '
+                     'Errors: whenever any tool returns ok=false or task/delivery reaches FAILED/UNCERTAIN, ALWAYS output error_detail / error_message / error.message directly to the user without hiding the failure cause. '
                      'For platform cookies, you can only inspect non-sensitive status (list_cookie_statuses), disable cookies (disable_platform_cookie) or remove cookies (remove_platform_cookie); '
                      'you cannot read cookie values, import/log in cookies, or re-enable disabled cookies. '
-                     'Downloads are asynchronous: poll get_task_status, then call deliver_media for bot delivery.',
+                     'Downloads are asynchronous: use get_task_status with wait_seconds/after_seq, then call deliver_media for bot delivery.',
     )
 
     @server.tool(structured_output=True, description='Analyze a supported public share/post/collection link (supports /us and /zip prefixes). Returns only observed metadata and real formats.')
     async def analyze_media(url: Annotated[str, Field(min_length=1, max_length=8192)], media_type: Literal['video', 'images'] = 'video') -> dict[str, Any]:
         return await invoke('analyze_media', {'url': url, 'media_type': media_type})
 
-    @server.tool(structured_output=True, description='Create an asynchronous download and return a task ID. Supports "/us" (collection/episodes/all images) and "/zip" (ZIP archive) URL prefixes. Omit options to use defaults; set use_defaults=false for explicit options.')
+    @server.tool(structured_output=True, description='Create an asynchronous download and return a task ID. Supports "/us" (collection/episodes/all images) and "/zip" (ZIP archive) URL prefixes. Optionally supply notify_adapter/notify_target to push status notifications directly via bot.')
     async def download_media(url: Annotated[str, Field(min_length=1, max_length=8192)], options: DownloadOptions | None = None,
                              request_key: Annotated[str | None, Field(max_length=128)] = None,
-                             approval_id: str | None = None) -> dict[str, Any]:
-        return await invoke('download_media', {'url': url, 'options': options.model_dump() if options else {}, 'request_key': request_key, 'approval_id': approval_id})
+                             approval_id: str | None = None,
+                             notify_adapter: Literal['telegram', 'onebot'] | None = None,
+                             notify_target: Annotated[str | None, Field(max_length=128)] = None,
+                             ctx: Context | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {'url': url, 'options': options.model_dump() if options else {}, 'request_key': request_key, 'approval_id': approval_id}
+        if notify_adapter is not None:
+            payload['notify_adapter'] = notify_adapter
+        if notify_target is not None:
+            payload['notify_target'] = notify_target
+        res = await invoke('download_media', payload)
+        await _emit_mcp_progress(ctx, res)
+        return res
 
-    @server.tool(structured_output=True, description='Get the current state, progress, speed, file count and sanitized failure code of a download task.')
-    async def get_task_status(task_id: str) -> dict[str, Any]:
-        return await invoke('get_task_status', {'task_id': task_id})
+    @server.tool(structured_output=True, description='Get task state, progress, speed, visualization pending_events and sanitized error details. Pass after_seq (from visualization.latest_seq) and wait_seconds (0-30) to block until the next milestone without missing fast transitions.')
+    async def get_task_status(task_id: str,
+                              after_seq: Annotated[int | None, Field(ge=0)] = None,
+                              wait_seconds: Annotated[float, Field(ge=0.0, le=30.0)] = 0.0,
+                              ctx: Context | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {'task_id': task_id}
+        if after_seq is not None:
+            payload['after_seq'] = after_seq
+        if wait_seconds:
+            payload['wait_seconds'] = float(wait_seconds)
+        res = await invoke('get_task_status', payload)
+        await _emit_mcp_progress(ctx, res)
+        return res
 
     @server.tool(structured_output=True, description='List tasks, optionally filtered by state.')
     async def list_tasks(state: Literal['QUEUED', 'DOWNLOADING', 'PROCESSING', 'READY', 'SENDING', 'SENT', 'FAILED', 'CLEANED', 'CANCELLED', 'EXPIRED'] | None = None,
@@ -74,12 +122,22 @@ def create_mcp(invoke, on_session=None):
     async def cancel_task(task_id: str) -> dict[str, Any]:
         return await invoke('cancel_task', {'task_id': task_id})
 
-    @server.tool(structured_output=True, description='Download a bounded 1-based range of collection episodes/media. Large/profile requests require a one-time approval_id from CONFIRMATION_REQUIRED.')
+    @server.tool(structured_output=True, description='Download a bounded 1-based range of collection episodes/media. Large/profile requests require a one-time approval_id from CONFIRMATION_REQUIRED. Optionally pass notify_adapter/notify_target for direct bot notifications.')
     async def download_collection(url: str, start: Annotated[int, Field(ge=1, le=200)] = 1,
         count: Annotated[int, Field(ge=1, le=200)] = 1, options: DownloadOptions | None = None,
-        request_key: Annotated[str | None, Field(max_length=128)] = None, approval_id: str | None = None) -> dict[str, Any]:
-        return await invoke('download_collection', {'url': url, 'start': start, 'count': count,
-            'options': options.model_dump() if options else {}, 'request_key': request_key, 'approval_id': approval_id})
+        request_key: Annotated[str | None, Field(max_length=128)] = None, approval_id: str | None = None,
+        notify_adapter: Literal['telegram', 'onebot'] | None = None,
+        notify_target: Annotated[str | None, Field(max_length=128)] = None,
+        ctx: Context | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {'url': url, 'start': start, 'count': count,
+            'options': options.model_dump() if options else {}, 'request_key': request_key, 'approval_id': approval_id}
+        if notify_adapter is not None:
+            payload['notify_adapter'] = notify_adapter
+        if notify_target is not None:
+            payload['notify_target'] = notify_target
+        res = await invoke('download_collection', payload)
+        await _emit_mcp_progress(ctx, res)
+        return res
 
     @server.tool(structured_output=True, description='Get an opaque controlled reference and SHA256 for a completed file. Accepts only a ledger file ID, never a server path.')
     async def get_media_file(file_id: str) -> dict[str, Any]:
@@ -93,21 +151,38 @@ def create_mcp(invoke, on_session=None):
     async def list_bridges() -> dict[str, Any]:
         return await invoke('list_bridges', {})
 
-    @server.tool(structured_output=True, description='Queue delivery of all completed task files to an allowed Telegram or QQ target. Honors QQ video/image message/file and forward collection settings.')
+    @server.tool(structured_output=True, description='Queue delivery of all completed task files to an allowed Telegram or QQ target. Honors QQ video/image message/file and forward collection settings. Pass after_seq to avoid repeating earlier milestones.')
     async def deliver_media(task_id: str, adapter: Literal['telegram', 'onebot'], target: str,
                             request_key: Annotated[str, Field(min_length=1, max_length=128)],
-                            kind: Literal['auto', 'video', 'audio', 'photo', 'document'] = 'auto') -> dict[str, Any]:
-        return await invoke('deliver_media', {'task_id': task_id, 'adapter': adapter, 'target': target, 'request_key': request_key, 'kind': kind})
+                            kind: Literal['auto', 'video', 'audio', 'photo', 'document'] = 'auto',
+                            after_seq: Annotated[int | None, Field(ge=0)] = None,
+                            ctx: Context | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {'task_id': task_id, 'adapter': adapter, 'target': target, 'request_key': request_key, 'kind': kind}
+        if after_seq is not None:
+            payload['after_seq'] = after_seq
+        res = await invoke('deliver_media', payload)
+        await _emit_mcp_progress(ctx, res)
+        return res
 
-    @server.tool(structured_output=True, description='Query delivery state and sanitized platform receipts.')
-    async def get_delivery_status(delivery_id: str) -> dict[str, Any]:
-        return await invoke('get_delivery_status', {'delivery_id': delivery_id})
+    @server.tool(structured_output=True, description='Query delivery state, sanitized platform receipts, and unconsumed visualization events. Supports after_seq and wait_seconds (0-30) for timely updates.')
+    async def get_delivery_status(delivery_id: str,
+                                  after_seq: Annotated[int | None, Field(ge=0)] = None,
+                                  wait_seconds: Annotated[float, Field(ge=0.0, le=30.0)] = 0.0,
+                                  ctx: Context | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {'delivery_id': delivery_id}
+        if after_seq is not None:
+            payload['after_seq'] = after_seq
+        if wait_seconds:
+            payload['wait_seconds'] = float(wait_seconds)
+        res = await invoke('get_delivery_status', payload)
+        await _emit_mcp_progress(ctx, res)
+        return res
 
     @server.tool(structured_output=True, description='Read all current download, ZIP packing, storage directories, QQ delivery mode, download visualization notification settings, feature, proxy, cache and theme settings.')
     async def get_settings() -> dict[str, Any]:
         return await invoke('get_settings', {})
 
-    @server.tool(structured_output=True, description='Update one or more service settings (including download_dir, image_dir, cache_dir, qq_*, visual_enabled, visual_on_receive, visual_on_start, visual_on_complete, visual_mode, visual_*_template, proxy, theme). Does not touch cookies.')
+    @server.tool(structured_output=True, description='Update one or more service settings (including download_dir, image_dir, cache_dir, qq_*, visual_enabled, visual_on_receive, visual_on_start, visual_on_complete, visual_mode, visual_notify_channel, visual_notify_target, visual_reuse_message, visual_*_template, proxy, theme). Does not touch cookies.')
     async def update_settings(settings: SettingsUpdate) -> dict[str, Any]:
         return await invoke('update_settings', {'settings': settings.model_dump(exclude_none=True)})
 

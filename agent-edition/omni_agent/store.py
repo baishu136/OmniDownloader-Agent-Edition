@@ -56,6 +56,18 @@ class Store:
                 expires REAL NOT NULL, approved INTEGER DEFAULT 0, used INTEGER DEFAULT 0,
                 summary TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS cleanup_log (created REAL NOT NULL, files INTEGER NOT NULL, bytes INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS visual_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                delivery_id TEXT DEFAULT '',
+                owner TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                state TEXT NOT NULL,
+                should_reply INTEGER DEFAULT 1,
+                server_notified INTEGER DEFAULT 0,
+                message TEXT NOT NULL,
+                created REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS visual_events_task_seq ON visual_events(task_id, seq);
         ''')
         self._ensure_columns()
 
@@ -111,12 +123,127 @@ class Store:
             return
         row = self.job(job_id)
         merged = self._parsed_meta(row)
-        for key in ('platform', 'title', 'author', 'media_type', 'file_count', 'command_summary', 'adapter', 'target'):
+        for key in ('platform', 'title', 'author', 'media_type', 'file_count', 'command_summary', 'adapter', 'target', 'notify_adapter', 'notify_target', 'notify_message_id'):
             val = metadata.get(key)
             if val not in (None, ''):
                 merged[key] = safe_text(val) if isinstance(val, str) else val
         raw = json.dumps(merged, ensure_ascii=False)
         self.db.execute('UPDATE jobs SET metadata=?,updated=? WHERE id=? OR source_id=?', (raw, time.time(), job_id, job_id))
+
+    def record_visual_event(
+        self,
+        job_id: str,
+        stage: str,
+        state: str,
+        *,
+        delivery_id: str = '',
+        error_code: str = '',
+        error_message: str = '',
+        once_per_stage: bool = True,
+        extra_context: dict | None = None,
+    ) -> dict | None:
+        """持久化记录关键可视化里程碑事件，确保极速下载或缓存复用时中间状态永不丢失。"""
+        row = self.db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if not row:
+            return None
+        row = dict(row)
+        if once_per_stage and stage != 'error':
+            dup = self.db.execute(
+                'SELECT 1 FROM visual_events WHERE task_id=? AND delivery_id=? AND stage=? LIMIT 1',
+                (job_id, delivery_id, stage),
+            ).fetchone()
+            if dup:
+                return None
+
+        files = self.files(job_id)
+        meta = self._parsed_meta(row)
+        if extra_context:
+            meta.update({k: v for k, v in extra_context.items() if v not in (None, '')})
+        s = self.config.settings
+        default_target = s.download_dir or '服务本地输出'
+        ctx = dict(
+            meta,
+            task_id=job_id,
+            progress=row['progress'],
+            speed=row['speed'],
+            file_count=len(files) or meta.get('file_count') or 1,
+            target=meta.get('target') or default_target,
+        )
+        vis = build_visualization(
+            s,
+            stage,
+            context=ctx,
+            error_code=error_code or row.get('error', ''),
+            error_message=error_message or row.get('error_message', ''),
+        )
+        if stage == 'error' and once_per_stage:
+            dup_err = self.db.execute(
+                "SELECT 1 FROM visual_events WHERE task_id=? AND delivery_id=? AND stage='error' AND message=? LIMIT 1",
+                (job_id, delivery_id, vis['message']),
+            ).fetchone()
+            if dup_err:
+                return None
+
+        now = time.time()
+        cur = self.db.execute(
+            '''INSERT INTO visual_events(task_id, delivery_id, owner, stage, state, should_reply, server_notified, message, created)
+               VALUES(?,?,?,?,?,?,?,?,?)''',
+            (
+                job_id,
+                delivery_id,
+                row['owner'],
+                stage,
+                state,
+                1 if vis['should_reply'] else 0,
+                0,
+                vis['message'],
+                now,
+            ),
+        )
+        return {
+            'seq': int(cur.lastrowid),
+            'task_id': job_id,
+            'delivery_id': delivery_id,
+            'stage': stage,
+            'state': state,
+            'should_reply': bool(vis['should_reply']),
+            'server_notified': False,
+            'message': vis['message'],
+            'created': now,
+        }
+
+    def mark_visual_event_notified(self, seq: int) -> None:
+        if seq:
+            self.db.execute('UPDATE visual_events SET server_notified=1 WHERE seq=?', (int(seq),))
+
+    def visual_events_for(self, job_id: str, owner: str, *, after_seq: int | None = None) -> list[dict]:
+        cursor = int(after_seq or 0)
+        rows = self.db.execute(
+            '''SELECT seq, task_id, delivery_id, stage, state, should_reply, server_notified, message, created
+               FROM visual_events WHERE task_id=? AND owner=? AND seq>? ORDER BY seq ASC''',
+            (job_id, owner, cursor),
+        ).fetchall()
+        return [
+            {
+                'seq': r['seq'],
+                'task_id': r['task_id'],
+                'delivery_id': r['delivery_id'],
+                'stage': r['stage'],
+                'state': r['state'],
+                'should_reply': bool(r['should_reply']),
+                'server_notified': bool(r['server_notified']),
+                'message': r['message'],
+                'created': r['created'],
+            }
+            for r in rows
+        ]
+
+    def latest_visual_seq(self, job_id: str, owner: str) -> int:
+        row = self.db.execute(
+            'SELECT COALESCE(MAX(seq), 0) m FROM visual_events WHERE task_id=? AND owner=?',
+            (job_id, owner),
+        ).fetchone()
+        return int(row['m']) if row else 0
 
     def update_job(self, job_id, state, progress=None, error='', speed='', error_message=None, visual_stage=None):
         err_msg = error_message if error_message is not None else ('' if not error else None)
@@ -138,7 +265,7 @@ class Store:
             raise AgentError('FILE_INVALID', '受控文件缺失或大小发生变化')
         return dict(row), path
 
-    def create_job(self, owner, payload, cache_key, request_key):
+    def create_job(self, owner, payload, cache_key, request_key, *, notify_meta: dict | None = None):
         existing = self.db.execute('SELECT * FROM jobs WHERE owner=? AND request_key=?', (owner, request_key)).fetchone()
         if existing:
             if existing['cache_key'] != cache_key: raise AgentError('IDEMPOTENCY_CONFLICT', '请求键已用于其他参数')
@@ -159,6 +286,18 @@ class Store:
         state = ('QUEUED' if source['state'] in ACTIVE else 'READY') if source else 'QUEUED'
         opts = payload.get('options') or {}
         init_meta = self._parsed_meta(dict(source)) if source else {}
+        init_meta.pop('notify_message_id', None)
+        n_meta = dict(notify_meta or {})
+        n_adapter = n_meta.get('notify_adapter') or payload.get('notify_adapter')
+        n_target = n_meta.get('notify_target') or payload.get('notify_target')
+        if n_adapter and n_target:
+            init_meta['notify_adapter'] = n_adapter
+            init_meta['notify_target'] = n_target
+            init_meta['adapter'] = 'QQ / OneBot' if n_adapter == 'onebot' else 'Telegram'
+            init_meta['target'] = n_target
+        else:
+            init_meta.pop('notify_adapter', None)
+            init_meta.pop('notify_target', None)
         init_meta['command_summary'] = summarize_command(
             cmd_all=bool(payload.get('cmd_all')),
             cmd_zip=bool(payload.get('cmd_zip')),
@@ -175,6 +314,9 @@ class Store:
             )
             if source and state == 'READY':
                 self.db.execute('INSERT INTO task_files SELECT ?,file_id FROM task_files WHERE task_id=?', (job_id, source['id']))
+            self.record_visual_event(job_id, 'receive', state)
+            if state == 'READY':
+                self.record_visual_event(job_id, 'complete', 'READY')
         return self.job(job_id), not bool(source)
 
     def finish(self, job_id, paths, metadata=None):
@@ -194,21 +336,27 @@ class Store:
                 self.db.execute('INSERT INTO task_files VALUES(?,?)', (job_id, record[0]))
             if self.job(job_id)['state'] != 'CANCELLED':
                 self.update_job(job_id, 'READY', 100, error='', error_message='', visual_stage='complete')
+                self.record_visual_event(job_id, 'complete', 'READY')
             followers = self.db.execute("SELECT id FROM jobs WHERE source_id=? AND state='QUEUED'", (job_id,)).fetchall()
             for follower in followers:
                 self.db.execute('INSERT INTO task_files SELECT ?,file_id FROM task_files WHERE task_id=?', (follower['id'], job_id))
                 self.update_job(follower['id'], 'READY', 100, error='', error_message='', visual_stage='complete')
+                self.record_visual_event(follower['id'], 'complete', 'READY')
 
     def fail(self, job_id, error, state='FAILED', error_message=''):
         clean_msg = safe_text(error_message or error)
         with self.transaction():
             self.update_job(job_id, state, error=error, error_message=clean_msg, visual_stage='error')
+            self.record_visual_event(job_id, 'error', state, error_code=error, error_message=clean_msg)
+            followers = self.db.execute("SELECT id FROM jobs WHERE source_id=? AND state='QUEUED'", (job_id,)).fetchall()
             self.db.execute(
                 "UPDATE jobs SET state=?,error=?,error_message=?,visual_stage='error',updated=? WHERE source_id=? AND state='QUEUED'",
                 (state, error, clean_msg, time.time(), job_id),
             )
+            for follower in followers:
+                self.record_visual_event(follower['id'], 'error', state, error_code=error, error_message=clean_msg)
 
-    def public_job(self, job_id, owner):
+    def public_job(self, job_id, owner, *, after_seq: int | None = None):
         row = self.job(job_id, owner)
         files = self.files(job_id)
         meta = self._parsed_meta(row)
@@ -222,12 +370,19 @@ class Store:
             file_count=len(files) or meta.get('file_count') or 1,
             target=meta.get('target') or default_target,
         )
+        stage = stage_from_task_state(row['state'])
+        pending = self.visual_events_for(row['id'], row['owner'], after_seq=after_seq)
+        latest_seq = self.latest_visual_seq(row['id'], row['owner'])
+        stage_notified = any(ev['stage'] == stage and ev['server_notified'] for ev in pending)
         vis = build_visualization(
             s,
-            stage_from_task_state(row['state']),
+            stage,
             context=ctx,
             error_code=row['error'],
             error_message=row.get('error_message', ''),
+            pending_events=pending,
+            latest_seq=latest_seq,
+            server_notified=stage_notified,
         )
         return {k: row[k] for k in ('id', 'state', 'progress', 'speed', 'error', 'created', 'updated')} | {
             'error_message': row.get('error_message', '') or row['error'],
@@ -253,6 +408,13 @@ class Store:
             self.db.execute('INSERT INTO deliveries(id,task_id,owner,adapter,target,kind,state,request_key,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?)',
                             (identifier, job_id, owner, adapter, target, kind, 'QUEUED', request_key, now, now))
             self.update_job(job_id, 'SENDING', visual_stage='complete')
+            self.record_visual_event(
+                job_id,
+                'complete',
+                'SENDING',
+                delivery_id=identifier,
+                extra_context={'adapter': 'QQ / OneBot' if adapter == 'onebot' else 'Telegram', 'target': target},
+            )
         return self.delivery(identifier, owner), True
 
     def delivery(self, identifier, owner=None):
@@ -260,7 +422,7 @@ class Store:
         if not row or owner is not None and row['owner'] != owner: raise AgentError('NOT_FOUND', '交付任务不存在')
         return dict(row)
 
-    def public_delivery(self, identifier, owner=None, *, include_receipts=True):
+    def public_delivery(self, identifier, owner=None, *, include_receipts=True, after_seq: int | None = None):
         row = self.delivery(identifier, owner)
         job = self.job(row['task_id'])
         files = self.files(row['task_id'])
@@ -278,12 +440,21 @@ class Store:
             stage = 'sent'
         else:
             stage = 'complete'
+        pending = self.visual_events_for(row['task_id'], row['owner'], after_seq=after_seq)
+        latest_seq = self.latest_visual_seq(row['task_id'], row['owner'])
+        stage_notified = any(
+            ev['stage'] == stage and ev['server_notified'] and (ev['delivery_id'] in ('', identifier))
+            for ev in pending
+        )
         vis = build_visualization(
             self.config.settings,
             stage,
             context=ctx,
             error_code=row['error'],
             error_message=row.get('error_message', ''),
+            pending_events=pending,
+            latest_seq=latest_seq,
+            server_notified=stage_notified,
         )
         result = {
             'id': row['id'],
@@ -316,7 +487,9 @@ class Store:
             if not total or count != total: raise AgentError('RECEIPT_REQUIRED', '平台回执不完整')
             self.db.execute("UPDATE deliveries SET state='SENT',error='',updated=? WHERE id=?", (time.time(), identifier))
             pending = self.db.execute("SELECT COUNT(*) FROM deliveries WHERE task_id=? AND state!='SENT'", (row['task_id'],)).fetchone()[0]
-            if not pending: self.update_job(row['task_id'], 'SENT')
+            if not pending:
+                self.update_job(row['task_id'], 'SENT')
+            self.record_visual_event(row['task_id'], 'sent', 'SENT', delivery_id=identifier)
 
     def cleanup(self, *, expired=False):
         removed, bytes_removed = 0, 0

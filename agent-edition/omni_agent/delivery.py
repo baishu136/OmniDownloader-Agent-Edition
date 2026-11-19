@@ -140,6 +140,32 @@ class TelegramAdapter(APIAdapter):
             raise AgentError('DELIVERY_UNCERTAIN', 'Telegram 回执缺少消息或匹配的会话标识')
         return {'platform': 'telegram', 'message_id': result['message_id'], 'chat_id': target}
 
+    async def send_text(self, target: str, text: str, *, message_id=None) -> dict:
+        """向已许可的 Telegram 会话发送文本状态消息，支持在已有 message_id 上原地更新。"""
+        self.check_target(target)
+        clean_text = str(text or '').strip()[:4000]
+        if not clean_text:
+            raise AgentError('INVALID_PARAMETER', '状态消息文本不能为空')
+        if message_id:
+            try:
+                edited = await self.request(
+                    '/bot' + self.config.token + '/editMessageText',
+                    json={'chat_id': target, 'message_id': message_id, 'text': clean_text},
+                )
+                if edited.get('ok') is True:
+                    res = edited.get('result') or {}
+                    return {'platform': 'telegram', 'message_id': res.get('message_id', message_id), 'chat_id': target, 'edited': True}
+            except AgentError:
+                pass
+        data = await self.request(
+            '/bot' + self.config.token + '/sendMessage',
+            json={'chat_id': target, 'text': clean_text},
+        )
+        result = data.get('result') or {}
+        if data.get('ok') is not True or not result.get('message_id'):
+            raise AgentError('BOT_REJECTED', 'Telegram 文本通知发送失败')
+        return {'platform': 'telegram', 'message_id': result['message_id'], 'chat_id': target, 'edited': False}
+
 
 class OneBotAdapter(APIAdapter):
     async def api(self, action, payload=None):
@@ -280,6 +306,24 @@ class OneBotAdapter(APIAdapter):
             'count': len(paths),
             'target': target,
             **{k: result[k] for k in ('message_id', 'id', 'res_id') if k in result},
+        }
+
+    async def send_text(self, target: str, text: str, *, message_id=None) -> dict:
+        """向已许可的 QQ 群聊或私聊发送文本状态通知（忽略 message_id 编辑要求，始终新发）。"""
+        self.check_target(target)
+        chat_type, number = self._parse_target(target)
+        clean_text = str(text or '').strip()[:4500]
+        if not clean_text:
+            raise AgentError('INVALID_PARAMETER', '状态消息文本不能为空')
+        action = 'send_group_msg' if chat_type == 'group' else 'send_private_msg'
+        id_key = 'group_id' if chat_type == 'group' else 'user_id'
+        result = await self.api(action, {id_key: number, 'message': [{'type': 'text', 'data': {'text': clean_text}}]})
+        return {
+            'platform': 'onebot',
+            'mode': 'text',
+            'target': target,
+            'edited': False,
+            **({k: result[k] for k in ('message_id', 'id') if k in result} if isinstance(result, dict) else {}),
         }
 
 

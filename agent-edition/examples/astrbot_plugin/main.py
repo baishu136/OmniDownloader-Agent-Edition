@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 
+import time
 import httpx
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
@@ -14,6 +15,8 @@ from astrbot.api.star import Context, Star, register
 class OmniAgentPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        if not hasattr(self, 'context') or self.context is None:
+            self.context = context
         self.server = os.environ.get('OMNI_AGENT_SERVER', 'http://127.0.0.1:58080').rstrip('/')
         self.identities = Path(os.environ.get('OMNI_AGENT_CHAT_IDENTITIES', 'data/omni-agent-chats.json'))
         self.bridge_id = f'astrbot-{os.getpid()}'
@@ -97,8 +100,36 @@ class OmniAgentPlugin(Star):
         text = str(vis.get('message') or '').strip()
         return text or fallback
 
+    @staticmethod
+    async def _consume_events(vis: dict | None, cursor: int | None, emitted: set[str], notify, *, defer_complete: bool = False) -> tuple[int | None, bool, bool]:
+        """消费服务端 pending_events 里程碑，返回更新后的游标、是否检测到服务端已通知、以及是否使用了事件流。"""
+        if not isinstance(vis, dict) or 'pending_events' not in vis:
+            return cursor, False, False
+        server_notified = bool(vis.get('server_notified'))
+        for ev in vis.get('pending_events') or []:
+            stage = ev.get('stage') or ''
+            if stage == 'complete' and defer_complete:
+                continue
+            if stage == 'sent':
+                continue
+            if ev.get('server_notified'):
+                server_notified = True
+                if stage and stage != 'error':
+                    emitted.add(stage)
+                continue
+            if stage != 'error' and stage in emitted:
+                continue
+            if ev.get('should_reply') and ev.get('message'):
+                await notify(str(ev['message']))
+                if stage and stage != 'error':
+                    emitted.add(stage)
+        latest = vis.get('latest_seq')
+        if isinstance(latest, int) and (cursor is None or latest > cursor):
+            cursor = latest
+        return cursor, server_notified, True
+
     async def process(self, event, url, download_type, approval_id=None, *, emit=None):
-        """执行下载与交付全流程，严格按服务端可视化配置向对话推送阶段状态，出错时直接输出报错详情。"""
+        """执行下载与交付全流程：优先依赖事件流游标与长轮询，防止极速下载与缓存复用丢阶段，出错时直接输出报错详情。"""
         async def _notify(text: str):
             if text and emit:
                 await emit(text)
@@ -109,68 +140,109 @@ class OmniAgentPlugin(Star):
         options = {} if download_type == 'default' else {'use_defaults': False, 'download_type': download_type}
 
         try:
-            job = await self.call('download_media', url=url, options=options, request_key=key, approval_id=approval_id)
+            job = await self.call(
+                'download_media',
+                url=url,
+                options=options,
+                request_key=key,
+                approval_id=approval_id,
+                notify_adapter=route['adapter'],
+                notify_target=route['target'],
+            )
         except Exception as exc:
             err_msg = str(exc)
             await _notify(err_msg)
             return err_msg
 
-        # 1. 发送/收到链接时状态
-        if job.get('state') == 'QUEUED':
-            await _notify(self._stage_text(job.get('visualization'), 'receive', '已收到链接，正在准备解析与下载...'))
+        cursor: int | None = None
+        emitted_stages: set[str] = set()
+        job_vis = job.get('visualization') or {}
 
-        sent_start = False
-        wait_meta_ticks = 0
-        final_status = None
-        for _ in range(7200):
-            state = await self.call('get_task_status', task_id=job['id'])
-            vis = state.get('visualization') or {}
-            st = state['state']
+        # 1. 发送/收到链接时状态（无论排队或缓存秒命中均不丢失 receive）
+        cursor, _, used_events = await self._consume_events(job_vis, cursor, emitted_stages, _notify, defer_complete=True)
+        if not used_events and job.get('state') in ('QUEUED', 'READY') and 'receive' not in emitted_stages:
+            await _notify(self._stage_text(job_vis, 'receive', '已收到链接，正在准备解析与下载...'))
+            emitted_stages.add('receive')
 
-            if st in ('DOWNLOADING', 'PROCESSING') and not sent_start:
-                has_title = bool((state.get('metadata') or {}).get('title'))
-                if has_title or wait_meta_ticks >= 2:
-                    sent_start = True
+        final_status = job if job.get('state') == 'READY' else None
+        if final_status is None:
+            prev_st = job.get('state')
+            for _ in range(1500):
+                t0 = time.monotonic()
+                call_args = {'task_id': job['id'], 'wait_seconds': 5.0}
+                if cursor is not None:
+                    call_args['after_seq'] = cursor
+                state = await self.call('get_task_status', **call_args)
+                vis = state.get('visualization') or {}
+                st = state['state']
+
+                prev_cursor = cursor
+                cursor, err_server_notified, used_events = await self._consume_events(
+                    vis, cursor, emitted_stages, _notify, defer_complete=True
+                )
+                if not used_events and st in ('DOWNLOADING', 'PROCESSING') and 'start' not in emitted_stages:
+                    emitted_stages.add('start')
                     await _notify(self._stage_text(vis, 'start', '开始下载媒体...'))
-                else:
-                    wait_meta_ticks += 1
 
-            if st == 'READY':
-                final_status = state
-                break
-            if st in ('FAILED', 'CANCELLED', 'EXPIRED'):
-                err_msg = state.get('error_message') or vis.get('error_detail') or state.get('error') or '下载失败'
-                await _notify(err_msg)
-                return err_msg
-            if st in ('SENT', 'CLEANED'):
-                return '这条消息的媒体已经交付'
-            await asyncio.sleep(1)
-        else:
-            timeout_msg = '等待超时，任务仍可通过管理页和 MCP 查询：' + job['id']
-            await _notify(timeout_msg)
-            return timeout_msg
+                if st == 'READY':
+                    final_status = state
+                    break
+                if st in ('FAILED', 'CANCELLED', 'EXPIRED'):
+                    err_msg = state.get('error_message') or vis.get('error_detail') or state.get('error') or '下载失败'
+                    if not err_server_notified and (not used_events or cursor == prev_cursor):
+                        await _notify(err_msg)
+                    return err_msg
+                if st in ('SENT', 'CLEANED'):
+                    return '这条消息的媒体已经交付'
 
-        delivery = await self.call(
-            'deliver_media',
-            task_id=job['id'],
-            adapter=route['adapter'],
-            target=route['target'],
-            request_key=key + '-send',
-        )
+                if time.monotonic() - t0 < 0.2 and st == prev_st and cursor == prev_cursor:
+                    await asyncio.sleep(0.2)
+                prev_st = st
+            else:
+                timeout_msg = '等待超时，任务仍可通过管理页和 MCP 查询：' + job['id']
+                await _notify(timeout_msg)
+                return timeout_msg
+
+        deliver_args = {
+            'task_id': job['id'],
+            'adapter': route['adapter'],
+            'target': route['target'],
+            'request_key': key + '-send',
+        }
+        if cursor is not None:
+            deliver_args['after_seq'] = cursor
+        delivery = await self.call('deliver_media', **deliver_args)
+
         # 3. 下载完成时（正在发送）
         d_vis = delivery.get('visualization') or {}
-        if d_vis.get('stages', {}).get('complete'):
+        cursor, _, used_events = await self._consume_events(d_vis, cursor, emitted_stages, _notify, defer_complete=False)
+        if not used_events and 'complete' not in emitted_stages and d_vis.get('stages', {}).get('complete'):
+            emitted_stages.add('complete')
             await _notify(self._stage_text(d_vis, 'complete', f"下载完成（共 {final_status.get('file_count', 1)} 个文件），正在发送..."))
 
-        for _ in range(300):
-            d_state = await self.call('get_delivery_status', delivery_id=delivery['id'])
-            if d_state['state'] == 'SENT':
+        prev_d_st = delivery.get('state')
+        for _ in range(120):
+            t0 = time.monotonic()
+            d_args = {'delivery_id': delivery['id'], 'wait_seconds': 5.0}
+            if cursor is not None:
+                d_args['after_seq'] = cursor
+            d_state = await self.call('get_delivery_status', **d_args)
+            d_s_vis = d_state.get('visualization') or {}
+            prev_cursor = cursor
+            cursor, err_server_notified, d_used_events = await self._consume_events(
+                d_s_vis, cursor, emitted_stages, _notify, defer_complete=False
+            )
+            dst = d_state['state']
+            if dst == 'SENT':
                 return '媒体已发送完成（交付编号：' + delivery['id'] + '）。'
-            if d_state['state'] in ('FAILED', 'UNCERTAIN'):
-                err_msg = d_state.get('error_message') or d_state.get('error') or '媒体发送失败'
-                await _notify(err_msg)
+            if dst in ('FAILED', 'UNCERTAIN'):
+                err_msg = d_state.get('error_message') or d_s_vis.get('error_detail') or d_state.get('error') or '媒体发送失败'
+                if not err_server_notified and (not d_used_events or cursor == prev_cursor):
+                    await _notify(err_msg)
                 return err_msg
-            await asyncio.sleep(1)
+            if time.monotonic() - t0 < 0.2 and dst == prev_d_st and cursor == prev_cursor:
+                await asyncio.sleep(0.2)
+            prev_d_st = dst
         return '媒体已进入发送队列（交付编号：' + delivery['id'] + '），请留意聊天消息。'
 
     async def _run_command(self, event: AstrMessageEvent, url: str, approval_id: str):
@@ -230,9 +302,18 @@ class OmniAgentPlugin(Star):
 
         async def _emit(msg: str):
             logs.append(msg)
+            chain = event.plain_result(msg)
+            ctx = getattr(self, 'context', None)
+            if ctx is not None and hasattr(ctx, 'send_message'):
+                try:
+                    sent = await ctx.send_message(event.unified_msg_origin, chain)
+                    if sent is not False:
+                        return
+                except Exception:
+                    pass
             if hasattr(event, 'send'):
                 try:
-                    await event.send(event.plain_result(msg))
+                    await event.send(chain)
                 except Exception:
                     pass
 
