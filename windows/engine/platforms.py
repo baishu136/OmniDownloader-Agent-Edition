@@ -185,7 +185,7 @@ class PlatformEngine:
             formats, urls = [f for f, _ in pairs], [u for _, u in pairs]
         generation = sessions.status(site)['generation']
         cls._sources[raw] = {'urls': urls, 'formats': formats, 'site': site, 'frames': frames,
-                             'id': identifier, 'generation': generation, 'created': time.monotonic()}
+                             'thumbnail': thumbnail, 'id': identifier, 'generation': generation, 'created': time.monotonic()}
         return VideoMetadata(url=raw, title=title, author=author, thumbnailUrl=thumbnail, siteName=site,
                              availableVideoFormats=formats, mediaId=identifier,
                              qualityWarning=result.get('quality_warning', '') if site == '抖音' else '',
@@ -221,7 +221,9 @@ class PlatformEngine:
             intent = task.quality_selection.model_dump(by_alias=True) if task.quality_selection else {}
             exact = fid if fid not in ('', 'best') else ''
             selected = choose(candidates, intent, exact)
-            info = {'id': snapshot['id'], 'title': task.title, 'webpage_url': task.url, 'extractor': 'NativeSnapshot', 'formats': candidates}
+            info = {'id': snapshot['id'], 'title': task.title, 'webpage_url': task.url,
+                    'thumbnail': task.thumbnail_url or snapshot.get('thumbnail') or '',
+                    'extractor': 'NativeSnapshot', 'formats': candidates}
             if '.m3u8' in selected['url']:
                 # Enumerate a master manifest instead of handing it to a segment downloader as a media playlist.
                 import yt_dlp

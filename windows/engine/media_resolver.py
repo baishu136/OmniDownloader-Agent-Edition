@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import sys
 import time
-from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -27,7 +27,8 @@ from urllib3.exceptions import HTTPError as Urllib3HttpError
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
 DOMAINS = {'抖音': ('douyin.com', 'iesdouyin.com'), '小红书': ('xiaohongshu.com', 'xhslink.cn', 'xhslink.com'),
            'Pixiv': ('pixiv.net',), 'X (Twitter)': ('x.com', 'twitter.com'), 'Pinterest': ('pinterest.com', 'pin.it'),
-           '快手': ('kuaishou.com', 'chenzhongtech.com'), '哔哩哔哩': ('bilibili.com', 'b23.tv')}
+           '快手': ('kuaishou.com', 'chenzhongtech.com'), '哔哩哔哩': ('bilibili.com', 'b23.tv'),
+           'TikTok': ('tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com')}
 MAX_IMAGES = 200
 
 
@@ -131,7 +132,8 @@ def content_id(url, platform):
     pattern = {'抖音': r'/(?:video|note)/(\d+)', 'Pixiv': r'/artworks/(\d+)',
                '小红书': r'/(?:explore|discovery/item|item)/([a-zA-Z0-9]+)',
                'X (Twitter)': r'/status/(\d+)', 'Pinterest': r'/pin/(?:[^/]*--)?(\d+)',
-               '快手': r'/(?:short-video|photo)/([a-zA-Z0-9]+)', '哔哩哔哩': r'/(?:opus/)?(\d+)'}[platform]
+               '快手': r'/(?:short-video|photo)/([a-zA-Z0-9]+)', '哔哩哔哩': r'/(?:opus/)?(\d+)',
+               'TikTok': r'/(?:photo|video)/(\d+)'}[platform]
     match = re.search(pattern, path)
     if match: return match[1]
     if platform == '抖音': return (parse_qs(urlsplit(url).query).get('modal_id') or [''])[0]
@@ -145,7 +147,8 @@ def resource(url, post_id, platform, width=0, height=0, original=False, identifi
     identity = identifier or hashlib.sha256(suffix.encode()).hexdigest()[:20]
     referer = {'Pixiv': 'https://www.pixiv.net/', '小红书': 'https://www.xiaohongshu.com/',
                '抖音': 'https://www.douyin.com/', 'X (Twitter)': 'https://x.com/', 'Pinterest': 'https://www.pinterest.com/',
-               '快手': 'https://www.kuaishou.com/', '哔哩哔哩': 'https://www.bilibili.com/'}[platform]
+               '快手': 'https://www.kuaishou.com/', '哔哩哔哩': 'https://www.bilibili.com/',
+               'TikTok': 'https://www.tiktok.com/'}[platform]
     return {'id': f'{post_id}:{identity}', 'url': url, 'width': int(width or 0), 'height': int(height or 0),
             'original': bool(original), 'watermark': 'SERVER_ORIGINAL' if original else 'UNCONFIRMED', 'headers': {'Referer': referer}}
 
@@ -889,8 +892,45 @@ def resolve_pinterest(url, cookie_file, proxy):
     return response.url, identifier, data.get('title') or data.get('grid_title') or identifier, (data.get('closeup_attribution') or {}).get('full_name') or '', resources
 
 
+def resolve_tiktok_images(client, url):
+    """解析 TikTok 图文作品（Photo Mode）并返回原图列表。"""
+    client.headers['User-Agent'] = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+    canonical = url
+    host = (urlsplit(url).hostname or '').lower()
+    if host in ('vm.tiktok.com', 'vt.tiktok.com'):
+        head_resp = client.head(url, allow_redirects=True, timeout=(10, 15))
+        canonical = head_resp.url or url
+        final_host = (urlsplit(canonical).hostname or '').lower()
+        if not any(final_host == d or final_host.endswith('.' + d) for d in DOMAINS['TikTok']):
+            raise MediaError('MEDIA_ID_MISMATCH', 'TikTok 短链接跳转到了非平台页面')
+    api_url = f'https://www.tikwm.com/api/?url={quote(canonical, safe="")}&hd=1'
+    resp = client.get(api_url, timeout=(12, 20))
+    check_response(resp)
+    payload = resp.json()
+    if payload.get('code') != 0:
+        raise MediaError('MEDIA_UNCONFIRMED', 'TikTok 图文接口未返回有效作品数据')
+    data = payload.get('data') or {}
+    req_id = content_id(canonical, 'TikTok')
+    actual_id = str(data.get('id') or '').strip()
+    if req_id and actual_id and req_id != actual_id:
+        raise MediaError('MEDIA_ID_MISMATCH', 'TikTok 接口返回了其他作品ID')
+    identifier = actual_id or req_id or hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    resources = [
+        r for r in (
+            resource(img_url, identifier, 'TikTok', 0, 0, True, f'p{idx}')
+            for idx, img_url in enumerate(data.get('images') or [])
+            if isinstance(img_url, str)
+        ) if r
+    ]
+    if not resources:
+        raise MediaError('NO_MEDIA', '该 TikTok 作品不包含可导出的图文图片')
+    title = str(data.get('title') or '').strip() or f'TikTok图文_{identifier}'
+    author = str((data.get('author') or {}).get('nickname') or '').strip()
+    return canonical, identifier, title, author, resources
+
+
 def resolve_images(url, platform, cookie_file=None, proxy=''):
-    if platform not in DOMAINS: raise MediaError('NO_MEDIA', '图文页支持抖音、快手、B站动态、Pixiv、小红书、X、Pinterest')
+    if platform not in DOMAINS: raise MediaError('NO_MEDIA', '图文页支持抖音、快手、B站动态、Pixiv、小红书、X、Pinterest、TikTok')
     client = session(cookie_file, proxy)
     route = 'native'
     if platform == 'Pixiv': values = resolve_pixiv(client, url)
@@ -899,6 +939,7 @@ def resolve_images(url, platform, cookie_file=None, proxy=''):
     elif platform == 'Pinterest': values = resolve_pinterest(url, cookie_file, proxy)
     elif platform == '快手': values = resolve_kuaishou_images(client, url)
     elif platform == '哔哩哔哩': values = resolve_bilibili_images(client, url)
+    elif platform == 'TikTok': values = resolve_tiktok_images(client, url)
     else:
         values = resolve_twitter_images(url, cookie_file, proxy)
         route = values[-1]; values = values[:-1]

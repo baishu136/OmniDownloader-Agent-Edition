@@ -445,3 +445,64 @@ async def test_image_format_conversion_preserves_animated_gif_and_updates_zip_ma
         assert entry1['file'] == 'p1.png'
         assert entry1['bytes'] == len(zf.read('p1.png'))
         assert entry1['sha256'] == hashlib.sha256(zf.read('p1.png')).hexdigest()
+
+
+async def test_tiktok_photo_route_and_image_in_mp4_guard(tmp_path, monkeypatch):
+    from pathlib import Path
+    from PIL import Image
+    import pytest
+    monkeypatch.setattr('omni_agent.worker.install_network_guard', lambda *args: None)
+    monkeypatch.setattr('omni_agent.worker.validate_url', lambda url, **kw: url)
+    from engine.images import ImageEngine
+    from engine.tiktok_extractor import TikTokDirectExtractor
+    from engine.url_sniffer import UrlSniffer
+    from omni_agent.worker import execute, validate_output
+
+    tt_photo_url = 'https://www.tiktok.com/@demo/photo/7123456789'
+    monkeypatch.setattr(UrlSniffer, 'sanitize_and_resolve_url', AsyncMock(return_value=tt_photo_url))
+    monkeypatch.setattr(ImageEngine, 'extract', AsyncMock(return_value={
+        'platform': 'TikTok',
+        'url': tt_photo_url,
+        'contentId': '7123456789',
+        'title': 'TikTok图集测试',
+        'author': 'demo',
+        'resources': [{'id': '7123456789:p0', 'url': 'https://img.invalid/1.jpg', 'headers': {}, 'watermark': 'SERVER_ORIGINAL'}],
+    }))
+
+    async def fake_tt_img_dl(task, progress, cancel):
+        from core.config import config
+        out = Path(config.download_dir) / f'{task.id}.jpg'
+        Image.new('RGB', (10, 10), 'teal').save(out, format='JPEG')
+        return str(out)
+
+    monkeypatch.setattr(ImageEngine, 'download', fake_tt_img_dl)
+
+    async def fail_if_video(*args, **kwargs):
+        raise AssertionError('TikTok /photo/ 链接不得进入视频提取通道')
+
+    monkeypatch.setattr(TikTokDirectExtractor, 'extract', fail_if_video)
+
+    events = []
+    await execute({
+        'action': 'download',
+        'url': tt_photo_url,
+        'all_items': False,
+        'allow_images': True,
+        'max_items': 20,
+        'state': str(tmp_path / 'w_tt'),
+        'data': str(tmp_path / 'd_tt'),
+        'max_file_bytes': 1024**2,
+        'options': {'download_type': 'VIDEO_WITH_AUDIO', 'height': 1080, 'container': 'mp4', 'audio_format': 'mp3', 'pack_zip': False},
+    }, events.append)
+    res = events[-1]['result']
+    assert res['metadata']['media_type'] == 'images'
+    assert res['paths'][0].endswith('.jpg')
+
+    # 若视频任务写入扩展名为 .mp4 但实际字节为 JPEG 图片的文件，validate_output 必须拒收
+    from omni_agent.errors import AgentError
+    out_dir = tmp_path / 'w_tt' / 'output'
+    disguised = out_dir / 'disguised.mp4'
+    disguised.write_bytes(Path(res['paths'][0]).read_bytes())
+    with pytest.raises(AgentError) as exc_info:
+        validate_output(str(disguised), tmp_path / 'w_tt', {'height': 1080, 'download_type': 'VIDEO_WITH_AUDIO'}, 1024**2)
+    assert exc_info.value.code == 'FILE_INVALID'

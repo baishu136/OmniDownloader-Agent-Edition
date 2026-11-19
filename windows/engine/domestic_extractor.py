@@ -80,6 +80,8 @@ class DomesticDirectExtractor:
 
         if not target_item:
             raise RuntimeError("未能获取到抖音视频数据，请尝试通用引擎")
+        if target_item.get("images") or (target_item.get("image_post_info") or {}).get("images"):
+            raise RuntimeError("[NO_MEDIA] 这是抖音图文作品，不适用视频导出")
 
         title = target_item.get("desc", f"抖音视频_{video_id}").strip() or f"抖音视频_{video_id}"
         author = target_item.get("author", {}).get("nickname", "抖音创作者")
@@ -212,25 +214,33 @@ class DomesticDirectExtractor:
         staging_dir = download_dir / ".staging"
         staging_dir.mkdir(parents=True, exist_ok=True)
 
+        # 0. 仅保存封面
+        if task.download_type == DownloadType.COVER:
+            cover_url = task.thumbnail_url
+            if not cover_url:
+                meta = await cls.extract(task.url, task.title)
+                cover_url = meta.thumbnail_url
+            if not cover_url:
+                raise RuntimeError("[NO_MEDIA] 未获取到作品封面地址")
+            on_progress(20.0, "", "正在下载封面图片...", TaskStatus.DOWNLOADING)
+            resp = await asyncio.to_thread(requests.get, cover_url, headers={"User-Agent": DESKTOP_UA}, timeout=15)
+            resp.raise_for_status()
+            from engine.media_resolver import image_extension
+            ext = image_extension(resp.content[:64])
+            dest = download_dir / f"{clean_title}_cover.{ext}"
+            with open(dest, "wb") as f:
+                f.write(resp.content)
+            on_progress(100.0, "", "封面保存成功", TaskStatus.COMPLETED)
+            return str(dest)
+
         video_url = task.selected_resolution if task.selected_resolution.startswith("http") else ""
         if not video_url:
             # 重新 extract 直链
             meta = await cls.extract(task.url, task.title)
             video_url = meta.available_video_formats[0].format_id if meta.available_video_formats else ""
 
-        if not video_url and task.download_type != DownloadType.COVER:
+        if not video_url:
             raise RuntimeError("未获取到有效播放直链")
-
-        # 0. 仅保存封面
-        if task.download_type == DownloadType.COVER:
-            cover_url = task.thumbnail_url or task.url
-            dest = download_dir / f"{clean_title}_cover.jpg"
-            on_progress(20.0, "", "正在下载封面图片...", TaskStatus.DOWNLOADING)
-            resp = await asyncio.to_thread(requests.get, cover_url, headers={"User-Agent": DESKTOP_UA}, timeout=15)
-            with open(dest, "wb") as f:
-                f.write(resp.content)
-            on_progress(100.0, "", "封面保存成功", TaskStatus.COMPLETED)
-            return str(dest)
 
         temp_file = staging_dir / f"domestic_{task.id}.mp4"
         headers = {"User-Agent": MOBILE_UA}

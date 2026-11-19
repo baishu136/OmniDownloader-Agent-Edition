@@ -116,6 +116,15 @@ def test_homepage_detection(url):
     assert is_profile(url)
 
 
+@pytest.mark.parametrize('url', [
+    'https://www.tiktok.com/@example/photo/7123456789',
+    'https://www.tiktok.com/@example/video/7123456789',
+    'https://x.com/u/status/12345',
+])
+def test_single_post_urls_not_flagged_as_profile(url):
+    assert not is_profile(url)
+
+
 def test_share_text_and_forged_host():
     assert source_url('看看这个 https://www.bilibili.com/video/BV17x411w7KC。') == 'https://www.bilibili.com/video/BV17x411w7KC'
     with pytest.raises(AgentError):

@@ -28,6 +28,8 @@ def parse_page(text, url):
         if not isinstance(source, str): return False
         p = urlsplit(source)
         return p.scheme in ('https', 'http') and p.hostname and not p.username
+    def is_image_url(source):
+        return urlsplit(source).path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.avif', '.bmp', '.gif'))
     formats = []
     def append(manifest, codec):
         for adaptation in manifest.get('adaptationSet') or []:
@@ -43,8 +45,15 @@ def parse_page(text, url):
     append(unwrap(photo.get('manifest')), 'h264')
     append(unwrap(photo.get('manifestH265')), 'hevc')
     if not formats:
-        formats = [dict(url=photo[key], width=0, height=0, fps=0, vcodec='unknown')
-                   for key in ('photoUrl', 'photoH265Url') if valid(photo.get(key))]
+        ext_params = unwrap(photo.get('ext_params'))
+        atlas = unwrap(photo.get('atlas')) or unwrap(ext_params.get('atlas'))
+        if (atlas.get('list') if isinstance(atlas, dict) else None) or str(photo.get('photoType') or '').upper() in ('ATLAS', 'PICTURE', 'IMAGE'):
+            raise RuntimeError('[NO_MEDIA] 这是快手图集作品，不适用视频导出')
+        candidates = [photo[key] for key in ('photoUrl', 'photoH265Url') if valid(photo.get(key))]
+        video_candidates = [u for u in candidates if not is_image_url(u)]
+        if candidates and not video_candidates:
+            raise RuntimeError('[NO_MEDIA] 这是快手图集作品，不适用视频导出')
+        formats = [dict(url=u, width=0, height=0, fps=0, vcodec='unknown') for u in video_candidates]
     if not formats: raise RuntimeError('[BROWSER_ASSIST_REQUIRED] 目标作品未返回媒体，请在浏览器播放后捕获')
     return dict(id=identifier, title=photo.get('caption') or identifier, thumbnail=photo.get('coverUrl') or '',
                 duration_ms=int(photo.get('duration') or 0), formats=formats)

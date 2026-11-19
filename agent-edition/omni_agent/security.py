@@ -106,13 +106,13 @@ def is_profile(url):
     # 识别常见用户主页/频道/搜索/动态链接形式（含 URL 编码路径）
     from urllib.parse import unquote
     path = unquote(path)
+    if host.endswith(('x.com', 'twitter.com')):
+        return not re.search(r'/status/\d+', path)
+    if host.endswith(('youtube.com', 'tiktok.com')) and '/@' in path:
+        return not re.search(r'/(video|photo|shorts|watch)/', path)
     if re.search(r'/(?:user|users|u|channel|channels|profile|search|feed|home|space)(?:/|$)', path, re.I):
         return True
     if host.endswith('bilibili.com') and host.startswith('space.'):
-        return True
-    if host.endswith(('x.com', 'twitter.com')) and not re.search(r'/status/\d+', path):
-        return True
-    if host.endswith(('youtube.com', 'tiktok.com')) and '/@' in path and not re.search(r'/(video|shorts|watch)/', path):
         return True
     if host.endswith('instagram.com') and not re.search(r'/(p|reel|reels|tv)/', path):
         return True

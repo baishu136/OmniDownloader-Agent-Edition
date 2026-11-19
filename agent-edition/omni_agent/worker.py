@@ -15,11 +15,12 @@ from .credentials import Vault
 from .errors import AgentError, safe_text
 from .security import controlled, install_network_guard, is_profile, source_url, validate_url
 
-_IMAGE_PLATFORMS = {'抖音', '快手', '哔哩哔哩', 'Pixiv', '小红书', 'X (Twitter)', 'Pinterest'}
+_IMAGE_PLATFORMS = {'抖音', '快手', '哔哩哔哩', 'Pixiv', '小红书', 'X (Twitter)', 'Pinterest', 'TikTok'}
 _IMAGE_FALLBACK_HINTS = (
     'NO_MEDIA',
     'MEDIA_UNCONFIRMED',
     '图文',
+    '图集',
     'no video could be found',
     '未取得笔记视频',
     '图片/漫画',
@@ -30,13 +31,15 @@ _IMAGE_FALLBACK_HINTS = (
 
 
 def _is_explicit_image_url(url: str, site: str) -> bool:
-    """识别无需先走视频提取的明确图文链接（如抖音图文 /note/、B 站动态图文 /opus/）。"""
+    """识别无需先走视频提取的明确图文链接（如抖音图文 /note/、B 站动态图文 /opus/、TikTok 图文 /photo/）。"""
     parts = urlsplit(url)
     host = (parts.hostname or '').lower()
     path = (parts.path or '').lower()
     if site == '抖音' and '/note/' in path:
         return True
     if site == '哔哩哔哩' and (host == 't.bilibili.com' or '/opus/' in path or '/dynamic/' in path):
+        return True
+    if site == 'TikTok' and '/photo/' in path:
         return True
     return False
 
@@ -406,9 +409,9 @@ async def execute(request, emit):
             raise AgentError('INVALID_RANGE', '指定范围没有图片')
         core_download_type = DownloadType.IMAGE_ZIP if pack_zip else DownloadType.IMAGE
         if pack_zip:
-            items = [(url, post['title'], [r['id'] for r in selected])]
+            items = [(url, post['title'], [r['id'] for r in selected], '')]
         else:
-            items = [(url, f'{post["title"]}_{idx + 1}' if len(selected) > 1 else post['title'], [resource['id']])
+            items = [(url, f'{post["title"]}_{idx + 1}' if len(selected) > 1 else post['title'], [resource['id']], '')
                      for idx, resource in enumerate(selected)]
     else:
         if action == 'collection':
@@ -425,15 +428,19 @@ async def execute(request, emit):
                 raise AgentError('COLLECTION_REQUIRED', '此链接包含多个媒体，请使用 download_collection 或在链接前加 /us 指令')
             chosen = [meta]
         core_download_type = DownloadType(options['download_type'])
-        items = [(item.url, item.title, []) for item in chosen]
+        items = [
+            (item.url, item.title, [], getattr(item, 'thumbnail_url', '') or getattr(meta, 'thumbnail_url', '') or '')
+            for item in chosen
+        ]
     emit({'kind': 'metadata', 'metadata': metadata})
     paths = []
-    for index, (item_url, title, image_ids) in enumerate(items):
+    for index, (item_url, title, image_ids, thumb_url) in enumerate(items):
         validate_url(item_url, initial=True, using_proxy=using_proxy)
         task = await task_manager.add_task(
             url=item_url,
             title=title or ('media-' + str(index + 1)),
             download_type=core_download_type,
+            thumbnail_url=thumb_url,
             audio_format=AudioFormat(options['audio_format']),
             quality_selection=QualitySelection(mode='MAX_HEIGHT', maxHeight=options['height'],
                                                container=options['container'], allowLowerQuality=True),
@@ -464,6 +471,7 @@ async def execute(request, emit):
 
 
 def validate_output(name, root, options, maximum):
+    from .delivery import IMAGE_EXTENSIONS, _magic_media_kind
     from .security import controlled
     path = controlled(root / 'output', name)
     if not path.is_file() or not 0 < path.stat().st_size <= maximum:
@@ -473,11 +481,13 @@ def validate_output(name, root, options, maximum):
         with zipfile.ZipFile(path) as archive:
             if sum(i.file_size for i in archive.infolist()) > maximum * 4 or archive.testzip():
                 raise AgentError('FILE_INVALID', '压缩包超过限制或校验失败')
-    elif suffix in ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif'):
+    elif suffix in IMAGE_EXTENSIONS:
         from PIL import Image
         with Image.open(path) as image:
             image.verify()
     else:
+        if options.get('download_type') == 'COVER' or _magic_media_kind(path) in ('photo', 'animation'):
+            raise AgentError('FILE_INVALID', '媒体成品类型与实际文件内容不匹配，拒绝作为音视频输出')
         from engine.media_verifier import probe
         actual = probe(path)
         if not actual['width'] and not actual['audio']:

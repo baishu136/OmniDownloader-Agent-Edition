@@ -170,3 +170,39 @@ async def test_telegram_probe_returns_bot_identity():
     })))
     info = await bot.probe()
     assert info['connected'] is True and info['username'] == 'omni_dl_bot' and info['bot_id'] == 555
+
+
+async def test_image_files_never_route_to_video_send_even_with_video_kind(tmp_path):
+    from PIL import Image
+
+    jpg = tmp_path / 'photo.jpg'
+    Image.new('RGB', (6, 4), 'red').save(jpg, format='JPEG')
+    webp = tmp_path / 'photo.webp'
+    Image.new('RGB', (8, 12), 'blue').save(webp, format='WEBP')
+    gif = tmp_path / 'anim.gif'
+    Image.new('RGB', (4, 4), 'green').save(gif, format='GIF', save_all=True, append_images=[Image.new('RGB', (4, 4), 'yellow')], duration=80)
+    archive = tmp_path / 'bundle.zip'
+    archive.write_bytes(b'PK\x03\x04fake-zip')
+    misnamed_mp4 = tmp_path / 'fake_video.mp4'
+    misnamed_mp4.write_bytes(jpg.read_bytes())
+
+    methods = []
+
+    async def handler(request):
+        methods.append(request.url.path.rsplit('/', 1)[-1])
+        return httpx.Response(200, json={'ok': True, 'result': {'message_id': 700 + len(methods), 'chat': {'id': 123}}})
+
+    tg = TelegramAdapter(telegram(), httpx.MockTransport(handler))
+    await tg.send(jpg, '123', 'video')
+    await tg.send(webp, '123', 'video')
+    await tg.send(gif, '123', 'video')
+    await tg.send(archive, '123', 'video')
+    await tg.send(misnamed_mp4, '123', 'video')
+    assert methods == ['sendPhoto', 'sendPhoto', 'sendAnimation', 'sendDocument', 'sendPhoto']
+
+    # OneBot 对 .jfif 与魔数为图片的错标 .mp4 均归类为 image 而非 video
+    jfif = tmp_path / 'pic.jfif'
+    jfif.write_bytes(jpg.read_bytes())
+    assert OneBotAdapter.media_category(jfif) == 'image'
+    assert OneBotAdapter.media_category(misnamed_mp4) == 'image'
+    assert OneBotAdapter.media_category(archive) == 'file'

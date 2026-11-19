@@ -31,7 +31,7 @@ from .cookie_login import (
     resolve_local_browser,
 )
 from .credentials import Vault
-from .delivery import BotConfig, IMAGE_EXTENSIONS, make_adapter
+from .delivery import BotConfig, IMAGE_EXTENSIONS, detect_media_kind, make_adapter
 from .errors import AgentError, safe_text
 from .runner import Runner
 from .security import is_profile, parse_download_commands, source_url
@@ -1268,6 +1268,21 @@ class Service:
             job_title = str(job_meta.get('title') or '').strip()
             forward_limit = max(2, min(100, int(getattr(s, 'qq_forward_max_items', 30) or 30)))
 
+            async def _send_single(record: dict, path: Path) -> None:
+                effective_kind = row['kind']
+                if effective_kind != 'document':
+                    detected = detect_media_kind(path)
+                    if detected and detected != effective_kind:
+                        effective_kind = 'auto'
+                receipt = await adapter.send(
+                    path,
+                    row['target'],
+                    effective_kind,
+                    video_mode=s.qq_video_mode,
+                    image_mode=s.qq_image_mode,
+                )
+                self.store.receipt(identifier, record['id'], receipt)
+
             if row['adapter'] == 'onebot' and (cmd_merge or (s.qq_forward_collection and row['kind'] != 'document')):
                 forwardable = [(rec, p) for rec, p in pending if p.suffix.lower() != '.zip' and adapter.media_category(p) in ('image', 'video')]
                 others = [(rec, p) for rec, p in pending if (rec, p) not in forwardable]
@@ -1286,43 +1301,56 @@ class Service:
                             self.store.receipt(identifier, rec['id'], receipt)
                     pending = others
             elif row['adapter'] == 'telegram' and row['kind'] != 'document' and len(pending) >= 2:
-                groupable = [(rec, p) for rec, p in pending if adapter.media_group_kind(p) is not None]
-                others = [(rec, p) for rec, p in pending if (rec, p) not in groupable]
-                if len(groupable) >= 2:
+                # 连续区间划分媒体组，严格按原始顺序逐段发送，并在超限/被拒时原地平滑降级单发
+                runs: list[tuple[bool, list[tuple[dict, Path]]]] = []
+                for item in pending:
+                    can_group = adapter.media_group_kind(item[1]) is not None
+                    if runs and runs[-1][0] == can_group:
+                        runs[-1][1].append(item)
+                    else:
+                        runs.append((can_group, [item]))
+                group_count = sum(len(items) for flag, items in runs if flag and len(items) >= 2)
+                if group_count >= 2:
                     tg_limit = min(10, forward_limit)
-                    batches = [groupable[i:i + tg_limit] for i in range(0, len(groupable), tg_limit)]
-                    # Telegram sendMediaGroup 要求每批至少 2 个媒体，末尾余 1 个时归入单发队列
-                    tail_single = []
-                    if batches and len(batches[-1]) == 1:
-                        tail_single = batches.pop()
-                    total_batches = len(batches)
-                    fallback_single = []
-                    for b_idx, batch in enumerate(batches, start=1):
+                    plan: list[tuple[str, list[tuple[dict, Path]]]] = []
+                    total_batches = 0
+                    for flag, items in runs:
+                        if not flag or len(items) < 2:
+                            for single in items:
+                                plan.append(('single', [single]))
+                            continue
+                        batches = [items[i:i + tg_limit] for i in range(0, len(items), tg_limit)]
+                        tail_single = batches.pop() if len(batches[-1]) == 1 else []
+                        total_batches += len(batches)
+                        for b in batches:
+                            plan.append(('group', b))
+                        for single in tail_single:
+                            plan.append(('single', [single]))
+                    b_idx = 0
+                    for kind_tag, chunk in plan:
+                        if kind_tag == 'single':
+                            await _send_single(chunk[0][0], chunk[0][1])
+                            continue
+                        b_idx += 1
                         cap = (
                             f'{job_title}（{b_idx}/{total_batches}）'
                             if job_title and total_batches > 1
                             else (job_title if b_idx == 1 else '')
                         )
                         try:
-                            receipts = await adapter.send_media_group([p for _, p in batch], row['target'], caption=cap)
-                            for (rec, _), rec_receipt in zip(batch, receipts):
+                            receipts = await adapter.send_media_group([p for _, p in chunk], row['target'], caption=cap)
+                            for (rec, _), rec_receipt in zip(chunk, receipts):
                                 self.store.receipt(identifier, rec['id'], rec_receipt)
                         except AgentError as group_err:
-                            if group_err.code == 'BOT_REJECTED':
-                                fallback_single.extend(batch)
+                            if group_err.code in ('BOT_REJECTED', 'BOT_FILE_TOO_LARGE'):
+                                for rec, p in chunk:
+                                    await _send_single(rec, p)
                             else:
                                 raise
-                    pending = fallback_single + tail_single + others
+                    pending = []
 
             for record, path in pending:
-                receipt = await adapter.send(
-                    path,
-                    row['target'],
-                    row['kind'],
-                    video_mode=s.qq_video_mode,
-                    image_mode=s.qq_image_mode,
-                )
-                self.store.receipt(identifier, record['id'], receipt)
+                await _send_single(record, path)
 
             self.store.sent(identifier)
             if s.auto_delete:

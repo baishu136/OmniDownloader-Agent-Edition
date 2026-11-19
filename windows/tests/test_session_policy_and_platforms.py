@@ -80,3 +80,16 @@ def test_kuaishou_backup_hosts_have_distinct_selectable_format_ids(monkeypatch):
     metadata = platforms.PlatformEngine._extract(url, '快手')
     assert len(metadata.available_video_formats) == 2
     assert len({f.format_id for f in metadata.available_video_formats}) == 2
+
+
+def test_kuaishou_atlas_and_image_photo_url_rejected_from_video_route():
+    identifier = '3xatlas999'
+    atlas_photo = {
+        'id': identifier,
+        'duration': 0,
+        'photoUrl': 'https://cdn.invalid/pic.webp',
+        'ext_params': {'type': 'json', 'json': {'atlas': {'list': ['/a.webp', '/b.webp']}}},
+    }
+    html = '<script>window.__APOLLO_STATE__=' + json.dumps({'defaultClient': {'VisionVideoDetailPhoto:' + identifier: atlas_photo}}) + ';</script>'
+    with pytest.raises(RuntimeError, match='NO_MEDIA'):
+        parse_page(html, 'https://www.kuaishou.com/short-video/' + identifier)

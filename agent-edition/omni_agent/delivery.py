@@ -15,10 +15,58 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .errors import AgentError
 
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif', '.jfif'}
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.flv'}
-_TELEGRAM_CONVERT_PHOTO_EXTS = {'.webp', '.avif', '.bmp'}
+AUDIO_EXTENSIONS = {'.mp3', '.m4a', '.flac', '.opus', '.ogg', '.wav', '.aac'}
+_TELEGRAM_CONVERT_PHOTO_EXTS = {'.webp', '.avif', '.bmp', '.jfif'}
 _WIN_DRIVE_RE = re.compile(r'^[A-Za-z]:[/\\]')
+
+
+def _magic_media_kind(path: Path) -> str:
+    """读取文件头魔数识别真实媒体类别，防止扩展名错配导致图片按视频发送。"""
+    try:
+        with path.open('rb') as stream:
+            head = stream.read(64)
+    except OSError:
+        return ''
+    if len(head) < 4:
+        return ''
+    if head.startswith(b'\xff\xd8\xff') or head.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'photo'
+    if head[:6] in (b'GIF87a', b'GIF89a'):
+        return 'animation'
+    if len(head) >= 12 and head.startswith(b'RIFF') and head[8:12] == b'WEBP':
+        return 'photo'
+    if len(head) >= 12 and head[4:8] == b'ftyp' and any(brand in head[8:40] for brand in (b'avif', b'avis')):
+        return 'photo'
+    if len(head) >= 18 and head.startswith(b'BM'):
+        return 'photo'
+    if head[:4] in (b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08'):
+        return 'document'
+    if head.startswith(b'ID3') or head.startswith(b'fLaC') or head.startswith(b'OggS'):
+        return 'audio'
+    if len(head) >= 16 and head[4:8] == b'ftyp' and b'M4A ' in head[8:24]:
+        return 'audio'
+    return ''
+
+
+def detect_media_kind(path: Path) -> str:
+    """结合二进制文件头魔数与扩展名推断真实发送类型（photo/animation/video/audio/document）。"""
+    magic = _magic_media_kind(path)
+    if magic:
+        return magic
+    suffix = path.suffix.lower()
+    if suffix == '.zip':
+        return 'document'
+    if suffix == '.gif':
+        return 'animation'
+    if suffix in IMAGE_EXTENSIONS:
+        return 'photo'
+    if suffix in VIDEO_EXTENSIONS:
+        return 'video'
+    if suffix in AUDIO_EXTENSIONS:
+        return 'audio'
+    return ''
 
 
 class BotConfig(BaseModel):
@@ -127,17 +175,22 @@ class TelegramAdapter(APIAdapter):
         return min(method_limit, self.config.max_upload_bytes)
 
     def _convert_photo_in_memory(self, path: Path) -> tuple[str, io.BytesIO, str] | None:
-        """将 WebP / AVIF / BMP 在内存中转为 Telegram 兼容 JPEG/PNG 字节流，不改动磁盘受控原文件。"""
+        """将 WebP / AVIF / BMP / JFIF 或错标扩展名图片在内存中转为 Telegram 兼容 JPEG/PNG，不改动磁盘受控原文件。"""
         try:
-            from PIL import Image
-            with Image.open(path) as img:
-                has_alpha = img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info)
+            from PIL import Image, ImageOps
+            with Image.open(path) as opened:
+                img = ImageOps.exif_transpose(opened)
+                has_alpha = img.mode in ('RGBA', 'LA', 'PA') or (img.mode == 'P' and 'transparency' in img.info)
                 buf = io.BytesIO()
                 if has_alpha:
-                    img.convert('RGBA').save(buf, format='PNG', optimize=True)
+                    if img.mode != 'RGBA':
+                        img = img.convert('RGBA')
+                    img.save(buf, format='PNG', optimize=True)
                     ext, mime = '.png', 'image/png'
                 else:
-                    img.convert('RGB').save(buf, format='JPEG', quality=92, optimize=True)
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    img.save(buf, format='JPEG', quality=92, optimize=True)
                     ext, mime = '.jpg', 'image/jpeg'
                 if buf.tell() <= 0 or buf.tell() > self.limit('photo'):
                     return None
@@ -149,30 +202,37 @@ class TelegramAdapter(APIAdapter):
     def media_group_kind(self, path: Path) -> str | None:
         """判断文件是否可纳入 Telegram sendMediaGroup（photo / video）。"""
         suffix = path.suffix.lower()
-        if suffix in ('.jpg', '.jpeg', '.png'):
-            return 'photo' if path.stat().st_size <= self.limit('photo') else None
-        if suffix in _TELEGRAM_CONVERT_PHOTO_EXTS:
-            return 'photo' if path.stat().st_size <= self.limit('document') else None
-        if suffix == '.mp4':
-            return 'video' if path.stat().st_size <= self.limit('video') else None
+        actual = detect_media_kind(path)
+        size = path.stat().st_size
+        if actual == 'animation' or suffix == '.gif':
+            return None
+        if actual == 'photo':
+            if suffix in ('.jpg', '.jpeg', '.png') and _magic_media_kind(path) in ('', 'photo'):
+                return 'photo' if size <= self.limit('photo') else None
+            return 'photo' if size <= self.limit('document') else None
+        if actual == 'video' and suffix == '.mp4':
+            return 'video' if size <= self.limit('video') else None
         return None
 
     async def send(self, path, target, kind='auto', **_kwargs):
         self.check_target(target)
         suffix = path.suffix.lower()
+        magic_kind = _magic_media_kind(path)
+        actual_kind = magic_kind or detect_media_kind(path) or 'document'
+        is_image_or_anim = magic_kind in ('photo', 'animation') or suffix in IMAGE_EXTENSIONS
+        is_zip = magic_kind == 'document' or suffix == '.zip'
         converted_photo = None
-        if kind == 'auto':
-            if suffix in ('.jpg', '.jpeg', '.png'):
-                kind = 'photo'
-            elif suffix in _TELEGRAM_CONVERT_PHOTO_EXTS:
-                converted_photo = self._convert_photo_in_memory(path)
-                kind = 'photo' if converted_photo else 'document'
-            elif suffix == '.gif':
+        if kind != 'document' and (kind == 'auto' or is_image_or_anim or is_zip):
+            if actual_kind == 'animation':
                 kind = 'animation'
-            elif suffix == '.mp4':
-                kind = 'video'
-            elif suffix in ('.mp3', '.m4a'):
-                kind = 'audio'
+            elif actual_kind == 'photo':
+                if suffix in _TELEGRAM_CONVERT_PHOTO_EXTS or (magic_kind == 'photo' and suffix not in ('.jpg', '.jpeg', '.png')):
+                    converted_photo = self._convert_photo_in_memory(path)
+                    kind = 'photo' if converted_photo else 'document'
+                else:
+                    kind = 'photo'
+            elif actual_kind in ('video', 'audio'):
+                kind = actual_kind
             else:
                 kind = 'document'
             if converted_photo is None and path.stat().st_size > self.limit(kind):
@@ -225,14 +285,15 @@ class TelegramAdapter(APIAdapter):
             for idx, path in enumerate(paths):
                 key = f'media_{idx}'
                 suffix = path.suffix.lower()
-                if suffix == '.mp4':
+                actual = detect_media_kind(path)
+                if actual == 'video' and suffix == '.mp4':
                     if path.stat().st_size > self.limit('video'):
                         raise AgentError('BOT_FILE_TOO_LARGE', '视频超过 Telegram 发送上限')
                     stream = stack.enter_context(path.open('rb'))
                     files_payload[key] = (path.name, stream, 'video/mp4')
                     entry = {'type': 'video', 'media': f'attach://{key}', 'supports_streaming': True}
-                else:
-                    if suffix in _TELEGRAM_CONVERT_PHOTO_EXTS:
+                elif actual == 'photo':
+                    if suffix in _TELEGRAM_CONVERT_PHOTO_EXTS or (_magic_media_kind(path) == 'photo' and suffix not in ('.jpg', '.jpeg', '.png')):
                         converted = self._convert_photo_in_memory(path)
                         if converted is None:
                             raise AgentError('BOT_FILE_TOO_LARGE', '转换后的图片超过 Telegram 照片发送上限')
@@ -243,6 +304,8 @@ class TelegramAdapter(APIAdapter):
                         stream = stack.enter_context(path.open('rb'))
                         files_payload[key] = (path.name, stream, mimetypes.guess_type(path.name)[0] or 'image/jpeg')
                     entry = {'type': 'photo', 'media': f'attach://{key}'}
+                else:
+                    raise AgentError('BOT_REJECTED', '媒体类型不支持打包为 Telegram 媒体组')
                 if idx == 0 and caption:
                     entry['caption'] = str(caption).strip()[:1024]
                 media_items.append(entry)
@@ -334,10 +397,10 @@ class OneBotAdapter(APIAdapter):
 
     @staticmethod
     def media_category(path: Path) -> str:
-        suffix = path.suffix.lower()
-        if suffix in IMAGE_EXTENSIONS:
+        actual = detect_media_kind(path)
+        if actual in ('photo', 'animation'):
             return 'image'
-        if suffix in VIDEO_EXTENSIONS:
+        if actual == 'video':
             return 'video'
         return 'file'
 

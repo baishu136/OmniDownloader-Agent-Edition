@@ -206,3 +206,40 @@ def test_pixiv_supplied_preview_does_not_replace_download_original(monkeypatch):
     item = media.resolve_pixiv(type('Client', (), {'headers': {}})(), 'https://www.pixiv.net/artworks/123')[-1][0]
     assert item['url'].endswith('123_p0.png') and '/img-original/' in item['url']
     assert item['previewUrl'].endswith('123_p0_master1200.jpg')
+
+
+def test_tiktok_photo_post_rejected_from_video_and_resolved_as_images(monkeypatch):
+    from engine.tiktok_extractor import TikTokDirectExtractor
+
+    photo_payload = {
+        'code': 0,
+        'data': {
+            'id': '7300000000000000001',
+            'title': 'TikTok 图文帖子',
+            'author': {'nickname': 'tester'},
+            'play': 'https://cdn.invalid/slideshow_bgm.mp4',
+            'images': ['https://img.invalid/p1.webp', 'https://img.invalid/p2.webp'],
+        },
+    }
+
+    class FakeResp:
+        url = 'https://www.tiktok.com/@u/photo/7300000000000000001'
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return photo_payload
+
+    monkeypatch.setattr('engine.tiktok_extractor.requests.head', lambda *a, **k: FakeResp())
+    monkeypatch.setattr('engine.tiktok_extractor.requests.get', lambda *a, **k: FakeResp())
+    with pytest.raises(RuntimeError, match='NO_MEDIA'):
+        TikTokDirectExtractor._extract_sync('https://www.tiktok.com/@u/photo/7300000000000000001')
+
+    class FakeClient:
+        headers = {}
+        def get(self, *a, **k): return FakeResp()
+        def head(self, *a, **k): return FakeResp()
+        def close(self): pass
+
+    monkeypatch.setattr(media, 'session', lambda *a, **k: FakeClient())
+    post = media.resolve_images('https://www.tiktok.com/@u/photo/7300000000000000001', 'TikTok')
+    assert post['contentKind'] == 'IMAGE_POST'
+    assert [r['url'] for r in post['resources']] == ['https://img.invalid/p1.webp', 'https://img.invalid/p2.webp']

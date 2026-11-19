@@ -260,3 +260,78 @@ async def test_ordered_collection_merge_command_forward_batching_and_telegram_me
     await service.run_delivery(service.store.delivery(d_fb['id']))
     assert service.store.delivery(d_fb['id'])['state'] == 'SENT'
     assert fb_calls == ['sendMediaGroup', 'sendPhoto', 'sendPhoto']
+
+
+async def test_service_delivery_corrects_wrong_video_kind_and_preserves_mixed_order_and_oversize_fallback(service, monkeypatch):
+    from PIL import Image
+    configure(service)
+
+    # 1. 单图任务即使用 video kind 请求交付，也不得走 sendVideo
+    row_single, _ = service.store.create_job('agent', {'url': 'https://x.com/u/status/single1'}, 'tg-single-img-k', 'tg-single-img-r')
+    s_dir = service.config.cache / 'jobs' / row_single['id'] / 'output'
+    s_dir.mkdir(parents=True)
+    img_only = s_dir / 'only.png'
+    Image.new('RGB', (10, 10), 'cyan').save(img_only)
+    service.store.finish(row_single['id'], [img_only], metadata={'title': '单图纠偏'})
+
+    single_calls = []
+
+    def single_handler(request):
+        single_calls.append(request.url.path.rsplit('/', 1)[-1])
+        return httpx.Response(200, json={'ok': True, 'result': {'message_id': 1001, 'chat': {'id': 123}}})
+
+    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg: TelegramAdapter(cfg, httpx.MockTransport(single_handler)))
+    d_single = await service.deliver('agent', row_single['id'], 'telegram', '123', 'video', 'tg-single-img-send')
+    await service.run_delivery(service.store.delivery(d_single['id']))
+    assert service.store.delivery(d_single['id'])['state'] == 'SENT'
+    assert single_calls == ['sendPhoto']
+
+    # 2. [img0, gif, img1, img2] 混排严格保留原始顺序：sendPhoto -> sendAnimation -> sendMediaGroup
+    row_mix, _ = service.store.create_job('agent', {'url': 'https://x.com/u/status/mix1'}, 'tg-mix-k', 'tg-mix-r')
+    m_dir = service.config.cache / 'jobs' / row_mix['id'] / 'output'
+    m_dir.mkdir(parents=True)
+    m0 = m_dir / 'm0.png'
+    mg = m_dir / 'm1.gif'
+    m2 = m_dir / 'm2.png'
+    m3 = m_dir / 'm3.png'
+    Image.new('RGB', (8, 8), 'red').save(m0)
+    Image.new('RGB', (8, 8), 'blue').save(mg, format='GIF', save_all=True, append_images=[Image.new('RGB', (8, 8), 'white')], duration=50)
+    Image.new('RGB', (8, 8), 'green').save(m2)
+    Image.new('RGB', (8, 8), 'yellow').save(m3)
+    service.store.finish(row_mix['id'], [m0, mg, m2, m3], metadata={'title': '混排保序'})
+
+    mix_calls = []
+
+    async def mix_handler(request):
+        raw = await request.aread()
+        mix_calls.append(request.url.path.rsplit('/', 1)[-1])
+        if request.url.path.endswith('/sendMediaGroup'):
+            count = raw.count(b'name="media_')
+            return httpx.Response(200, json={'ok': True, 'result': [{'message_id': 1100 + i, 'chat': {'id': 123}} for i in range(count)]})
+        return httpx.Response(200, json={'ok': True, 'result': {'message_id': 1150, 'chat': {'id': 123}}})
+
+    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg: TelegramAdapter(cfg, httpx.MockTransport(mix_handler)))
+    d_mix = await service.deliver('agent', row_mix['id'], 'telegram', '123', 'auto', 'tg-mix-send')
+    await service.run_delivery(service.store.delivery(d_mix['id']))
+    assert mix_calls == ['sendPhoto', 'sendAnimation', 'sendMediaGroup']
+
+    # 3. 媒体组内含转换后超 photo 上限的图片时，不崩溃，自动降级单发并走 sendDocument
+    small_cfg = BotConfig(adapter='telegram', enabled=True, base_url='https://api.telegram.org', token='mock-token', allowed_targets=['123'], max_upload_bytes=1024**2)
+    service.vault.put('bot-telegram', small_cfg.model_dump_json())
+    row_big, _ = service.store.create_job('agent', {'url': 'https://x.com/u/status/big'}, 'tg-big-k', 'tg-big-r')
+    b_dir = service.config.cache / 'jobs' / row_big['id'] / 'output'
+    b_dir.mkdir(parents=True)
+    bw = b_dir / 'huge.webp'
+    bp = b_dir / 'ok.png'
+    Image.new('RGB', (120, 120), 'navy').save(bw, format='WEBP')
+    Image.new('RGB', (4, 4), 'pink').save(bp)
+    service.store.finish(row_big['id'], [bw, bp], metadata={'title': '超限相册降级'})
+
+    big_calls = []
+    adapter_obj = TelegramAdapter(small_cfg, httpx.MockTransport(lambda r: (big_calls.append(r.url.path.rsplit('/', 1)[-1]), httpx.Response(200, json={'ok': True, 'result': {'message_id': 1200 + len(big_calls), 'chat': {'id': 123}}}))[1]))
+    monkeypatch.setattr(adapter_obj, 'limit', lambda kind: 200 if kind == 'photo' else 1024**2)
+    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg: adapter_obj)
+    d_big = await service.deliver('agent', row_big['id'], 'telegram', '123', 'auto', 'tg-big-send')
+    await service.run_delivery(service.store.delivery(d_big['id']))
+    assert service.store.delivery(d_big['id'])['state'] == 'SENT'
+    assert big_calls == ['sendDocument', 'sendPhoto']

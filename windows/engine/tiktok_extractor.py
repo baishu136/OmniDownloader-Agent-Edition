@@ -52,6 +52,9 @@ class TikTokDirectExtractor:
             raise RuntimeError(f"TikTok 直连解析接口反馈: {res_json.get('msg', '解析失败')}")
 
         data = res_json.get("data", {})
+        images = [u for u in (data.get("images") or []) if isinstance(u, str) and u.startswith(("http://", "https://"))]
+        if images:
+            raise RuntimeError("[NO_MEDIA] 这是 TikTok 图文作品，请使用图文引擎下载")
         title = data.get("title", "").strip() or "TikTok短视频"
         author = data.get("author", {}).get("nickname", "TikTok用户")
         duration = data.get("duration", 0)
@@ -94,26 +97,34 @@ class TikTokDirectExtractor:
         staging_dir = download_dir / ".staging"
         staging_dir.mkdir(parents=True, exist_ok=True)
 
+        proxies = {"http": config.proxy_url, "https": config.proxy_url} if config.proxy_url else None
+
+        # 0. 仅保存封面
+        if task.download_type == DownloadType.COVER:
+            cover_url = task.thumbnail_url
+            if not cover_url:
+                meta = await cls.extract(task.url)
+                cover_url = meta.thumbnail_url
+            if not cover_url:
+                raise RuntimeError("[NO_MEDIA] 未获取到 TikTok 作品封面地址")
+            on_progress(20.0, "", "正在保存封面...", TaskStatus.DOWNLOADING)
+            resp = await asyncio.to_thread(requests.get, cover_url, headers={"User-Agent": MOBILE_UA}, proxies=proxies, timeout=15)
+            resp.raise_for_status()
+            from engine.media_resolver import image_extension
+            ext = image_extension(resp.content[:64])
+            dest = download_dir / f"{clean_title}_cover.{ext}"
+            with open(dest, "wb") as f:
+                f.write(resp.content)
+            on_progress(100.0, "", "封面已保存", TaskStatus.COMPLETED)
+            return str(dest)
+
         video_url = task.selected_resolution if task.selected_resolution.startswith("http") else ""
         if not video_url:
             meta = await cls.extract(task.url)
             video_url = meta.available_video_formats[0].format_id if meta.available_video_formats else ""
 
-        if not video_url and task.download_type != DownloadType.COVER:
+        if not video_url:
             raise RuntimeError("未获取到 TikTok 视频播放地址")
-
-        proxies = {"http": config.proxy_url, "https": config.proxy_url} if config.proxy_url else None
-
-        # 0. 仅保存封面
-        if task.download_type == DownloadType.COVER:
-            cover_url = task.thumbnail_url or task.url
-            dest = download_dir / f"{clean_title}_cover.jpg"
-            on_progress(20.0, "", "正在保存封面...", TaskStatus.DOWNLOADING)
-            resp = await asyncio.to_thread(requests.get, cover_url, headers={"User-Agent": MOBILE_UA}, proxies=proxies, timeout=15)
-            with open(dest, "wb") as f:
-                f.write(resp.content)
-            on_progress(100.0, "", "封面已保存", TaskStatus.COMPLETED)
-            return str(dest)
 
         temp_file = staging_dir / f"tiktok_{task.id}.mp4"
 
