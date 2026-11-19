@@ -932,6 +932,10 @@ async def test_edge_clean_mode_bypass_browser_priority_and_relaunch(service, mon
         'omni_agent.cookie_login.list_local_browsers',
         lambda: [chrome_browser, edge_browser],
     )
+    monkeypatch.setattr(
+        'omni_agent.service.list_local_browsers',
+        lambda: [chrome_browser, edge_browser],
+    )
     monkeypatch.setattr('omni_agent.cookie_login.find_local_browser', lambda: edge_browser)
     monkeypatch.setattr('omni_agent.service.find_local_browser', lambda: edge_browser)
     monkeypatch.setattr(service.browser_logins, 'POLL_INTERVAL_SEC', 0.01)
