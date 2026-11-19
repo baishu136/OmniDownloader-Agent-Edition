@@ -25,6 +25,7 @@ class Settings(BaseModel):
     max_height: int = Field(2160, ge=144, le=8640)
     container: Literal['mp4', 'mkv', 'auto'] = 'mp4'
     audio_format: Literal['mp3', 'm4a', 'flac', 'opus'] = 'mp3'
+    image_format: Literal['original', 'jpg', 'png', 'webp'] = 'original'
     pack_zip: bool = False
     autonomous: bool = True
     max_file_bytes: int = Field(500 * 1024**2, ge=1024, le=20 * 1024**3)

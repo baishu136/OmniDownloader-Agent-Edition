@@ -309,6 +309,7 @@ class Store:
             cmd_merge=bool(payload.get('cmd_merge')),
             pack_zip=bool(opts.get('pack_zip')),
             download_type=str(opts.get('download_type') or ''),
+            image_format=str(opts.get('image_format') or ''),
         )
         visual_stage = 'complete' if state == 'READY' else 'receive'
         with self.transaction():

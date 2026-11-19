@@ -275,3 +275,173 @@ async def test_auto_image_fallback_first_image_without_us_and_bilibili_single_vi
     }, ev_bili.append)
     assert downloaded_urls == [bili_url]
     assert len(ev_bili[-1]['result']['paths']) == 1
+
+
+async def test_image_format_conversion_preserves_animated_gif_and_updates_zip_manifest(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import zipfile
+    from PIL import Image
+
+    monkeypatch.setattr('omni_agent.worker.install_network_guard', lambda *args: None)
+    monkeypatch.setattr('omni_agent.worker.validate_url', lambda url, **kw: url)
+    from core.config import config
+    from engine.images import ImageEngine
+    from engine.url_sniffer import UrlSniffer
+
+    url = 'https://www.xiaohongshu.com/explore/fmt-test'
+    post = {
+        'url': url,
+        'platform': '小红书',
+        'title': '图片格式测试',
+        'resources': [{'id': 'i1'}, {'id': 'i2'}, {'id': 'i3'}],
+    }
+    monkeypatch.setattr(UrlSniffer, 'sanitize_and_resolve_url', AsyncMock(return_value=url))
+    monkeypatch.setattr(ImageEngine, 'extract', AsyncMock(return_value=post))
+
+    # 1. 多图下载指定 image_format='jpg'：
+    #    - 透明 RGBA PNG 白色背景合成转为 JPG 并清理旧后缀；
+    #    - 静态 WebP 转为 JPG；
+    #    - 多帧动态 GIF 自动保留动态（维持 .gif 多帧，不拆帧）；
+    async def mixed_img_dl(task, progress, cancel):
+        out = Path(config.download_dir)
+        idx = task.selected_image_ids[0]
+        if idx == 'i1':
+            p = out / f'{task.id}_alpha.png'
+            rgba = Image.new('RGBA', (8, 8), (200, 0, 0, 0))
+            rgba.putpixel((0, 0), (10, 20, 30, 255))
+            rgba.save(p, format='PNG')
+            return str(p)
+        if idx == 'i2':
+            p = out / f'{task.id}_static.webp'
+            Image.new('RGB', (8, 8), (40, 120, 200)).save(p, format='WEBP')
+            return str(p)
+        p = out / f'{task.id}_anim.gif'
+        f1 = Image.new('RGB', (8, 8), 'red')
+        f2 = Image.new('RGB', (8, 8), 'blue')
+        f1.save(p, format='GIF', save_all=True, append_images=[f2], duration=80, loop=0)
+        return str(p)
+
+    monkeypatch.setattr(ImageEngine, 'download', mixed_img_dl)
+    ev_jpg = []
+    await execute({
+        'action': 'download',
+        'url': '/us ' + url,
+        'all_items': True,
+        'allow_images': True,
+        'max_items': 20,
+        'state': str(tmp_path / 'w_jpg'),
+        'data': str(tmp_path / 'd_jpg'),
+        'max_file_bytes': 1024**2,
+        'options': {
+            'download_type': 'IMAGE',
+            'height': 1080,
+            'container': 'mp4',
+            'audio_format': 'mp3',
+            'pack_zip': False,
+            'image_format': 'jpg',
+        },
+    }, ev_jpg.append)
+    out_paths = [Path(p) for p in ev_jpg[-1]['result']['paths']]
+    assert [p.suffix.lower() for p in out_paths] == ['.jpg', '.jpg', '.gif']
+    assert all(p.is_file() for p in out_paths)
+    # 透明像素合成为纯白底 JPEG
+    with Image.open(out_paths[0]) as im_rgba_jpg:
+        assert im_rgba_jpg.format == 'JPEG'
+        r, g, b = im_rgba_jpg.getpixel((5, 5))
+        assert r >= 245 and g >= 245 and b >= 245
+    # 动图保留全部动画帧
+    with Image.open(out_paths[2]) as im_gif:
+        assert getattr(im_gif, 'is_animated', False) and im_gif.n_frames == 2
+
+    # 2. 原图已是匹配格式（.jpg 在 image_format='jpg' 下）保持原始字节零重编码；切换 image_format='webp' 才转换
+    exact_bytes = b''
+
+    async def exact_jpg_dl(task, progress, cancel):
+        nonlocal exact_bytes
+        p = Path(config.download_dir) / f'{task.id}_keep.jpg'
+        Image.new('RGB', (6, 6), 'green').save(p, format='JPEG', quality=90)
+        exact_bytes = p.read_bytes()
+        return str(p)
+
+    monkeypatch.setattr(ImageEngine, 'download', exact_jpg_dl)
+    ev_keep = []
+    await execute({
+        'action': 'download',
+        'url': url,
+        'all_items': False,
+        'allow_images': True,
+        'max_items': 20,
+        'state': str(tmp_path / 'w_keep'),
+        'data': str(tmp_path / 'd_keep'),
+        'max_file_bytes': 1024**2,
+        'options': {'download_type': 'IMAGE', 'height': 1080, 'container': 'mp4', 'audio_format': 'mp3', 'pack_zip': False, 'image_format': 'jpg'},
+    }, ev_keep.append)
+    kept_path = Path(ev_keep[-1]['result']['paths'][0])
+    assert kept_path.suffix == '.jpg' and kept_path.read_bytes() == exact_bytes
+
+    ev_webp = []
+    await execute({
+        'action': 'download',
+        'url': url,
+        'all_items': False,
+        'allow_images': True,
+        'max_items': 20,
+        'state': str(tmp_path / 'w_webp'),
+        'data': str(tmp_path / 'd_webp'),
+        'max_file_bytes': 1024**2,
+        'options': {'download_type': 'IMAGE', 'height': 1080, 'container': 'mp4', 'audio_format': 'mp3', 'pack_zip': False, 'image_format': 'webp'},
+    }, ev_webp.append)
+    webp_path = Path(ev_webp[-1]['result']['paths'][0])
+    assert webp_path.suffix == '.webp'
+    with Image.open(webp_path) as im_w:
+        assert im_w.format == 'WEBP'
+
+    # 3. 图集 ZIP（ImageEngine IMAGE_ZIP 带 manifest.json）在 image_format='png' 时自动转换包内静态图、保留动图 GIF 并刷新 manifest.json
+    async def zip_with_manifest_dl(task, progress, cancel):
+        work = Path(config.download_dir)
+        w1 = work / 'raw1.webp'
+        Image.new('RGB', (10, 10), (12, 34, 56)).save(w1, format='WEBP')
+        g1 = work / 'raw2.gif'
+        Image.new('RGB', (6, 6), 'red').save(g1, format='GIF', save_all=True, append_images=[Image.new('RGB', (6, 6), 'yellow')], duration=90)
+        zpath = work / 'fmt_images.zip'
+        with zipfile.ZipFile(zpath, 'w', zipfile.ZIP_STORED) as zf:
+            zf.write(w1, 'p1.webp')
+            zf.write(g1, 'p2.gif')
+            manifest = {
+                'platform': '小红书',
+                'contentId': 'fmt-test',
+                'images': [
+                    {'id': 'i1', 'file': 'p1.webp', 'bytes': w1.stat().st_size, 'sha256': hashlib.sha256(w1.read_bytes()).hexdigest(), 'source': 'PLATFORM_SOURCE'},
+                    {'id': 'i2', 'file': 'p2.gif', 'bytes': g1.stat().st_size, 'sha256': hashlib.sha256(g1.read_bytes()).hexdigest(), 'source': 'PLATFORM_SOURCE'},
+                ],
+            }
+            zf.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False))
+        w1.unlink()
+        g1.unlink()
+        return str(zpath)
+
+    monkeypatch.setattr(ImageEngine, 'download', zip_with_manifest_dl)
+    ev_zip = []
+    await execute({
+        'action': 'download',
+        'url': '/us /zip ' + url,
+        'all_items': True,
+        'allow_images': True,
+        'max_items': 20,
+        'state': str(tmp_path / 'w_zipfmt'),
+        'data': str(tmp_path / 'd_zipfmt'),
+        'max_file_bytes': 1024**2,
+        'options': {'download_type': 'IMAGE', 'height': 1080, 'container': 'mp4', 'audio_format': 'mp3', 'pack_zip': True, 'image_format': 'png'},
+    }, ev_zip.append)
+    res_zip = Path(ev_zip[-1]['result']['paths'][0])
+    assert res_zip.suffix == '.zip'
+    with zipfile.ZipFile(res_zip) as zf:
+        assert zf.testzip() is None
+        names = set(zf.namelist())
+        assert names == {'p1.png', 'p2.gif', 'manifest.json'}
+        converted_manifest = json.loads(zf.read('manifest.json').decode('utf-8'))
+        entry1 = converted_manifest['images'][0]
+        assert entry1['file'] == 'p1.png'
+        assert entry1['bytes'] == len(zf.read('p1.png'))
+        assert entry1['sha256'] == hashlib.sha256(zf.read('p1.png')).hexdigest()

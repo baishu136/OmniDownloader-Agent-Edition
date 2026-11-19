@@ -162,20 +162,25 @@ def test_async_core_completion_in_background(service):
 def test_agent_can_manage_settings_and_bots_with_redacted_secrets(service):
     with TestClient(create_app(service)) as client:
         res = client.post('/api/tools/get_settings', json={}).json()
-        assert res['ok'] and res['result']['default_height'] == 1080
+        assert res['ok'] and res['result']['default_height'] == 1080 and res['result']['image_format'] == 'original'
 
         upd = client.post('/api/tools/update_settings', json={
-            'settings': {'default_height': 720, 'profiles': True, 'proxy': 'http://127.0.0.1:7890', 'theme': 'dark'}
+            'settings': {'default_height': 720, 'profiles': True, 'proxy': 'http://127.0.0.1:7890', 'theme': 'dark', 'image_format': 'jpg'}
         }).json()
         assert upd['ok']
         assert upd['result']['default_height'] == 720
         assert upd['result']['profiles'] is True
         assert upd['result']['proxy'] == 'http://127.0.0.1:7890'
+        assert upd['result']['image_format'] == 'jpg'
+        assert json.loads(service.config.path.read_text('utf-8'))['image_format'] == 'jpg'
         assert json.loads(service.config.path.read_text('utf-8'))['theme'] == 'dark'
+        assert client.post('/api/tools/get_service_capabilities', json={}).json()['result']['defaults']['image_format'] == 'jpg'
 
-        # 非法代理或默认画质高于最高画质仍须拒绝
+        # 非法代理或默认画质高于最高画质或非法图片格式仍须拒绝
         bad = client.post('/api/tools/update_settings', json={'settings': {'default_height': 4320}}).json()
         assert not bad['ok'] and bad['error']['code'] == 'INVALID_PARAMETER'
+        bad_img_fmt = client.post('/api/tools/update_settings', json={'settings': {'image_format': 'tiff'}}).json()
+        assert not bad_img_fmt['ok'] and bad_img_fmt['error']['code'] == 'INVALID_PARAMETER'
         bad_proxy = client.post('/api/tools/update_settings', json={'settings': {'proxy': 'http://user:pass@127.0.0.1:7890'}}).json()
         assert not bad_proxy['ok'] and bad_proxy['error']['code'] == 'INVALID_PARAMETER'
 
@@ -289,10 +294,12 @@ def test_patch_and_reset_settings_and_storage_directories(service, tmp_path):
             'qq_video_mode': 'message',
             'qq_image_mode': 'file',
             'qq_forward_collection': True,
+            'image_format': 'webp',
             'pack_zip': True,
         })
         assert res.status_code == 200 and res.json()['settings']['theme'] == 'dark'
         assert res.json()['settings']['qq_forward_collection'] is True
+        assert res.json()['settings']['image_format'] == 'webp'
 
         # 不合法的相对路径或内部目录重叠须拒绝
         bad = client.patch('/api/admin/config', json={'download_dir': 'relative/path'})
@@ -326,6 +333,7 @@ def test_patch_and_reset_settings_and_storage_directories(service, tmp_path):
         assert reset_cfg['qq_video_mode'] == 'file'
         assert reset_cfg['qq_forward_collection'] is False
         assert reset_cfg['pack_zip'] is False
+        assert reset_cfg['image_format'] == 'original'
 
 
 async def test_download_command_prefixes_us_and_zip(service):

@@ -178,11 +178,11 @@ def create_mcp(invoke, on_session=None):
         await _emit_mcp_progress(ctx, res)
         return res
 
-    @server.tool(structured_output=True, description='Read all current download, ZIP packing, storage directories, QQ delivery mode, download visualization notification settings, feature, proxy, cache and theme settings.')
+    @server.tool(structured_output=True, description='Read all current download, ZIP packing, image format (image_format), storage directories, QQ delivery mode, download visualization notification settings, feature, proxy, cache and theme settings.')
     async def get_settings() -> dict[str, Any]:
         return await invoke('get_settings', {})
 
-    @server.tool(structured_output=True, description='Update one or more service settings (including download_dir, image_dir, cache_dir, qq_*, visual_enabled, visual_on_receive, visual_on_start, visual_on_complete, visual_mode, visual_notify_channel, visual_notify_target, visual_reuse_message, visual_*_template, proxy, theme). Does not touch cookies.')
+    @server.tool(structured_output=True, description='Update one or more service settings (including default_type, default_height, container, audio_format, image_format, pack_zip, download_dir, image_dir, cache_dir, qq_*, visual_enabled, visual_on_receive, visual_on_start, visual_on_complete, visual_mode, visual_notify_channel, visual_notify_target, visual_reuse_message, visual_*_template, proxy, theme). Does not touch cookies.')
     async def update_settings(settings: SettingsUpdate) -> dict[str, Any]:
         return await invoke('update_settings', {'settings': settings.model_dump(exclude_none=True)})
 

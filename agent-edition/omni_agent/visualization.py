@@ -33,6 +33,7 @@ def summarize_command(
     cmd_merge: bool = False,
     pack_zip: bool = False,
     download_type: str = '',
+    image_format: str = '',
 ) -> str:
     """生成可读的链接指令与打包模式摘要。"""
     parts = []
@@ -52,6 +53,8 @@ def summarize_command(
             'IMAGE_ZIP': '图文压缩包',
         }
         parts.append(labels.get(download_type, download_type))
+    if image_format and image_format != 'original' and download_type in ('IMAGE', 'IMAGE_ZIP'):
+        parts.append(f'图片格式 {image_format.upper()}')
     return ' + '.join(parts) if parts else '默认下载参数'
 
 

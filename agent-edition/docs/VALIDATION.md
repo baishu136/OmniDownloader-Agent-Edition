@@ -3,12 +3,12 @@
 日期：2026-11-19。下列记录来自实际执行，模拟 API 和真实平台验收严格区分。
 
 - Windows 原核心：`python -m pytest windows/tests -q`，140 通过，存在既有 Pydantic 弃用警告。
-- Agent 独立测试：`python -m pytest agent-edition/tests -q`，104 通过，覆盖：
+- Agent 独立测试：`python -m pytest agent-edition/tests -q`，105 通过，覆盖：
   - 独立默认工作目录解析（`./data/` 及便携目录同级 `data/`）与无 `auth.json` 验证；
   - 免令牌 HTTP 管理接口与官方 MCP SDK 真实 `stdio` / Streamable HTTP 握手及 23 项工具（含 `list_bridges`）发现；
   - 设置读取/局部更新/自动保存/重置默认设置，以及 `download_dir`、`image_dir` 永久导出、页内目录浏览/创建与原生文件夹选择降级逻辑；
   - 网络代理格式校验、不可达端口快速报错与 HTTP 连通性延迟探测；
-  - 图文自动识别与打包分离：默认模式下自动识别/回退图文提取，不加 `/us` 时仅下载首图（或当前单集视频），支持 `/us`（全量）、`/zip`（打包）与 `/merge`（合并转发）任意组合解析，以及 `task_files.ord` 严格保序；
+  - 图文自动识别、独立格式与打包分离：默认模式下自动识别/回退图文提取，不加 `/us` 时仅下载首图（或当前单集视频），支持 `/us`（全量）、`/zip`（打包）与 `/merge`（合并转发）任意组合解析，支持 `image_format`（`original`/`jpg`/`png`/`webp`，散图与 ZIP 包均统一转换并更新 `manifest.json`，多帧 GIF 动图保留动态与字节直通），以及 `task_files.ord` 严格保序；
   - QQ 与 Telegram 合集/图集发送验证：QQ 视频/图片消息与群文件切换、`.zip` 强制文件上传、合并转发（`send_group_forward_msg`）及默认 30 条上限（`qq_forward_max_items`）自动分批、单次交付探针缓存、Windows 盘符 `file:///` URI 转换，以及 Telegram `sendMediaGroup` 相册分批与降级、WebP/AVIF 内存无损转 JPEG/PNG 发送与 GIF `sendAnimation`；
   - 下载可视化高可靠机制、事件流与直发联动验证：SQLite `visual_events` 持久化出箱、`after_seq` 游标增量消费与 `wait_seconds` 长轮询在缓存秒命中及极速下载下零丢包、Telegram `sendMessage`/`editMessageText` 原地编辑刷新与 OneBot 群文本直发（受 `allowed_targets` 白名单约束且不重复发阶段）、`server_bot`/`caller_only`/`auto` 通道切换、`AgentError` 附带 `visualization` 错误载荷、`POST /api/admin/visual/test` 预览及试发、MCP 23 工具保持不变下的 `Context.report_progress` 实时通知、AstrBot `context.send_message`/`pending_events` 与 `OmniBotClient` 事件流与报错直出；
   - 已接入桥接自动识别：Streamable HTTP / MCP stdio / AstrBot 心跳注册、`list_bridges` 工具与离线注销检测；

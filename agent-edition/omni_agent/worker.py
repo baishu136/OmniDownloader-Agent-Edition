@@ -1,6 +1,8 @@
 """JSON-line bridge to the existing TaskManager, inside a disposable process."""
 import asyncio
 import contextlib
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -49,6 +51,152 @@ def _should_fallback_to_images(exc: Exception) -> bool:
 def _safe_archive_name(title, fallback='omni_archive'):
     cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', str(title or '')).strip(' .')
     return (cleaned[:80] or fallback)
+
+
+_IMAGE_SUFFIXES_BY_FORMAT = {
+    'jpg': ('.jpg', '.jpeg'),
+    'png': ('.png',),
+    'webp': ('.webp',),
+}
+_CONVERTIBLE_IMAGE_SUFFIXES = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif'}
+
+
+def convert_image_bytes(raw_bytes: bytes, source_suffix: str, target_format: str) -> tuple[bytes, str] | None:
+    """按指定目标格式转换静态图片字节；目标为 original、后缀已匹配或属多帧动图时返回 None 保持原样。"""
+    fmt = str(target_format or 'original').lower()
+    if fmt == 'original' or fmt not in _IMAGE_SUFFIXES_BY_FORMAT:
+        return None
+    if source_suffix.lower() not in _CONVERTIBLE_IMAGE_SUFFIXES:
+        return None
+    if source_suffix.lower() in _IMAGE_SUFFIXES_BY_FORMAT[fmt]:
+        return None
+    from PIL import Image, ImageOps
+    with Image.open(io.BytesIO(raw_bytes)) as opened:
+        if getattr(opened, 'is_animated', False) and getattr(opened, 'n_frames', 1) > 1:
+            return None
+        img = ImageOps.exif_transpose(opened)
+        has_alpha = img.mode in ('RGBA', 'LA', 'PA') or (img.mode == 'P' and 'transparency' in img.info)
+        buf = io.BytesIO()
+        if fmt == 'jpg':
+            if has_alpha:
+                rgba = img.convert('RGBA')
+                bg = Image.new('RGB', rgba.size, (255, 255, 255))
+                bg.paste(rgba, mask=rgba.getchannel('A'))
+                out_img = bg
+            elif img.mode != 'RGB':
+                out_img = img.convert('RGB')
+            else:
+                out_img = img
+            out_img.save(buf, format='JPEG', quality=95, subsampling=0)
+            return buf.getvalue(), '.jpg'
+        if fmt == 'png':
+            if has_alpha:
+                out_img = img.convert('RGBA') if img.mode != 'RGBA' else img
+            elif img.mode not in ('RGB', 'L'):
+                out_img = img.convert('RGB')
+            else:
+                out_img = img
+            out_img.save(buf, format='PNG', optimize=True)
+            return buf.getvalue(), '.png'
+        if has_alpha:
+            out_img = img.convert('RGBA') if img.mode != 'RGBA' else img
+        elif img.mode != 'RGB':
+            out_img = img.convert('RGB')
+        else:
+            out_img = img
+        out_img.save(buf, format='WEBP', quality=92)
+        return buf.getvalue(), '.webp'
+
+
+def convert_image_file(path_str: str, output_dir: Path, target_format: str, max_file_bytes: int) -> str:
+    """将散图文件按目标格式原子替换保存，保持原有文件名主干并校验大小限制。"""
+    src = controlled(output_dir, path_str)
+    converted = convert_image_bytes(src.read_bytes(), src.suffix, target_format)
+    if converted is None:
+        return str(src)
+    payload, new_ext = converted
+    if not 0 < len(payload) <= max_file_bytes:
+        raise AgentError('FILE_TOO_LARGE', '转换后的图片为空或超出单文件大小上限')
+    target = src.with_suffix(new_ext)
+    idx = 1
+    while target.exists() and target.resolve() != src.resolve():
+        target = output_dir / f'{src.stem}_{idx}{new_ext}'
+        idx += 1
+    temporary = target.with_suffix(f'{new_ext}.part')
+    try:
+        temporary.write_bytes(payload)
+        temporary.replace(target)
+        if target.resolve() != src.resolve():
+            src.unlink(missing_ok=True)
+        return str(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def convert_zip_images(zip_path_str: str, output_dir: Path, target_format: str, max_file_bytes: int) -> str:
+    """按目标图片格式重建图集 ZIP 压缩包内容，并同步更新其中的 manifest.json。"""
+    fmt = str(target_format or 'original').lower()
+    if fmt == 'original' or fmt not in _IMAGE_SUFFIXES_BY_FORMAT:
+        return zip_path_str
+    src = controlled(output_dir, zip_path_str)
+    with zipfile.ZipFile(src) as archive:
+        entries = [(info.filename, archive.read(info.filename)) for info in archive.infolist() if not info.is_dir()]
+    rewrites: list[tuple[str, str, bytes, bool]] = []
+    used_names: set[str] = set()
+    changed = False
+    manifest_raw: bytes | None = None
+    for name, raw in entries:
+        if name == 'manifest.json':
+            manifest_raw = raw
+            continue
+        p = Path(name)
+        converted = convert_image_bytes(raw, p.suffix, fmt)
+        if converted is not None:
+            new_bytes, new_ext = converted
+            changed = True
+            candidate = str(p.with_suffix(new_ext)).replace('\\', '/')
+        else:
+            new_bytes = raw
+            candidate = name
+        final_name = candidate
+        idx = 1
+        while final_name in used_names:
+            cp = Path(candidate)
+            final_name = str(cp.with_name(f'{cp.stem}_{idx}{cp.suffix}')).replace('\\', '/')
+            idx += 1
+        used_names.add(final_name)
+        rewrites.append((name, final_name, new_bytes, converted is not None))
+    if not changed:
+        return str(src)
+
+    temporary = src.with_suffix('.zip.part')
+    try:
+        rename_map = {old: (new, len(data), hashlib.sha256(data).hexdigest()) for old, new, data, _ in rewrites}
+        with zipfile.ZipFile(temporary, 'w', zipfile.ZIP_STORED) as bundle:
+            for _, final_name, data, _ in rewrites:
+                bundle.writestr(final_name, data)
+            if manifest_raw is not None:
+                try:
+                    manifest = json.loads(manifest_raw.decode('utf-8'))
+                    for item in manifest.get('images') or []:
+                        old_file = item.get('file')
+                        if old_file in rename_map:
+                            new_file, size_val, digest = rename_map[old_file]
+                            item['file'] = new_file
+                            item['bytes'] = size_val
+                            item['sha256'] = digest
+                    bundle.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
+                except (ValueError, UnicodeDecodeError):
+                    bundle.writestr('manifest.json', manifest_raw)
+        if not temporary.is_file() or not 0 < temporary.stat().st_size <= max_file_bytes:
+            raise AgentError('FILE_TOO_LARGE', '转换打包后的压缩包为空或超出单文件大小上限')
+        with zipfile.ZipFile(temporary) as bundle:
+            if sum(i.file_size for i in bundle.infolist()) > max_file_bytes * 4 or bundle.testzip():
+                raise AgentError('FILE_INVALID', '转换后的压缩包超出大小或完整性校验失败')
+        temporary.replace(src)
+        return str(src)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def pack_paths_to_zip(paths, output_dir, title, max_file_bytes):
@@ -298,8 +446,16 @@ async def execute(request, emit):
             await asyncio.sleep(.25)
         if task.status != TaskStatus.COMPLETED:
             raise AgentError(task.error_code or task.status.value, safe_text(task.error_message or '核心下载未完成'))
-        validate_output(task.local_file_path, root, options, request['max_file_bytes'])
-        paths.append(task.local_file_path)
+        local_path = task.local_file_path
+        validate_output(local_path, root, options, request['max_file_bytes'])
+        image_format = str(options.get('image_format') or 'original').lower()
+        if image_request and image_format != 'original':
+            if Path(local_path).suffix.lower() == '.zip':
+                local_path = convert_zip_images(local_path, root / 'output', image_format, request['max_file_bytes'])
+            else:
+                local_path = convert_image_file(local_path, root / 'output', image_format, request['max_file_bytes'])
+            validate_output(local_path, root, options, request['max_file_bytes'])
+        paths.append(local_path)
     if pack_zip and not (len(paths) == 1 and Path(paths[0]).suffix.lower() == '.zip'):
         zip_path = pack_paths_to_zip(paths, root / 'output', metadata.get('title') or 'omni_media', request['max_file_bytes'])
         validate_output(zip_path, root, options, request['max_file_bytes'])

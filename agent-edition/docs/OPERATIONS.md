@@ -5,6 +5,7 @@
 ## 部署与工作目录
 
 - 默认数据与缓存目录：源码运行与工程内打包运行使用项目根目录下的 `data/`；将便携 ZIP 解压至独立文件夹运行时自动使用 EXE 同级 `data/`（保存 `settings.json`、`ledger.sqlite3`、`credentials/`、`sessions/` 与 `cache/omni-agent-managed/`），不再写入 `%LOCALAPPDATA%`。
+- 图文独立格式设置（`image_format`）：在“01 下载与存储设置”可独立配置「默认图片格式」（`original` 保留原图格式默认 / `jpg` / `png` / `webp`，亦可由 Agent/MCP 在 `use_defaults=false` 时单次覆盖）；非 `original` 模式下在 Worker 层统一转换散图及 ZIP 包内图片（同步更新 `manifest.json`，遇多帧 GIF 等动画自动保留动态不拆帧），本地 `image_dir` 导出与 QQ / Telegram 发送天然一致。
 - 永久下载与图文保存目录：可在管理页“01 下载与存储设置”点击“选择文件夹”浏览本机目录并点击“保存”，或通过 `update_settings` 设置 `download_dir` 与 `image_dir`，下载完成后自动导出成品，不受缓存自动清理影响。
 - 网络代理诊断：支持 `http` / `https` / `socks5` 代理，兼容 Fake-IP / TUN；可在设置页直接点击“测试连通性”测量代理 TCP 握手及国内外媒体目标连通延迟。
 - 已取消令牌授权设定：无 `auth.json`，打开 `http://127.0.0.1:58080/` 即可直接进入设置页；更改开关即自动保存，目录与代理提供显式保存与清空按钮，并支持“重置默认设置”。

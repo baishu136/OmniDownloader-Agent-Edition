@@ -46,6 +46,7 @@ class DownloadOptions(BaseModel):
     height: int | None = Field(None, ge=144, le=8640)
     container: Literal['mp4', 'mkv', 'auto'] | None = None
     audio_format: Literal['mp3', 'm4a', 'flac', 'opus'] | None = None
+    image_format: Literal['original', 'jpg', 'png', 'webp'] | None = None
     pack_zip: bool | None = None
     all_items: bool | None = None
     preserve_original: bool = True
@@ -59,6 +60,7 @@ class SettingsUpdate(BaseModel):
     max_height: int | None = Field(None, ge=144, le=8640)
     container: Literal['mp4', 'mkv', 'auto'] | None = None
     audio_format: Literal['mp3', 'm4a', 'flac', 'opus'] | None = None
+    image_format: Literal['original', 'jpg', 'png', 'webp'] | None = None
     pack_zip: bool | None = None
     autonomous: bool | None = None
     max_file_bytes: int | None = Field(None, ge=1024, le=20 * 1024**3)
@@ -734,6 +736,7 @@ class Service:
             height=s.default_height,
             container=s.container,
             audio_format=s.audio_format,
+            image_format=s.image_format,
             pack_zip=default_pack_zip,
             all_items=False,
         )
@@ -1397,6 +1400,13 @@ class Service:
             'cookie_agent_permissions': ['read_status', 'disable', 'remove'],
             'login_validation': ['哔哩哔哩', 'Pixiv'],
             'features': {k: getattr(s, k) for k in ('video', 'audio', 'images', 'collections', 'profiles', 'covers', 'autonomous', 'reuse_cache', 'auto_delete', 'pack_zip', 'qq_forward_collection', 'visual_enabled')},
+            'defaults': {
+                'type': s.default_type,
+                'height': s.default_height,
+                'container': s.container,
+                'audio_format': s.audio_format,
+                'image_format': s.image_format,
+            },
             'qq_delivery': {
                 'video_mode': s.qq_video_mode,
                 'image_mode': s.qq_image_mode,
