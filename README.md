@@ -37,3 +37,11 @@ docker compose up -d --build
 - **设置、桥接、运维与 Cookie 控制工具（13 项）**：`get_settings`、`update_settings`、`reset_settings`、`list_bridges`、`get_bot_configs`、`update_bot_config`、`probe_bot`、`list_approvals`、`approve_request`、`cleanup_cache`、`list_cookie_statuses`、`disable_platform_cookie`、`remove_platform_cookie`。
 
 QQ / Telegram 连接、链接前缀指令、下载可视化、MCP 配置与 AstrBot 示例见 [操作手册](agent-edition/docs/OPERATIONS.md)。
+
+## ☕ 赞助与支持
+
+如果您觉得本项目对您有所帮助，欢迎赞助支持作者！您的支持是持续维护与迭代的最大动力。
+
+| 微信支付 (WeChat Pay) | 支付宝 (Alipay) |
+| :---: | :---: |
+| <img src="docs/images/sponsor_wechat.jpg" width="240" alt="微信支付" /> | <img src="docs/images/sponsor_alipay.jpg" width="240" alt="支付宝" /> |
