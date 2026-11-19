@@ -154,3 +154,124 @@ async def test_all_items_separate_images_and_zip_packing_for_video_collection(tm
     assert len(out_paths) == 1 and out_paths[0].endswith('.zip')
     with zipfile.ZipFile(out_paths[0]) as zf:
         assert zf.testzip() is None and len(zf.namelist()) == 2
+
+
+async def test_auto_image_fallback_first_image_without_us_and_bilibili_single_video(tmp_path, monkeypatch):
+    import zipfile
+    monkeypatch.setattr('omni_agent.worker.install_network_guard', lambda *args: None)
+    monkeypatch.setattr('omni_agent.worker.validate_url', lambda url, **kw: url)
+    from core.config import config
+    from core.models import FormatOption, VideoMetadata
+    from engine.bilibili_extractor import BilibiliDirectExtractor
+    from engine.images import ImageEngine
+    from engine.platforms import PlatformEngine
+    from engine.url_sniffer import UrlSniffer
+
+    # 1. 默认 VIDEO_WITH_AUDIO 下发小红书图文链接（原帖 25 张图 > max_items=20）：
+    #    自动回退 ImageEngine，且不加 /us 时仅下载首图（1 张），不提前报 LIMIT_EXCEEDED
+    xhs_url = 'https://www.xiaohongshu.com/explore/auto-note'
+    post = {
+        'url': xhs_url,
+        'platform': '小红书',
+        'title': '自动图文笔记',
+        'resources': [{'id': f'img_{i}'} for i in range(1, 26)],
+    }
+    monkeypatch.setattr(UrlSniffer, 'sanitize_and_resolve_url', AsyncMock(return_value=xhs_url))
+    monkeypatch.setattr(PlatformEngine, 'extract', AsyncMock(side_effect=RuntimeError('[MEDIA_UNCONFIRMED] 当前会话未取得笔记视频')))
+    monkeypatch.setattr(ImageEngine, 'extract', AsyncMock(return_value=post))
+    dl_ids = []
+
+    async def fake_img_dl(task, progress, cancel):
+        from PIL import Image
+        dl_ids.append((task.download_type.value, list(task.selected_image_ids)))
+        p = Path(config.download_dir) / f'{task.id}.png'
+        Image.new('RGB', (4, 4), 'cyan').save(p)
+        return str(p)
+
+    monkeypatch.setattr(ImageEngine, 'download', fake_img_dl)
+
+    ev_single = []
+    await execute({
+        'action': 'download',
+        'url': xhs_url,
+        'all_items': False,
+        'allow_images': True,
+        'max_items': 20,
+        'state': str(tmp_path / 'w_auto1'),
+        'data': str(tmp_path / 'd_auto1'),
+        'max_file_bytes': 1024**2,
+        'options': {'download_type': 'VIDEO_WITH_AUDIO', 'height': 1080, 'container': 'mp4', 'audio_format': 'mp3', 'pack_zip': False},
+    }, ev_single.append)
+    assert dl_ids == [('IMAGE', ['img_1'])]
+    assert len(ev_single[-1]['result']['paths']) == 1
+    assert ev_single[-1]['result']['metadata']['media_type'] == 'images'
+
+    # 2. 不加 /us 仅加 /zip（pack_zip=True, image_zip_all=False）仍只打包首图；显式 image_zip_all=True 才打包全部
+    dl_ids.clear()
+    ev_zip_one = []
+    await execute({
+        'action': 'download',
+        'url': '/zip ' + xhs_url,
+        'all_items': False,
+        'allow_images': True,
+        'max_items': 5,
+        'state': str(tmp_path / 'w_zip1'),
+        'data': str(tmp_path / 'd_zip1'),
+        'max_file_bytes': 1024**2,
+        'options': {'download_type': 'VIDEO_WITH_AUDIO', 'height': 1080, 'container': 'mp4', 'audio_format': 'mp3', 'pack_zip': True, 'image_zip_all': False},
+    }, ev_zip_one.append)
+    assert dl_ids == [('IMAGE_ZIP', ['img_1'])]
+    assert ev_zip_one[-1]['result']['paths'][0].endswith('.zip')
+
+    # 3. 关闭图文权限（allow_images=False）时绝不自动回退图文
+    ev_denied = []
+    try:
+        await execute({
+            'action': 'download',
+            'url': xhs_url,
+            'all_items': False,
+            'allow_images': False,
+            'state': str(tmp_path / 'w_noimg'),
+            'data': str(tmp_path / 'd_noimg'),
+            'max_file_bytes': 1024**2,
+            'options': {'download_type': 'VIDEO_WITH_AUDIO', 'height': 1080, 'container': 'mp4', 'audio_format': 'mp3', 'pack_zip': False},
+        }, ev_denied.append)
+        assert False, 'Expected video extraction failure when allow_images=False'
+    except RuntimeError as exc:
+        assert 'MEDIA_UNCONFIRMED' in str(exc)
+
+    # 4. B 站带合集 multiMediaList 的普通单视频，不加 /us 直接下载当前单集（不报 COLLECTION_REQUIRED）
+    bili_url = 'https://www.bilibili.com/video/BV1singleP2?p=2'
+    c1 = VideoMetadata(url='https://www.bilibili.com/video/BV1singleP2', title='P1', siteName='哔哩哔哩')
+    c2 = VideoMetadata(url=bili_url, title='P2', siteName='哔哩哔哩')
+    bili_meta = VideoMetadata(
+        url=bili_url,
+        title='合集当前P2',
+        siteName='哔哩哔哩',
+        availableVideoFormats=[FormatOption(formatId='f1', resolutionLabel='720p', width=1280, height=720)],
+        multiMediaList=[c1, c2],
+    )
+    monkeypatch.setattr(UrlSniffer, 'sanitize_and_resolve_url', AsyncMock(return_value=bili_url))
+    monkeypatch.setattr(BilibiliDirectExtractor, 'extract', AsyncMock(return_value=bili_meta))
+    downloaded_urls = []
+
+    async def fake_bili_dl(task, progress, cancel):
+        from PIL import Image
+        downloaded_urls.append(task.url)
+        p = Path(config.download_dir) / f'{task.id}.png'
+        Image.new('RGB', (8, 8), 'blue').save(p)
+        return str(p)
+
+    monkeypatch.setattr(BilibiliDirectExtractor, 'download', fake_bili_dl)
+    ev_bili = []
+    await execute({
+        'action': 'download',
+        'url': bili_url,
+        'all_items': False,
+        'state': str(tmp_path / 'w_bili'),
+        'data': str(tmp_path / 'd_bili'),
+        'max_file_bytes': 1024**2,
+        'options': {'download_type': 'VIDEO_WITH_AUDIO', 'height': 1080, 'container': 'mp4', 'audio_format': 'mp3', 'pack_zip': False},
+    }, ev_bili.append)
+    assert downloaded_urls == [bili_url]
+    assert len(ev_bili[-1]['result']['paths']) == 1

@@ -64,13 +64,14 @@ def validate_url(url, *, initial=False, resolve=True, using_proxy=False):
         raise AgentError('INVALID_URL', '链接格式无效或域名无法解析') from None
 
 
-def parse_download_command(raw):
-    """解析链接前缀指令：/us（下载合集、分集视频、全部图片）、/zip（以压缩包形式发送）。"""
+def parse_download_commands(raw):
+    """解析链接前缀指令：/us（下载合集、分集视频、全部图片）、/zip（压缩包发送）、/merge（合并转发/媒体组发送）。"""
     text = str(raw or '').strip()
     all_items = False
     pack_zip = False
+    merge_forward = False
     while True:
-        match = re.match(r'^/(us|zip)(?=\s|$|https?://)(?:\s+)?', text, re.I)
+        match = re.match(r'^/(us|zip|merge)(?=\s|$|https?://)(?:\s+)?', text, re.I)
         if not match:
             break
         cmd = match.group(1).lower()
@@ -78,12 +79,20 @@ def parse_download_command(raw):
             all_items = True
         elif cmd == 'zip':
             pack_zip = True
+        elif cmd == 'merge':
+            merge_forward = True
         text = text[match.end():].lstrip()
-    return text, all_items, pack_zip
+    return text, all_items, pack_zip, merge_forward
+
+
+def parse_download_command(raw):
+    """向后兼容的三元组前缀解析接口，返回 (clean_text, all_items, pack_zip)。"""
+    clean, all_items, pack_zip, _ = parse_download_commands(raw)
+    return clean, all_items, pack_zip
 
 
 def source_url(text):
-    clean, _, _ = parse_download_command(text)
+    clean, _, _, _ = parse_download_commands(text)
     match = re.search(r'https?://[^\s<>"\u201d]+', clean)
     if not match:
         raise AgentError('INVALID_URL', '请提供HTTP(S)作品或合集链接')

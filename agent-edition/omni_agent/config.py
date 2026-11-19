@@ -51,6 +51,7 @@ class Settings(BaseModel):
     qq_video_mode: Literal['message', 'file'] = 'file'
     qq_image_mode: Literal['message', 'file'] = 'message'
     qq_forward_collection: bool = False
+    qq_forward_max_items: int = Field(30, ge=2, le=100)
     visual_enabled: bool = True
     visual_on_receive: bool = True
     visual_on_start: bool = True

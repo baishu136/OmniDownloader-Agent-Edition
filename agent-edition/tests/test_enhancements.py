@@ -781,6 +781,30 @@ async def test_astrbot_plugin_stage_visualization_and_direct_error(tmp_path, mon
     await plugin.process(DummyEvent(), 'https://www.bilibili.com/video/BV1srv', 'default', emit=lambda m: asyncio.sleep(0, result=srv_emitted.append(m)))
     assert srv_emitted == []
 
+    # 4. 验证 AstrBot /us /zip /merge 组合指令与带空格分享文案不再错拆链接为 approval_id
+    class ShareEvent(DummyEvent):
+        message_str = '/us /merge https://www.xiaohongshu.com/explore/abc123'
+
+    u1, a1 = plugin._extract_command_input(ShareEvent(), 'us', '/merge', 'https://www.xiaohongshu.com/explore/abc123')
+    assert u1 == '/us /merge https://www.xiaohongshu.com/explore/abc123' and a1 == ''
+
+    class MergeOnlyEvent(DummyEvent):
+        message_str = '/merge /us https://www.bilibili.com/video/BV1test 0123456789abcdef0123456789abcdef'
+
+    u2, a2 = plugin._extract_command_input(MergeOnlyEvent(), 'merge', '/us', 'https://www.bilibili.com/video/BV1test')
+    assert u2 == '/merge /us https://www.bilibili.com/video/BV1test'
+    assert a2 == '0123456789abcdef0123456789abcdef'
+
+    class ShareTextEvent(DummyEvent):
+        message_str = '/omni 3.89 复制打开抖音，看看作品 https://v.douyin.com/iTest/'
+
+    u3, a3 = plugin._extract_command_input(ShareTextEvent(), 'omni', '3.89', '复制打开抖音')
+    assert 'https://v.douyin.com/iTest/' in u3 and a3 == ''
+
+    # 无 message_str 时也兼容按空格拆坏的 /us /zip <url>
+    u4, a4 = plugin._extract_command_input(DummyEvent(), 'us', '/zip', 'https://x.com/u/status/9')
+    assert u4 == '/us /zip https://x.com/u/status/9' and a4 == ''
+
 
 @pytest.mark.asyncio
 async def test_visual_events_outbox_server_bot_notify_and_mcp_progress(service, tmp_path, monkeypatch):

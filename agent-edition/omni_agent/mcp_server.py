@@ -68,7 +68,7 @@ def create_mcp(invoke, on_session=None):
         version=__version__,
         middleware=[ToolBoundary(on_session=on_session)],
         instructions='No authorization token is required for local access. You may read, update and reset service settings, manage bot configurations, inspect auto-detected bridges (list_bridges), cache cleanup and approvals. '
-                     'URL prefixes supported by analyze_media/download_media: "/us" (download collection, multi-part videos or all images) and "/zip" (send as a ZIP archive). '
+                     'URL prefixes supported by analyze_media/download_media: "/us" (download collection, multi-part videos or all images; without /us image posts download only the first image), "/zip" (send as a ZIP archive), and "/merge" (force merged forward message on QQ or media group on Telegram). '
                      'Download visualization & status delivery: task and delivery results include "visualization" with ordered "pending_events" (each having seq, stage, should_reply, server_notified, message), "latest_seq", and "server_notified". '
                      'When triggering downloads for QQ / Telegram users, pass notify_adapter and notify_target (if known and permitted) so the server can push status messages immediately via the configured bot without waiting for LLM turn boundaries. '
                      'When polling get_task_status / get_delivery_status / deliver_media, pass after_seq=visualization.latest_seq and wait_seconds=5 (up to 30) so milestone transitions return immediately without missing fast stages or cache hits. '
@@ -79,11 +79,11 @@ def create_mcp(invoke, on_session=None):
                      'Downloads are asynchronous: use get_task_status with wait_seconds/after_seq, then call deliver_media for bot delivery.',
     )
 
-    @server.tool(structured_output=True, description='Analyze a supported public share/post/collection link (supports /us and /zip prefixes). Returns only observed metadata and real formats.')
+    @server.tool(structured_output=True, description='Analyze a supported public share/post/collection link (supports /us, /zip and /merge prefixes; image posts auto-detect). Returns only observed metadata and real formats.')
     async def analyze_media(url: Annotated[str, Field(min_length=1, max_length=8192)], media_type: Literal['video', 'images'] = 'video') -> dict[str, Any]:
         return await invoke('analyze_media', {'url': url, 'media_type': media_type})
 
-    @server.tool(structured_output=True, description='Create an asynchronous download and return a task ID. Supports "/us" (collection/episodes/all images) and "/zip" (ZIP archive) URL prefixes. Optionally supply notify_adapter/notify_target to push status notifications directly via bot.')
+    @server.tool(structured_output=True, description='Create an asynchronous download and return a task ID. Supports "/us" (collection/episodes/all images; without /us image posts fetch only the first image), "/zip" (ZIP archive) and "/merge" (force merged forward/media group delivery) prefixes. Auto-detects image posts when images feature is enabled. Optionally supply notify_adapter/notify_target.')
     async def download_media(url: Annotated[str, Field(min_length=1, max_length=8192)], options: DownloadOptions | None = None,
                              request_key: Annotated[str | None, Field(max_length=128)] = None,
                              approval_id: str | None = None,
@@ -151,7 +151,7 @@ def create_mcp(invoke, on_session=None):
     async def list_bridges() -> dict[str, Any]:
         return await invoke('list_bridges', {})
 
-    @server.tool(structured_output=True, description='Queue delivery of all completed task files to an allowed Telegram or QQ target. Honors QQ video/image message/file and forward collection settings. Pass after_seq to avoid repeating earlier milestones.')
+    @server.tool(structured_output=True, description='Queue delivery of all completed task files in original order to an allowed Telegram or QQ target. Honors /merge, QQ video/image/forward settings (including qq_forward_max_items batch limit) and Telegram sendMediaGroup. Pass after_seq to avoid repeating earlier milestones.')
     async def deliver_media(task_id: str, adapter: Literal['telegram', 'onebot'], target: str,
                             request_key: Annotated[str, Field(min_length=1, max_length=128)],
                             kind: Literal['auto', 'video', 'audio', 'photo', 'document'] = 'auto',

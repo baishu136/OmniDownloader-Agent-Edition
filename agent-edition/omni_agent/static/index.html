@@ -141,7 +141,7 @@
       </section>
 
       <section id="features">
-        <div class="section-heading"><span>02</span><div><h2>功能权限与下载限制</h2><p>关闭后，MCP 与机器人调用会直接被拒绝；支持 <code>/us</code>（合集/分集/全图）和 <code>/zip</code>（压缩包）前缀指令。</p></div></div>
+        <div class="section-heading"><span>02</span><div><h2>功能权限与下载限制</h2><p>关闭后，MCP 与机器人调用会直接被拒绝；支持 <code>/us</code>（合集/分集/全图；不加时图文仅首图）、<code>/zip</code>（压缩包）与 <code>/merge</code>（合并转发）前缀指令。</p></div></div>
         <div class="switches">
           <label><span>允许 Agent 自主选择参数<small>仍受画质、体积和功能限制</small></span><input type="checkbox" name="autonomous" role="switch"></label>
           <label><span>视频下载<small>含仅视频和 GIF 导出</small></span><input type="checkbox" name="video" role="switch"></label>
@@ -164,7 +164,7 @@
       </section>
 
       <section id="qq-policy">
-        <div class="section-heading"><span>03</span><div><h2>QQ 消息与合集发送设置</h2><p>控制 OneBot / NapCat 向群聊或私聊发送媒体时的真实协议行为（使用 <code>/zip</code> 时始终以文件形式发送压缩包）。</p></div></div>
+        <div class="section-heading"><span>03</span><div><h2>QQ 消息与合集发送设置</h2><p>控制 OneBot / NapCat 向群聊或私聊发送媒体时的真实协议行为（使用 <code>/zip</code> 始终以文件发送；使用 <code>/merge</code> 可单次强制合并转发）。</p></div></div>
         <div class="field-grid">
           <label>视频发送方式
             <select name="qq_video_mode">
@@ -178,10 +178,14 @@
               <option value="file">以群/私聊文件发送</option>
             </select>
           </label>
+          <label>合并转发单批上限条数
+            <input name="qq_forward_max_items" type="number" min="2" max="100" required>
+            <small>默认 30 条；超过此数量时自动拆分为多条合并转发发出，防止超时或被拒</small>
+          </label>
         </div>
         <div class="switches sub-switches">
           <label>
-            <span>合集 / 图集打包为转发的聊天记录<small>启用后，多个视频或图片会打包成一条合并转发消息（<code>send_*_forward_msg</code>）发出，避免刷屏</small></span>
+            <span>合集 / 图集打包为转发的聊天记录<small>启用后，多个视频或图片按原序打包成合并转发消息（<code>send_*_forward_msg</code>）发出，也可使用 <code>/merge</code> 临时指定</small></span>
             <input type="checkbox" name="qq_forward_collection" role="switch">
           </label>
         </div>

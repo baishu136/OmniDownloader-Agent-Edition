@@ -329,7 +329,7 @@ def test_patch_and_reset_settings_and_storage_directories(service, tmp_path):
 
 
 async def test_download_command_prefixes_us_and_zip(service):
-    from omni_agent.security import parse_download_command
+    from omni_agent.security import parse_download_command, parse_download_commands
 
     assert parse_download_command('/us https://www.bilibili.com/video/BV1xx') == ('https://www.bilibili.com/video/BV1xx', True, False)
     assert parse_download_command('/zip https://www.xiaohongshu.com/explore/1') == ('https://www.xiaohongshu.com/explore/1', False, True)
@@ -337,12 +337,47 @@ async def test_download_command_prefixes_us_and_zip(service):
     assert parse_download_command('/zip/us https://youtube.com/watch?v=1') == ('/zip/us https://youtube.com/watch?v=1', False, False)
     assert parse_download_command('/ushttps://youtube.com/watch?v=1') == ('https://youtube.com/watch?v=1', True, False)
 
-    # 通过服务层调用，/us + /zip 能正确写入 payload 的 all_items 与 pack_zip
+    # /merge 前缀指令及其任意组合
+    assert parse_download_commands('/merge https://www.xiaohongshu.com/explore/1') == ('https://www.xiaohongshu.com/explore/1', False, False, True)
+    assert parse_download_commands('/us /merge https://www.bilibili.com/video/BV1xx') == ('https://www.bilibili.com/video/BV1xx', True, False, True)
+    assert parse_download_commands('/merge /us /zip https://x.com/u/status/1') == ('https://x.com/u/status/1', True, True, True)
+
+    # 默认合并转发单批上限应为 30 条，并可通过 update_settings 修改
+    assert service.config.settings.qq_forward_max_items == 30
+    updated = service.update_settings({'qq_forward_max_items': 25})
+    assert updated['qq_forward_max_items'] == 25
+    assert service.capabilities()['qq_delivery']['forward_max_items'] == 25
+    assert '/merge' in service.capabilities()['download_commands']
+
+    # 通过服务层调用，/us + /zip + /merge 能正确写入 payload 的 all_items、pack_zip 与 cmd_merge
     service.update_settings({'confirmation_threshold': 50})
-    job = await service.download('agent', '/us /zip https://www.bilibili.com/video/BV17x411w7KC', DownloadOptions())
+    job = await service.download('agent', '/us /zip /merge https://www.bilibili.com/video/BV17x411w7KC', DownloadOptions())
     stored = service.store.payload(service.store.job(job['id']))
     assert stored['all_items'] is True
-    assert stored['cmd_all'] is True and stored['cmd_zip'] is True
+    assert stored['cmd_all'] is True and stored['cmd_zip'] is True and stored['cmd_merge'] is True
     assert stored['options']['pack_zip'] is True
     assert stored['url'] == 'https://www.bilibili.com/video/BV17x411w7KC'
+    assert '合并转发 /merge' in job['metadata']['command_summary']
+
+    # 9 张图文下载不再因 500 MiB * 9 误报 CACHE_FULL，3 张图文在默认阈值 5 下也不误报 CONFIRMATION_REQUIRED
+    service.update_settings({'confirmation_threshold': 5, 'max_collection': 20})
+    small_img_col = await service.download(
+        'agent',
+        'https://www.xiaohongshu.com/explore/9pics',
+        DownloadOptions(use_defaults=False, download_type='IMAGE'),
+        collection=True,
+        start=1,
+        count=3,
+    )
+    assert small_img_col['state'] == 'QUEUED'
+    service.update_settings({'confirmation_threshold': 10})
+    nine_img_col = await service.download(
+        'agent',
+        'https://www.xiaohongshu.com/explore/9pics',
+        DownloadOptions(use_defaults=False, download_type='IMAGE'),
+        collection=True,
+        start=1,
+        count=9,
+    )
+    assert nine_img_col['state'] == 'QUEUED'
 

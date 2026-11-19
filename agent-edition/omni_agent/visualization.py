@@ -26,11 +26,20 @@ def render_template(template: str, variables: dict) -> str:
     return _PLACEHOLDER_RE.sub(_replace, source).strip()
 
 
-def summarize_command(*, cmd_all: bool = False, cmd_zip: bool = False, pack_zip: bool = False, download_type: str = '') -> str:
+def summarize_command(
+    *,
+    cmd_all: bool = False,
+    cmd_zip: bool = False,
+    cmd_merge: bool = False,
+    pack_zip: bool = False,
+    download_type: str = '',
+) -> str:
     """生成可读的链接指令与打包模式摘要。"""
     parts = []
     if cmd_all:
         parts.append('合集全量 /us')
+    if cmd_merge:
+        parts.append('合并转发 /merge')
     if cmd_zip or pack_zip:
         parts.append('压缩包 /zip' if cmd_zip else '压缩包导出')
     if download_type and download_type != 'VIDEO_WITH_AUDIO':

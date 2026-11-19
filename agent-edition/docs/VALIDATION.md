@@ -3,13 +3,13 @@
 日期：2026-11-19。下列记录来自实际执行，模拟 API 和真实平台验收严格区分。
 
 - Windows 原核心：`python -m pytest windows/tests -q`，140 通过，存在既有 Pydantic 弃用警告。
-- Agent 独立测试：`python -m pytest agent-edition/tests -q`，102 通过，覆盖：
+- Agent 独立测试：`python -m pytest agent-edition/tests -q`，104 通过，覆盖：
   - 独立默认工作目录解析（`./data/` 及便携目录同级 `data/`）与无 `auth.json` 验证；
   - 免令牌 HTTP 管理接口与官方 MCP SDK 真实 `stdio` / Streamable HTTP 握手及 23 项工具（含 `list_bridges`）发现；
   - 设置读取/局部更新/自动保存/重置默认设置，以及 `download_dir`、`image_dir` 永久导出、页内目录浏览/创建与原生文件夹选择降级逻辑；
   - 网络代理格式校验、不可达端口快速报错与 HTTP 连通性延迟探测；
-  - 图文下载与打包压缩包分离，`/us`、`/zip` 与 `/us /zip` 链接前缀解析与多集视频/全图执行验证；
-  - QQ 视频/图片消息与群文件发送切换、`.zip` 强制文件上传、合集/图集打包为合并转发聊天记录（`send_group_forward_msg`）及 Bot 连接信息探测；
+  - 图文自动识别与打包分离：默认模式下自动识别/回退图文提取，不加 `/us` 时仅下载首图（或当前单集视频），支持 `/us`（全量）、`/zip`（打包）与 `/merge`（合并转发）任意组合解析，以及 `task_files.ord` 严格保序；
+  - QQ 与 Telegram 合集/图集发送验证：QQ 视频/图片消息与群文件切换、`.zip` 强制文件上传、合并转发（`send_group_forward_msg`）及默认 30 条上限（`qq_forward_max_items`）自动分批、单次交付探针缓存、Windows 盘符 `file:///` URI 转换，以及 Telegram `sendMediaGroup` 相册分批与降级、WebP/AVIF 内存无损转 JPEG/PNG 发送与 GIF `sendAnimation`；
   - 下载可视化高可靠机制、事件流与直发联动验证：SQLite `visual_events` 持久化出箱、`after_seq` 游标增量消费与 `wait_seconds` 长轮询在缓存秒命中及极速下载下零丢包、Telegram `sendMessage`/`editMessageText` 原地编辑刷新与 OneBot 群文本直发（受 `allowed_targets` 白名单约束且不重复发阶段）、`server_bot`/`caller_only`/`auto` 通道切换、`AgentError` 附带 `visualization` 错误载荷、`POST /api/admin/visual/test` 预览及试发、MCP 23 工具保持不变下的 `Context.report_progress` 实时通知、AstrBot `context.send_message`/`pending_events` 与 `OmniBotClient` 事件流与报错直出；
   - 已接入桥接自动识别：Streamable HTTP / MCP stdio / AstrBot 心跳注册、`list_bridges` 工具与离线注销检测；
   - Cookie 多格式导入（Netscape / 请求头 / JSON 数组）、环回 WebSocket+HTTP 多路 CDP Cookie 合并与脱敏宿主域解析、对齐 Android 版登录体验（首次「登录获取会话」与重验证「重新验证登录」切换、重新验证及独立容器防自动覆写 `require_explicit_save`、清除会话 Google 注销提醒与 `manage_only` 只管理模式、页内 Google/平台快捷导航、Google/独立登录档案多账号隔离容器 `data/browser-profiles/<id>_e<epoch>/` 与两阶段 `epoch`/`owner_token` 所有权校验安全退出）、多平台批量工作窗/后台无头一键免密同步、浏览器首选策略（Chrome 优先于 Edge 及可选切换）、防风控纯净无调试模式（屏蔽 `AutomationControlled`、Google 流程智能省去 `--remote-debugging-port`、Windows `WM_CLOSE` 优雅刷盘关闭及同内核 `.omni-browser.json` 匹配无头读回与一键 `relaunch-clean`）、系统默认浏览器打开接口、B站扫码流程及严格权限隔离（Agent 仅可读取非敏感状态、禁用与移除，绝无读取明文/UI 元数据/来源字段/`owner_token`/浏览器偏好/独立档案/浏览器同步或重置权限）；

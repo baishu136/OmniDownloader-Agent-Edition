@@ -46,7 +46,7 @@ class Runner:
         state.mkdir(parents=True, exist_ok=True)
         request = dict(payload, data=str(self.config.directory), state=str(state), proxy=settings.proxy,
             max_file_bytes=settings.max_file_bytes, max_items=settings.max_profile if payload.get('profile') else settings.max_collection,
-            allow_profiles=settings.profiles)
+            allow_profiles=settings.profiles, allow_images=settings.images, allow_collections=settings.collections)
         env = dict(os.environ)
         env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1])
         env['PYTHONIOENCODING'] = 'utf-8'

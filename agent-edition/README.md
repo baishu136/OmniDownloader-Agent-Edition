@@ -5,9 +5,9 @@
 - 官方 MCP Python SDK 2.3：stdio、Streamable HTTP，23 个带严格 Schema 的工具（含 `list_bridges` 自动桥接识别）。
 - 免令牌本机直连管理：用户与 Agent 均可读取/修改/重置下载参数、打包方式、存储目录、QQ 消息/文件/转发模式、下载可视化通知规则、功能开关、代理与机器人配置。
 - 目录选择与网络代理诊断：提供桌面系统文件夹选择弹窗与跨环境 页内服务端目录浏览器、目录保存按键及代理 TCP/HTTP 连通性诊断测试。
-- 链接前缀指令：支持 `/us`（下载合集、分集视频、全部图片）与 `/zip`（打包为 ZIP 压缩包发送）。
+- 链接前缀指令与图文智能识别：支持 `/us`（下载合集、分集视频、全部图片；不加 `/us` 时图文仅下载首图）、`/zip`（打包为 ZIP 压缩包发送）与 `/merge`（强制合并转发/媒体组发送），默认模式自动识别图文作品并保持 `task_files.ord` 严格原序。
 - 完善 Cookie 登录流程与多账号隔离容器：对齐 Android 版「登录获取会话 / 重新验证登录」及防误覆写策略（`require_explicit_save`），优先 Google Chrome 并支持页面选择本机 Edge/Chrome/Brave，内置**防风控纯净无调试模式**（Google 登录流程自动关闭调试端口、彻底解决 Edge / Chrome 无法登录 Google 问题），提供清除后 Google 账号注销提示与 `manage_only` 管理页、页内快捷导航、Google / 独立登录档案（多账号隔离与 `owner_token` 安全退出）、哔哩哔哩官方扫码、持久档案免密同步与默认浏览器导入；严格维持 Agent 零明文及零浏览器偏好/独立档案读写隔离。
 - 下载可视化高可靠反馈与报错直出：采用 SQLite `visual_events` 事件流与 `after_seq`/`wait_seconds` 长轮询防极速下载/缓存命中丢阶段，支持 `auto` / `server_bot`（QQ/Telegram 机器人白名单即时文本直发及 Telegram 原地编辑刷新）/ `caller_only` 通道、MCP `Context.report_progress` 进度推送、管理页预览与测试通知，以及任意报错直接输出脱敏报错内容。
-- Telegram multipart 上传、OneBot 11 / NapCat 群聊/私聊消息、群文件与合并转发聊天记录交付，并自动识别已接入的 MCP / AstrBot / Bot 桥接。
+- Telegram 相册/动图/WebP/AVIF 兼容与 OneBot 11 / NapCat 群聊/私聊消息、群文件及合并转发（默认单批 30 条上限自动分批 `qq_forward_max_items`）交付，并自动识别已接入的 MCP / AstrBot / Bot 桥接。
 
 Windows：运行根目录 `启动服务.bat` 或 `dist\OmniDownloaderAgent\OmniDownloaderAgent.exe`，打开 `http://127.0.0.1:58080/` 直接管理设置。stdio 使用同包 `OmniDownloaderAgentMCP.exe --stdio`。

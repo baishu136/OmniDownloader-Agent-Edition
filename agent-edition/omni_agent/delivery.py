@@ -1,7 +1,11 @@
 """Authenticated outgoing API calls are the only source of send receipts."""
 import asyncio
+import contextlib
+import io
+import json
 import mimetypes
 from pathlib import Path
+import re
 import time
 from typing import Literal, Protocol
 from urllib.parse import urlsplit
@@ -13,6 +17,8 @@ from .errors import AgentError
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif'}
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.flv'}
+_TELEGRAM_CONVERT_PHOTO_EXTS = {'.webp', '.avif', '.bmp'}
+_WIN_DRIVE_RE = re.compile(r'^[A-Za-z]:[/\\]')
 
 
 class BotConfig(BaseModel):
@@ -53,9 +59,10 @@ class APIAdapter:
     def __init__(self, config, transport=None):
         self.config, self.transport = config, transport
 
-    async def request(self, path, **kwargs):
+    async def request(self, path, *, timeout: float | None = None, **kwargs):
         # 禁止跟随重定向，防止恶意节点窃取机器人请求头或令牌
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=10), transport=self.transport,
+        read_timeout = float(timeout) if timeout is not None else 120.0
+        async with httpx.AsyncClient(timeout=httpx.Timeout(read_timeout, connect=10), transport=self.transport,
                                      trust_env=False, follow_redirects=False) as client:
             for attempt in range(3):
                 for value in kwargs.get('files', {}).values():
@@ -73,7 +80,11 @@ class APIAdapter:
                 if response.status_code == 429:
                     if attempt == 2:
                         raise AgentError('BOT_RATE_LIMITED', '机器人发送限流，文件已保留')
-                    delay = min(5, max(0, int(response.headers.get('Retry-After', '1'))))
+                    try:
+                        retry_after = int(response.headers.get('Retry-After', '1'))
+                    except ValueError:
+                        retry_after = 1
+                    delay = min(30, max(1, retry_after))
                     await asyncio.sleep(delay)
                     continue
                 if response.status_code >= 500:
@@ -115,30 +126,149 @@ class TelegramAdapter(APIAdapter):
         method_limit = 10 * 1024**2 if kind == 'photo' else (2000 * 1024**2 if self.config.local_api else 50 * 1024**2)
         return min(method_limit, self.config.max_upload_bytes)
 
+    def _convert_photo_in_memory(self, path: Path) -> tuple[str, io.BytesIO, str] | None:
+        """将 WebP / AVIF / BMP 在内存中转为 Telegram 兼容 JPEG/PNG 字节流，不改动磁盘受控原文件。"""
+        try:
+            from PIL import Image
+            with Image.open(path) as img:
+                has_alpha = img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info)
+                buf = io.BytesIO()
+                if has_alpha:
+                    img.convert('RGBA').save(buf, format='PNG', optimize=True)
+                    ext, mime = '.png', 'image/png'
+                else:
+                    img.convert('RGB').save(buf, format='JPEG', quality=92, optimize=True)
+                    ext, mime = '.jpg', 'image/jpeg'
+                if buf.tell() <= 0 or buf.tell() > self.limit('photo'):
+                    return None
+                buf.seek(0)
+                return f'{path.stem}{ext}', buf, mime
+        except Exception:
+            return None
+
+    def media_group_kind(self, path: Path) -> str | None:
+        """判断文件是否可纳入 Telegram sendMediaGroup（photo / video）。"""
+        suffix = path.suffix.lower()
+        if suffix in ('.jpg', '.jpeg', '.png'):
+            return 'photo' if path.stat().st_size <= self.limit('photo') else None
+        if suffix in _TELEGRAM_CONVERT_PHOTO_EXTS:
+            return 'photo' if path.stat().st_size <= self.limit('document') else None
+        if suffix == '.mp4':
+            return 'video' if path.stat().st_size <= self.limit('video') else None
+        return None
+
     async def send(self, path, target, kind='auto', **_kwargs):
         self.check_target(target)
+        suffix = path.suffix.lower()
+        converted_photo = None
         if kind == 'auto':
-            suffix = path.suffix.lower()
-            kind = 'photo' if suffix in ('.jpg', '.jpeg', '.png') else 'video' if suffix == '.mp4' else 'audio' if suffix in ('.mp3', '.m4a') else 'document'
-            if path.stat().st_size > self.limit(kind):
+            if suffix in ('.jpg', '.jpeg', '.png'):
+                kind = 'photo'
+            elif suffix in _TELEGRAM_CONVERT_PHOTO_EXTS:
+                converted_photo = self._convert_photo_in_memory(path)
+                kind = 'photo' if converted_photo else 'document'
+            elif suffix == '.gif':
+                kind = 'animation'
+            elif suffix == '.mp4':
+                kind = 'video'
+            elif suffix in ('.mp3', '.m4a'):
+                kind = 'audio'
+            else:
                 kind = 'document'
-        if kind not in ('video', 'audio', 'photo', 'document'):
+            if converted_photo is None and path.stat().st_size > self.limit(kind):
+                kind = 'document'
+        elif kind == 'photo' and suffix in _TELEGRAM_CONVERT_PHOTO_EXTS:
+            converted_photo = self._convert_photo_in_memory(path)
+        if kind not in ('video', 'audio', 'photo', 'animation', 'document'):
             raise AgentError('INVALID_PARAMETER', '不支持的发送类型')
-        if path.stat().st_size > self.limit(kind):
+        if converted_photo is None and path.stat().st_size > self.limit(kind):
             raise AgentError('BOT_FILE_TOO_LARGE', '文件超过当前 Telegram 发送方式的限制')
-        method = {'video': 'sendVideo', 'audio': 'sendAudio', 'photo': 'sendPhoto', 'document': 'sendDocument'}[kind]
-        with path.open('rb') as stream:
+        method = {
+            'video': 'sendVideo',
+            'audio': 'sendAudio',
+            'photo': 'sendPhoto',
+            'animation': 'sendAnimation',
+            'document': 'sendDocument',
+        }[kind]
+        form_data = {'chat_id': target}
+        if kind == 'video':
+            form_data['supports_streaming'] = 'true'
+        if converted_photo is not None:
+            upload_name, upload_buf, upload_mime = converted_photo
             data = await self.request(
                 '/bot' + self.config.token + '/' + method,
-                data={'chat_id': target},
-                files={kind: (path.name, stream, mimetypes.guess_type(path.name)[0] or 'application/octet-stream')},
+                data=form_data,
+                files={kind: (upload_name, upload_buf, upload_mime)},
             )
+        else:
+            with path.open('rb') as stream:
+                data = await self.request(
+                    '/bot' + self.config.token + '/' + method,
+                    data=form_data,
+                    files={kind: (path.name, stream, mimetypes.guess_type(path.name)[0] or 'application/octet-stream')},
+                )
         result = data.get('result') or {}
         if data.get('ok') is not True:
             raise AgentError('BOT_REJECTED', 'Telegram 未确认发送成功，文件已保留')
         if not result.get('message_id') or str(result.get('chat', {}).get('id')) != target:
             raise AgentError('DELIVERY_UNCERTAIN', 'Telegram 回执缺少消息或匹配的会话标识')
         return {'platform': 'telegram', 'message_id': result['message_id'], 'chat_id': target}
+
+    async def send_media_group(self, paths: list[Path], target: str, *, caption: str = '') -> list[dict]:
+        """以 Telegram sendMediaGroup 聚合发送 2~10 个图片/视频，减少刷屏并返回逐条回执。"""
+        self.check_target(target)
+        if not 2 <= len(paths) <= 10:
+            raise AgentError('INVALID_PARAMETER', 'Telegram 媒体组仅支持单批 2 至 10 个媒体')
+        media_items = []
+        files_payload = {}
+        with contextlib.ExitStack() as stack:
+            for idx, path in enumerate(paths):
+                key = f'media_{idx}'
+                suffix = path.suffix.lower()
+                if suffix == '.mp4':
+                    if path.stat().st_size > self.limit('video'):
+                        raise AgentError('BOT_FILE_TOO_LARGE', '视频超过 Telegram 发送上限')
+                    stream = stack.enter_context(path.open('rb'))
+                    files_payload[key] = (path.name, stream, 'video/mp4')
+                    entry = {'type': 'video', 'media': f'attach://{key}', 'supports_streaming': True}
+                else:
+                    if suffix in _TELEGRAM_CONVERT_PHOTO_EXTS:
+                        converted = self._convert_photo_in_memory(path)
+                        if converted is None:
+                            raise AgentError('BOT_FILE_TOO_LARGE', '转换后的图片超过 Telegram 照片发送上限')
+                        files_payload[key] = converted
+                    else:
+                        if path.stat().st_size > self.limit('photo'):
+                            raise AgentError('BOT_FILE_TOO_LARGE', '图片超过 Telegram 照片发送上限')
+                        stream = stack.enter_context(path.open('rb'))
+                        files_payload[key] = (path.name, stream, mimetypes.guess_type(path.name)[0] or 'image/jpeg')
+                    entry = {'type': 'photo', 'media': f'attach://{key}'}
+                if idx == 0 and caption:
+                    entry['caption'] = str(caption).strip()[:1024]
+                media_items.append(entry)
+
+            data = await self.request(
+                '/bot' + self.config.token + '/sendMediaGroup',
+                timeout=min(300.0, max(120.0, 30.0 * len(paths))),
+                data={'chat_id': target, 'media': json.dumps(media_items, ensure_ascii=False)},
+                files=files_payload,
+            )
+        results = data.get('result')
+        if data.get('ok') is not True:
+            raise AgentError('BOT_REJECTED', 'Telegram 媒体组未确认发送成功，文件已保留')
+        if not isinstance(results, list) or len(results) != len(paths):
+            raise AgentError('DELIVERY_UNCERTAIN', 'Telegram 媒体组回执数量不完整；请核对后决定重试')
+        receipts = []
+        for item in results:
+            if not isinstance(item, dict) or not item.get('message_id') or str((item.get('chat') or {}).get('id')) != target:
+                raise AgentError('DELIVERY_UNCERTAIN', 'Telegram 媒体组回执缺少消息或匹配的会话标识')
+            receipts.append({
+                'platform': 'telegram',
+                'mode': 'media_group',
+                'message_id': item['message_id'],
+                'chat_id': target,
+            })
+        return receipts
 
     async def send_text(self, target: str, text: str, *, message_id=None) -> dict:
         """向已许可的 Telegram 会话发送文本状态消息，支持在已有 message_id 上原地更新。"""
@@ -168,8 +298,13 @@ class TelegramAdapter(APIAdapter):
 
 
 class OneBotAdapter(APIAdapter):
-    async def api(self, action, payload=None):
-        data = await self.request('/' + action, json=payload or {}, headers={'Authorization': 'Bearer ' + self.config.token})
+    def __init__(self, config, transport=None):
+        super().__init__(config, transport)
+        self._probe_cache: dict | None = None
+        self._checked_targets: set[str] = set()
+
+    async def api(self, action, payload=None, *, timeout: float | None = None):
+        data = await self.request('/' + action, timeout=timeout, json=payload or {}, headers={'Authorization': 'Bearer ' + self.config.token})
         if data.get('status') != 'ok' or data.get('retcode') != 0:
             code = 'CAPABILITY_UNAVAILABLE' if data.get('retcode') in (1404, 404) else 'BOT_REJECTED'
             raise AgentError(code, 'OneBot 未确认操作成功；请检查协议端 API 能力或权限')
@@ -191,6 +326,13 @@ class OneBotAdapter(APIAdapter):
         return self.config.remote_root.rstrip('/\\') + '/' + resolved.relative_to(root).as_posix()
 
     @staticmethod
+    def _media_file_uri(remote: str) -> str:
+        """Windows 带盘符路径转为 file:/// URI 以兼容 OneBot 媒体消息段，Linux 容器路径保持原样。"""
+        if _WIN_DRIVE_RE.match(remote):
+            return 'file:///' + remote.replace('\\', '/')
+        return remote
+
+    @staticmethod
     def media_category(path: Path) -> str:
         suffix = path.suffix.lower()
         if suffix in IMAGE_EXTENSIONS:
@@ -199,9 +341,11 @@ class OneBotAdapter(APIAdapter):
             return 'video'
         return 'file'
 
-    async def probe(self):
+    async def probe(self, *, use_cache: bool = False):
         if not self.config.enabled:
             raise AgentError('BOT_DISABLED', '请先保存并启用 OneBot 连接')
+        if use_cache and self._probe_cache is not None:
+            return self._probe_cache
         version = await self.api('get_version_info')
         status = await self.api('get_status')
         if not isinstance(version, dict) or not isinstance(status, dict) or status.get('online') is not True:
@@ -223,13 +367,14 @@ class OneBotAdapter(APIAdapter):
                 result['nickname'] = str(login.get('nickname', ''))[:40]
         except AgentError:
             pass
+        self._probe_cache = result
         return result
 
     async def send(self, path, target, kind='auto', *, video_mode='file', image_mode='message'):
         self.check_target(target)
         chat_type, number = self._parse_target(target)
         remote = self._map_remote(path)
-        probe_info = await self.probe()
+        probe_info = await self.probe(use_cache=True)
 
         category = self.media_category(path)
         use_message = (
@@ -240,7 +385,7 @@ class OneBotAdapter(APIAdapter):
         if use_message:
             action = 'send_group_msg' if chat_type == 'group' else 'send_private_msg'
             id_key = 'group_id' if chat_type == 'group' else 'user_id'
-            segment = {'type': category, 'data': {'file': remote}}
+            segment = {'type': category, 'data': {'file': self._media_file_uri(remote)}}
             result = await self.api(action, {id_key: number, 'message': [segment]})
             if not isinstance(result, dict) or not any(result.get(k) for k in ('message_id', 'id')):
                 raise AgentError('DELIVERY_UNCERTAIN', '协议端未返回可核对的消息标识；保留文件等待核对')
@@ -252,10 +397,13 @@ class OneBotAdapter(APIAdapter):
                 **{k: result[k] for k in ('message_id', 'id') if k in result},
             }
 
-        if chat_type == 'group':
-            await self.api('get_group_file_system_info', {'group_id': number})
-        else:
-            await self.api('get_stranger_info', {'user_id': number, 'no_cache': True})
+        target_key = f'file:{target}'
+        if target_key not in self._checked_targets:
+            if chat_type == 'group':
+                await self.api('get_group_file_system_info', {'group_id': number})
+            else:
+                await self.api('get_stranger_info', {'user_id': number, 'no_cache': True})
+            self._checked_targets.add(target_key)
         payload = {'file': remote, 'name': path.name, ('group_id' if chat_type == 'group' else 'user_id'): number}
         result = await self.api('upload_group_file' if chat_type == 'group' else 'upload_private_file', payload)
         if not isinstance(result, dict) or not any(result.get(k) for k in ('file_id', 'id', 'message_id')):
@@ -272,7 +420,7 @@ class OneBotAdapter(APIAdapter):
         """将合集或图集的多个媒体文件打包为 OneBot 合并转发聊天记录发出。"""
         self.check_target(target)
         chat_type, number = self._parse_target(target)
-        probe_info = await self.probe()
+        probe_info = await self.probe(use_cache=True)
         bot_uid = str(probe_info.get('bot_id') or '10000')
         bot_name = probe_info.get('nickname') or 'OmniDownloader'
 
@@ -292,12 +440,13 @@ class OneBotAdapter(APIAdapter):
                 'data': {
                     'user_id': bot_uid,
                     'nickname': bot_name,
-                    'content': [{'type': category, 'data': {'file': remote}}],
+                    'content': [{'type': category, 'data': {'file': self._media_file_uri(remote)}}],
                 },
             })
         action = 'send_group_forward_msg' if chat_type == 'group' else 'send_private_forward_msg'
         id_key = 'group_id' if chat_type == 'group' else 'user_id'
-        result = await self.api(action, {id_key: number, 'messages': nodes})
+        timeout = min(300.0, max(120.0, 30.0 * len(paths)))
+        result = await self.api(action, {id_key: number, 'messages': nodes}, timeout=timeout)
         if not isinstance(result, dict) or not any(result.get(k) for k in ('message_id', 'id', 'res_id')):
             raise AgentError('DELIVERY_UNCERTAIN', '协议端未返回可核对的转发记录标识；保留文件等待核对')
         return {

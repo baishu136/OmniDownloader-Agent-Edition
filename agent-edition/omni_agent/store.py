@@ -41,6 +41,7 @@ class Store:
                 digest TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'READY', created REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS task_files (
                 task_id TEXT REFERENCES jobs(id), file_id TEXT REFERENCES files(id),
+                ord INTEGER DEFAULT 0,
                 PRIMARY KEY(task_id,file_id));
             CREATE TABLE IF NOT EXISTS deliveries (
                 id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES jobs(id), owner TEXT NOT NULL,
@@ -78,6 +79,7 @@ class Store:
             ('jobs', 'metadata', "TEXT DEFAULT '{}'"),
             ('jobs', 'visual_stage', "TEXT DEFAULT ''"),
             ('deliveries', 'error_message', "TEXT DEFAULT ''"),
+            ('task_files', 'ord', 'INTEGER DEFAULT 0'),
         ):
             existing = {r['name'] for r in self.db.execute(f'PRAGMA table_info({table})').fetchall()}
             if column not in existing:
@@ -254,7 +256,10 @@ class Store:
         )
 
     def files(self, job_id):
-        return [dict(r) for r in self.db.execute('SELECT f.* FROM files f JOIN task_files t ON t.file_id=f.id WHERE t.task_id=? ORDER BY f.id', (job_id,))]
+        return [dict(r) for r in self.db.execute(
+            'SELECT f.* FROM files f JOIN task_files t ON t.file_id=f.id WHERE t.task_id=? ORDER BY t.ord ASC, f.created ASC, f.id ASC',
+            (job_id,),
+        )]
 
     def file(self, file_id, owner):
         row = self.db.execute('''SELECT f.* FROM files f JOIN task_files t ON t.file_id=f.id
@@ -301,6 +306,7 @@ class Store:
         init_meta['command_summary'] = summarize_command(
             cmd_all=bool(payload.get('cmd_all')),
             cmd_zip=bool(payload.get('cmd_zip')),
+            cmd_merge=bool(payload.get('cmd_merge')),
             pack_zip=bool(opts.get('pack_zip')),
             download_type=str(opts.get('download_type') or ''),
         )
@@ -313,7 +319,7 @@ class Store:
                  json.dumps(init_meta, ensure_ascii=False), visual_stage, now, now),
             )
             if source and state == 'READY':
-                self.db.execute('INSERT INTO task_files SELECT ?,file_id FROM task_files WHERE task_id=?', (job_id, source['id']))
+                self.db.execute('INSERT INTO task_files(task_id,file_id,ord) SELECT ?,file_id,ord FROM task_files WHERE task_id=?', (job_id, source['id']))
             self.record_visual_event(job_id, 'receive', state)
             if state == 'READY':
                 self.record_visual_event(job_id, 'complete', 'READY')
@@ -331,15 +337,15 @@ class Store:
         with self.transaction():
             if metadata:
                 self.merge_job_metadata(job_id, dict(metadata, file_count=len(records)))
-            for record in records:
+            for idx, record in enumerate(records):
                 self.db.execute('INSERT INTO files VALUES(?,?,?,?,?,?)', record)
-                self.db.execute('INSERT INTO task_files VALUES(?,?)', (job_id, record[0]))
+                self.db.execute('INSERT INTO task_files(task_id,file_id,ord) VALUES(?,?,?)', (job_id, record[0], idx))
             if self.job(job_id)['state'] != 'CANCELLED':
                 self.update_job(job_id, 'READY', 100, error='', error_message='', visual_stage='complete')
                 self.record_visual_event(job_id, 'complete', 'READY')
             followers = self.db.execute("SELECT id FROM jobs WHERE source_id=? AND state='QUEUED'", (job_id,)).fetchall()
             for follower in followers:
-                self.db.execute('INSERT INTO task_files SELECT ?,file_id FROM task_files WHERE task_id=?', (follower['id'], job_id))
+                self.db.execute('INSERT INTO task_files(task_id,file_id,ord) SELECT ?,file_id,ord FROM task_files WHERE task_id=?', (follower['id'], job_id))
                 self.update_job(follower['id'], 'READY', 100, error='', error_message='', visual_stage='complete')
                 self.record_visual_event(follower['id'], 'complete', 'READY')
 

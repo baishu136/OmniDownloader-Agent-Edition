@@ -11,18 +11,21 @@
 
 ## 链接前缀下载指令
 
-在 `analyze_media`、`download_media`、`bot_client.py` 或聊天插件中输入链接时，可在链接最前方附带前缀指令（可组合使用）：
-- `/us <链接>`：展开下载合集、分集视频或图文作品的全部图片。
-- `/zip <链接>`：将下载的图文、视频或合集打包为 `.zip` 压缩包后导出与发送。
-- `/us /zip <链接>`：同时下载全部内容并打包为单个 `.zip` 压缩包发送。
+在 `analyze_media`、`download_media`、`bot_client.py` 或聊天插件中输入链接时，可在链接最前方附带前缀指令（可任意组合使用）：
+- `/us <链接>`：展开下载合集、分集视频或图文作品的全部图片（**不加 `/us` 时图文作品默认仅下载首图，多集视频默认下载当前单视频**；支持自动识别小红书、抖音、Pixiv、B站动态、X 等图文作品）。
+- `/zip <链接>`：将下载的图文、视频或合集打包为 `.zip` 压缩包后导出与发送（不加 `/us` 时仅打包首图/当前单集）。
+- `/merge <链接>`：强制将该次下载结果以合并转发聊天记录（QQ / OneBot `send_*_forward_msg`）或媒体组相册（Telegram `sendMediaGroup`）方式发出。
+- `/us /merge <链接>` 或 `/us /zip <链接>`：同时下载全部内容并以合并转发或单个 `.zip` 压缩包发送。
 
-## QQ / OneBot 消息发送设置
+## QQ / OneBot 与 Telegram 合集/图集发送设置
 
 在“03 QQ 消息与合集发送设置”或通过 `update_settings` 可配置：
 - `qq_video_mode`：`file`（群/私聊文件上传）或 `message`（聊天视频消息 `send_group_msg`/`send_private_msg`）。
 - `qq_image_mode`：`message`（聊天图片消息）或 `file`（群/私聊文件上传）。
-- `qq_forward_collection`：`true` 时，多视频合集或多张图集自动打包为一条合并转发聊天记录（`send_group_forward_msg`/`send_private_forward_msg`）发送。
-- 注意：`.zip` 压缩包始终以群/私聊文件上传方式发送。
+- `qq_forward_collection`：`true` 时，多视频合集或多张图集严格按原始顺序打包为合并转发聊天记录（`send_group_forward_msg`/`send_private_forward_msg`）发送；也可在单次请求中通过 `/merge` 前缀指令临时启用。
+- `qq_forward_max_items`：合并转发单批最多条数（默认 **30** 条，范围 2–100）；超出时自动按批次拆分并标注批次标题（如 `第 1/2 批`），防止单包过大超时或被协议端拒发。
+- Telegram 媒体组与格式兼容：多图/合集自动按每批最多 10 个聚合为 `sendMediaGroup` 相册发送（若被拒则自动降级逐条发送）；`.webp` / `.avif` / `.bmp` 原图在内存中自动转换为兼容 JPEG/PNG 发出（不改动受控缓存原文件），`.gif` 自动使用 `sendAnimation` 发送。
+- 注意：`.zip` 压缩包始终以群/私聊文件或文档方式上传发送。
 
 ## 下载可视化与报错直出
 

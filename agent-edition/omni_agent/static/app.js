@@ -1285,7 +1285,7 @@ async function refresh(syncBots = true) {
   const entries = [
     ['MCP 服务', '运行中 · 免令牌直连（Streamable HTTP 与 stdio · 23 工具）'],
     ['HTTP 地址', location.origin + '/mcp'],
-    ['下载指令前缀', '/us（合集、分集视频、全部图片）· /zip（打包压缩包发送）'],
+    ['下载指令前缀', '/us（合集、分集视频、全部图片；不加时图文仅首图）· /zip（压缩包发送）· /merge（合并转发发送）'],
     ['服务数据目录', status.data_path],
     ['媒体下载保存目录', status.download_dir || '未指定（仅存受控缓存）'],
     ['图文保存目录', status.image_dir || '未指定（跟随媒体下载目录）'],

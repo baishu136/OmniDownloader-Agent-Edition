@@ -31,10 +31,10 @@ from .cookie_login import (
     resolve_local_browser,
 )
 from .credentials import Vault
-from .delivery import BotConfig, make_adapter
+from .delivery import BotConfig, IMAGE_EXTENSIONS, make_adapter
 from .errors import AgentError, safe_text
 from .runner import Runner
-from .security import is_profile, parse_download_command, source_url
+from .security import is_profile, parse_download_commands, source_url
 from .store import ACTIVE, Store
 from .visualization import build_visualization, format_error_detail, stage_from_task_state
 
@@ -85,6 +85,7 @@ class SettingsUpdate(BaseModel):
     qq_video_mode: Literal['message', 'file'] | None = None
     qq_image_mode: Literal['message', 'file'] | None = None
     qq_forward_collection: bool | None = None
+    qq_forward_max_items: int | None = Field(None, ge=2, le=100)
     visual_enabled: bool | None = None
     visual_on_receive: bool | None = None
     visual_on_start: bool | None = None
@@ -753,7 +754,7 @@ class Service:
         return result
 
     def check_url(self, raw):
-        clean, cmd_all, cmd_zip = parse_download_command(raw)
+        clean, cmd_all, cmd_zip, _ = parse_download_commands(raw)
         url = source_url(clean)
         if is_profile(url) and not self.config.settings.profiles:
             raise AgentError('FEATURE_DISABLED', '当前设置未允许用户主页解析与批量下载')
@@ -764,8 +765,8 @@ class Service:
         s = self.config.settings
         if media_type == 'images' and not s.images:
             raise AgentError('FEATURE_DISABLED', '当前设置关闭了图文能力')
-        if media_type == 'video' and not any((s.video, s.audio, s.covers)):
-            raise AgentError('FEATURE_DISABLED', '当前设置关闭了视频相关能力')
+        if media_type == 'video' and not any((s.video, s.audio, s.covers, s.images)):
+            raise AgentError('FEATURE_DISABLED', '当前设置关闭了视频与图文相关能力')
         async with self.analysis_slots:
             result = await self.runner.call({'action': 'analyze', 'url': url, 'media_type': media_type, 'profile': is_profile(url)})
         result['options'] = [o for o in result.get('options', []) if getattr(s, {'VIDEO_WITH_AUDIO': 'video', 'VIDEO_ONLY': 'video',
@@ -786,12 +787,14 @@ class Service:
         notify_adapter: str | None = None,
         notify_target: str | None = None,
     ):
+        _, _, _, cmd_merge = parse_download_commands(raw_url)
         url, cmd_all, cmd_zip = self.check_url(raw_url)
         s = self.config.settings
         if bool(notify_adapter) != bool(notify_target):
             raise AgentError('INVALID_PARAMETER', '指定直发状态通知时须同时提供 notify_adapter 与 notify_target')
         if notify_adapter and notify_target:
             make_adapter(self.bot_config(notify_adapter)).check_target(notify_target)
+        explicit_image_zip = (options.download_type == 'IMAGE_ZIP') or (options.use_defaults and s.default_type == 'IMAGE_ZIP')
         resolved = self.resolve_options(options, cmd_all=cmd_all, cmd_zip=cmd_zip)
         if (collection or resolved['all_items']) and not s.collections and resolved['download_type'] != 'IMAGE':
             raise AgentError('FEATURE_DISABLED', '当前设置关闭了合集下载')
@@ -805,8 +808,10 @@ class Service:
             start=start,
             count=count,
             all_items=resolved['all_items'],
+            image_zip_all=explicit_image_zip,
             cmd_all=cmd_all,
             cmd_zip=cmd_zip,
+            cmd_merge=cmd_merge,
             profile=is_profile(url),
         )
         generations = {p: self.sessions.status(p)['generation'] for p in self.domains}
@@ -821,10 +826,10 @@ class Service:
         needs_confirm = (
             count > s.confirmation_threshold
             or is_profile(url)
-            or (resolved['download_type'] == 'IMAGE' and resolved['pack_zip'])
+            or explicit_image_zip
             or (resolved['all_items'] and limit > s.confirmation_threshold)
             or resolved['height'] > 2160
-            or s.max_file_bytes * count > 1024**3
+            or (resolved['download_type'] != 'IMAGE' and count > 1 and s.max_file_bytes > 1024**3)
         )
         if needs_confirm:
             approval = self.store.db.execute(
@@ -838,7 +843,7 @@ class Service:
                 ).fetchone()
                 identifier = existing_approval['id'] if existing_approval else uuid.uuid4().hex
                 if not existing_approval:
-                    est = limit if (resolved['all_items'] or (resolved['download_type'] == 'IMAGE' and resolved['pack_zip'])) else count
+                    est = limit if (resolved['all_items'] or explicit_image_zip) else count
                     self.store.db.execute(
                         'INSERT INTO approvals(id,owner,fingerprint,expires,summary) VALUES(?,?,?,?,?)',
                         (identifier, owner, key, time.time() + 600, f'{owner}: 最多{est} 个媒体，起始 {start}，类型 {resolved["download_type"]}'),
@@ -847,7 +852,9 @@ class Service:
         queued = self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('QUEUED','DOWNLOADING','PROCESSING')").fetchone()[0]
         if queued >= s.max_queue:
             raise AgentError('QUEUE_FULL', '下载队列已满')
-        if self.store.usage() + s.max_file_bytes * count > s.max_cache_bytes or shutil.disk_usage(self.config.cache).free < s.max_file_bytes * count:
+        unit_reserve = min(s.max_file_bytes, 20 * 1024**2) if resolved['download_type'] == 'IMAGE' else s.max_file_bytes
+        reserve_bytes = min(unit_reserve * count, s.max_file_bytes * 2) if count > 1 else unit_reserve
+        if self.store.usage() + reserve_bytes > s.max_cache_bytes or shutil.disk_usage(self.config.cache).free < reserve_bytes:
             raise AgentError('CACHE_FULL', '缓存配额或磁盘剩余空间不足，请先清理或调低文件上限')
         notify_meta = {'notify_adapter': notify_adapter, 'notify_target': notify_target} if (notify_adapter and notify_target) else None
         row, new = self.store.create_job(owner, payload, key, request_key, notify_meta=notify_meta)
@@ -856,11 +863,11 @@ class Service:
         await self._dispatch_visual_events(row['id'], owner)
         return self.store.public_job(row['id'], owner)
 
-    def _export_to_storage(self, payload, paths):
+    def _export_to_storage(self, payload, paths, metadata=None):
         """若用户配置了永久下载或图文存储目录，则安全导出成品副本，不受自动缓存清理影响。"""
         s = self.config.settings
         dtype = (payload.get('options') or {}).get('download_type')
-        is_image_job = dtype in ('IMAGE', 'IMAGE_ZIP')
+        is_image_job = dtype in ('IMAGE', 'IMAGE_ZIP') or (metadata or {}).get('media_type') == 'images'
         target_str = (s.image_dir or s.download_dir) if is_image_job else s.download_dir
         if not target_str:
             return
@@ -1152,7 +1159,7 @@ class Service:
                     pending_bg.append(loop.create_task(self._dispatch_visual_events(identifier, row['owner'])))
 
             result = await self.runner.call(payload, identifier, progress)
-            self._export_to_storage(payload, result['paths'])
+            self._export_to_storage(payload, result['paths'], metadata=result.get('metadata'))
             if result.get('metadata'):
                 self.store.merge_job_metadata(identifier, result['metadata'])
             self.store.record_visual_event(identifier, 'start', 'DOWNLOADING')
@@ -1248,14 +1255,61 @@ class Service:
                 record, path = self.store.file(file['id'], row['owner'])
                 pending.append((record, path))
 
-            if row['adapter'] == 'onebot' and s.qq_forward_collection:
+            job_row = self.store.job(row['task_id'])
+            try:
+                job_payload = self.store.payload(job_row)
+            except Exception:
+                job_payload = {}
+            job_meta = self.store._parsed_meta(job_row)
+            cmd_merge = bool(job_payload.get('cmd_merge'))
+            job_title = str(job_meta.get('title') or '').strip()
+            forward_limit = max(2, min(100, int(getattr(s, 'qq_forward_max_items', 30) or 30)))
+
+            if row['adapter'] == 'onebot' and (cmd_merge or (s.qq_forward_collection and row['kind'] != 'document')):
                 forwardable = [(rec, p) for rec, p in pending if p.suffix.lower() != '.zip' and adapter.media_category(p) in ('image', 'video')]
                 others = [(rec, p) for rec, p in pending if (rec, p) not in forwardable]
-                if len(forwardable) >= 2:
-                    receipt = await adapter.send_forward([p for _, p in forwardable], row['target'])
-                    for rec, _ in forwardable:
-                        self.store.receipt(identifier, rec['id'], receipt)
+                min_forward = 1 if cmd_merge else 2
+                if len(forwardable) >= min_forward:
+                    batches = [forwardable[i:i + forward_limit] for i in range(0, len(forwardable), forward_limit)]
+                    total_batches = len(batches)
+                    for b_idx, batch in enumerate(batches, start=1):
+                        batch_title = (
+                            f'{job_title}（第 {b_idx}/{total_batches} 批）'
+                            if job_title and total_batches > 1
+                            else (job_title or (f'合集媒体（第 {b_idx}/{total_batches} 批）' if total_batches > 1 else ''))
+                        )
+                        receipt = await adapter.send_forward([p for _, p in batch], row['target'], title=batch_title)
+                        for rec, _ in batch:
+                            self.store.receipt(identifier, rec['id'], receipt)
                     pending = others
+            elif row['adapter'] == 'telegram' and row['kind'] != 'document' and len(pending) >= 2:
+                groupable = [(rec, p) for rec, p in pending if adapter.media_group_kind(p) is not None]
+                others = [(rec, p) for rec, p in pending if (rec, p) not in groupable]
+                if len(groupable) >= 2:
+                    tg_limit = min(10, forward_limit)
+                    batches = [groupable[i:i + tg_limit] for i in range(0, len(groupable), tg_limit)]
+                    # Telegram sendMediaGroup 要求每批至少 2 个媒体，末尾余 1 个时归入单发队列
+                    tail_single = []
+                    if batches and len(batches[-1]) == 1:
+                        tail_single = batches.pop()
+                    total_batches = len(batches)
+                    fallback_single = []
+                    for b_idx, batch in enumerate(batches, start=1):
+                        cap = (
+                            f'{job_title}（{b_idx}/{total_batches}）'
+                            if job_title and total_batches > 1
+                            else (job_title if b_idx == 1 else '')
+                        )
+                        try:
+                            receipts = await adapter.send_media_group([p for _, p in batch], row['target'], caption=cap)
+                            for (rec, _), rec_receipt in zip(batch, receipts):
+                                self.store.receipt(identifier, rec['id'], rec_receipt)
+                        except AgentError as group_err:
+                            if group_err.code == 'BOT_REJECTED':
+                                fallback_single.extend(batch)
+                            else:
+                                raise
+                    pending = fallback_single + tail_single + others
 
             for record, path in pending:
                 receipt = await adapter.send(
@@ -1335,11 +1389,20 @@ class Service:
             'arbitrary_video_reencode': False,
             'drm_bypass': False,
             'auth_required': False,
-            'download_commands': {'/us': '下载合集、分集视频或全部图片', '/zip': '将输出打包为 ZIP 压缩包发送'},
+            'download_commands': {
+                '/us': '下载合集、分集视频或全部图片（不加 /us 时图文仅下载首图）',
+                '/zip': '将输出打包为 ZIP 压缩包发送',
+                '/merge': '以合并转发聊天记录（QQ）或媒体组相册（Telegram）发送',
+            },
             'cookie_agent_permissions': ['read_status', 'disable', 'remove'],
             'login_validation': ['哔哩哔哩', 'Pixiv'],
             'features': {k: getattr(s, k) for k in ('video', 'audio', 'images', 'collections', 'profiles', 'covers', 'autonomous', 'reuse_cache', 'auto_delete', 'pack_zip', 'qq_forward_collection', 'visual_enabled')},
-            'qq_delivery': {'video_mode': s.qq_video_mode, 'image_mode': s.qq_image_mode, 'forward_collection': s.qq_forward_collection},
+            'qq_delivery': {
+                'video_mode': s.qq_video_mode,
+                'image_mode': s.qq_image_mode,
+                'forward_collection': s.qq_forward_collection,
+                'forward_max_items': s.qq_forward_max_items,
+            },
             'visualization': {
                 'enabled': s.visual_enabled,
                 'mode': s.visual_mode,

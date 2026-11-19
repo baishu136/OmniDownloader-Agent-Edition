@@ -6,11 +6,44 @@ import os
 from pathlib import Path
 import re
 import sys
+from urllib.parse import urlsplit
 import zipfile
 
 from .credentials import Vault
 from .errors import AgentError, safe_text
 from .security import controlled, install_network_guard, is_profile, source_url, validate_url
+
+_IMAGE_PLATFORMS = {'抖音', '快手', '哔哩哔哩', 'Pixiv', '小红书', 'X (Twitter)', 'Pinterest'}
+_IMAGE_FALLBACK_HINTS = (
+    'NO_MEDIA',
+    'MEDIA_UNCONFIRMED',
+    '图文',
+    'no video could be found',
+    '未取得笔记视频',
+    '图片/漫画',
+    '未取得真实视频格式',
+    '不适用视频导出',
+    '未提供视频',
+)
+
+
+def _is_explicit_image_url(url: str, site: str) -> bool:
+    """识别无需先走视频提取的明确图文链接（如抖音图文 /note/、B 站动态图文 /opus/）。"""
+    parts = urlsplit(url)
+    host = (parts.hostname or '').lower()
+    path = (parts.path or '').lower()
+    if site == '抖音' and '/note/' in path:
+        return True
+    if site == '哔哩哔哩' and (host == 't.bilibili.com' or '/opus/' in path or '/dynamic/' in path):
+        return True
+    return False
+
+
+def _should_fallback_to_images(exc: Exception) -> bool:
+    """判断视频提取失败是否因目标实际为图文帖子，从而允许在默认模式下平滑回退图文引擎。"""
+    text = str(exc or '')
+    low = text.lower()
+    return any(hint.lower() in low for hint in _IMAGE_FALLBACK_HINTS)
 
 
 def _safe_archive_name(title, fallback='omni_archive'):
@@ -117,60 +150,99 @@ async def execute(request, emit):
     site = UrlSniffer.identify_site(url)
     options = request.get('options') or {}
     all_items = bool(request.get('all_items'))
+    allow_images = bool(request.get('allow_images', True))
     pack_zip = bool(options.get('pack_zip') or options.get('download_type') == 'IMAGE_ZIP')
     image_request = options.get('download_type') in ('IMAGE', 'IMAGE_ZIP') or request.get('media_type') == 'images'
-    if image_request:
+    can_auto_image = (
+        allow_images
+        and site in _IMAGE_PLATFORMS
+        and (action == 'analyze' or options.get('download_type', 'VIDEO_WITH_AUDIO') == 'VIDEO_WITH_AUDIO')
+    )
+    if not image_request and can_auto_image and _is_explicit_image_url(url, site):
+        image_request = True
+
+    post = None
+    meta = None
+    children = []
+
+    async def _extract_images():
+        nonlocal url
         from engine.images import ImageEngine
         if profile:
             if site != 'X (Twitter)':
                 raise AgentError('CAPABILITY_UNAVAILABLE', '当前主页图文适配器仅提供X首个图片分页')
             from engine.media_resolver import resolve_x_profile_page
+
             def profile_page():
                 with sessions.cookie_file(site) as cookie:
                     return resolve_x_profile_page(url, cookie, config.proxy_url)
-            post = await asyncio.to_thread(profile_page)
-            post['resources'] = post['resources'][:request.get('max_items', 10)]
-            url = post['url']
-            ImageEngine.remember(post)
+
+            resolved_post = await asyncio.to_thread(profile_page)
+            resolved_post['resources'] = resolved_post['resources'][:request.get('max_items', 10)]
+            url = resolved_post['url']
+            ImageEngine.remember(resolved_post)
         else:
-            post = await ImageEngine.extract(url, site)
-        if len(post['resources']) > request.get('max_items', 20) and action != 'analyze' and not (action == 'collection' or all_items):
-            raise AgentError('LIMIT_EXCEEDED', '图文数量超过限制')
-        metadata = {'platform': site, 'title': safe_text(post['title']), 'author': safe_text(post.get('author', '')),
-                    'media_type': 'images', 'file_count': len(post['resources']),
-                    'options': ['IMAGE']}
+            resolved_post = await ImageEngine.extract(url, site)
+        meta_dict = {
+            'platform': site,
+            'title': safe_text(resolved_post['title']),
+            'author': safe_text(resolved_post.get('author', '')),
+            'media_type': 'images',
+            'file_count': len(resolved_post['resources']),
+            'options': ['IMAGE'],
+        }
+        return resolved_post, meta_dict
+
+    if image_request:
+        post, metadata = await _extract_images()
         if action == 'analyze':
             emit({'kind': 'result', 'result': metadata})
             return
     else:
         if profile and site != 'YouTube':
             raise AgentError('CAPABILITY_UNAVAILABLE', '当前主页视频适配器仅提供有界的YouTube列表')
-        if site in ('抖音', '小红书', '快手', '小黑盒', 'Pixiv'):
-            from engine.platforms import PlatformEngine
-            meta = await PlatformEngine.extract(url, site)
-        elif site == '哔哩哔哩':
-            from engine.bilibili_extractor import BilibiliDirectExtractor
-            meta = await BilibiliDirectExtractor.extract(url)
-        elif site == 'TikTok':
-            from engine.tiktok_extractor import TikTokDirectExtractor
-            meta = await TikTokDirectExtractor.extract(url)
+        try:
+            if site in ('抖音', '小红书', '快手', '小黑盒', 'Pixiv'):
+                from engine.platforms import PlatformEngine
+                meta = await PlatformEngine.extract(url, site)
+            elif site == '哔哩哔哩':
+                from engine.bilibili_extractor import BilibiliDirectExtractor
+                meta = await BilibiliDirectExtractor.extract(url)
+            elif site == 'TikTok':
+                from engine.tiktok_extractor import TikTokDirectExtractor
+                meta = await TikTokDirectExtractor.extract(url)
+            else:
+                meta = await YtDlpEngine.extract(url, site)
+        except Exception as video_exc:
+            if can_auto_image and _should_fallback_to_images(video_exc):
+                try:
+                    post, metadata = await _extract_images()
+                    image_request = True
+                except Exception:
+                    raise video_exc
+            else:
+                raise
+
+        if image_request:
+            if action == 'analyze':
+                emit({'kind': 'result', 'result': metadata})
+                return
         else:
-            meta = await YtDlpEngine.extract(url, site)
-        children = meta.multi_media_list
-        children = children[:request.get('max_items', 20)]
-        metadata = {'platform': site, 'title': safe_text(meta.title), 'author': safe_text(meta.author),
-                    'media_type': 'video', 'file_count': len(children) or 1,
-                    'formats': [{'id': str(f.format_id) if not str(f.format_id).startswith('http') else 'source',
-                                 'width': f.width or None, 'height': f.height or None, 'fps': f.fps or None,
-                                 'container': f.ext or None, 'video_codec': f.vcodec or None,
-                                 'audio_codec': f.acodec or None,
-                                 'hdr': f.dynamic_range or None} for f in meta.available_video_formats],
-                    'audio_formats': [f.ext for f in meta.available_audio_formats],
-                    'collection': [{'index': i + 1, 'title': safe_text(m.title)} for i, m in enumerate(children)],
-                    'options': ['VIDEO_WITH_AUDIO', 'VIDEO_ONLY', 'AUDIO_ONLY', 'GIF', 'COVER']}
-        if action == 'analyze':
-            emit({'kind': 'result', 'result': metadata})
-            return
+            children = meta.multi_media_list
+            children = children[:request.get('max_items', 20)]
+            metadata = {'platform': site, 'title': safe_text(meta.title), 'author': safe_text(meta.author),
+                        'media_type': 'video', 'file_count': len(children) or 1,
+                        'formats': [{'id': str(f.format_id) if not str(f.format_id).startswith('http') else 'source',
+                                     'width': f.width or None, 'height': f.height or None, 'fps': f.fps or None,
+                                     'container': f.ext or None, 'video_codec': f.vcodec or None,
+                                     'audio_codec': f.acodec or None,
+                                     'hdr': f.dynamic_range or None} for f in meta.available_video_formats],
+                        'audio_formats': [f.ext for f in meta.available_audio_formats],
+                        'collection': [{'index': i + 1, 'title': safe_text(m.title)} for i, m in enumerate(children)],
+                        'options': ['VIDEO_WITH_AUDIO', 'VIDEO_ONLY', 'AUDIO_ONLY', 'GIF', 'COVER']}
+            if action == 'analyze':
+                emit({'kind': 'result', 'result': metadata})
+                return
     from core.models import AudioFormat, DownloadType, QualitySelection, TaskStatus
     from core.task_manager import task_manager
     max_items = request.get('max_items', 20)
@@ -178,7 +250,7 @@ async def execute(request, emit):
         available = post['resources']
         if action == 'collection':
             selected = available[request['start'] - 1:request['start'] - 1 + request['count']]
-        elif all_items or options.get('download_type') == 'IMAGE_ZIP':
+        elif all_items or request.get('image_zip_all') or options.get('image_zip_all') or options.get('download_type') == 'IMAGE_ZIP':
             selected = available[:max_items]
         else:
             selected = available[:1]
@@ -201,7 +273,7 @@ async def execute(request, emit):
         elif all_items and children:
             chosen = children[:max_items]
         else:
-            if children:
+            if children and not meta.available_video_formats:
                 raise AgentError('COLLECTION_REQUIRED', '此链接包含多个媒体，请使用 download_collection 或在链接前加 /us 指令')
             chosen = [meta]
         core_download_type = DownloadType(options['download_type'])
@@ -245,7 +317,7 @@ def validate_output(name, root, options, maximum):
         with zipfile.ZipFile(path) as archive:
             if sum(i.file_size for i in archive.infolist()) > maximum * 4 or archive.testzip():
                 raise AgentError('FILE_INVALID', '压缩包超过限制或校验失败')
-    elif suffix in ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif'):
+    elif suffix in ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif'):
         from PIL import Image
         with Image.open(path) as image:
             image.verify()

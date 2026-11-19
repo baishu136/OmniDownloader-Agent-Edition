@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-
+import re
 import time
 import httpx
 from astrbot.api.event import AstrMessageEvent, filter
@@ -270,31 +270,78 @@ class OmniAgentPlugin(Star):
                 yield event.plain_result(item)
         await task
 
+    @staticmethod
+    def _extract_command_input(event: AstrMessageEvent, cmd: str, url: str = '', approval_id: str = '') -> tuple[str, str]:
+        """从完整原始消息中提取链接与可选审批 ID，兼容 /us /zip /merge 组合前缀与带空格分享文案。"""
+        raw_msg = str(getattr(event, 'message_str', '') or '').strip()
+        body = ''
+        if raw_msg:
+            stripped = re.sub(rf'^(?:@\S+\s+)*[!/／]?{re.escape(cmd)}(?=\s|$|https?://|/)', '', raw_msg, count=1, flags=re.I).strip()
+            if stripped != raw_msg:
+                body = stripped
+                approval_id = ''
+        if not body:
+            u = str(url or '').strip()
+            a = str(approval_id or '').strip()
+            if a and ('http://' in a or 'https://' in a or a.startswith('/') or not re.fullmatch(r'[0-9a-fA-F]{16,64}', a)):
+                body = f'{u} {a}'.strip()
+                approval_id = ''
+            else:
+                body = u
+                approval_id = a
+
+        # 支持从末尾提取显式 approval_id=xxx 或独立 32 位十六进制审批码（避免吞掉 URL）
+        found_approval = str(approval_id or '').strip()
+        if not found_approval and body:
+            m_kv = re.search(r'(?:\s+|^)approval_id=([A-Za-z0-9_-]{8,64})\s*$', body)
+            if m_kv:
+                found_approval = m_kv.group(1)
+                body = body[:m_kv.start()].strip()
+            else:
+                m_hex = re.search(r'\s+([0-9a-fA-F]{32})\s*$', body)
+                if m_hex and ('http://' in body[:m_hex.start()] or 'https://' in body[:m_hex.start()]):
+                    found_approval = m_hex.group(1)
+                    body = body[:m_hex.start()].strip()
+
+        if cmd in ('us', 'zip', 'merge'):
+            token = f'/{cmd}'
+            if not re.search(rf'(?:^|\s)/{cmd}(?=\s|$|https?://)', body, re.I):
+                body = f'{token} {body}'.strip()
+        return body, found_approval
+
     @filter.command('omni')
-    async def download_command(self, event: AstrMessageEvent, url: str, approval_id: str = ''):
-        async for result in self._run_command(event, url, approval_id):
+    async def download_command(self, event: AstrMessageEvent, url: str = '', approval_id: str = ''):
+        payload_url, parsed_approval = self._extract_command_input(event, 'omni', url, approval_id)
+        async for result in self._run_command(event, payload_url, parsed_approval):
             yield result
 
     @filter.command('us')
-    async def download_all_command(self, event: AstrMessageEvent, url: str, approval_id: str = ''):
-        """下载合集、分集视频或全部图片。"""
-        prefixed = url if url.lstrip().lower().startswith('/us') else f'/us {url}'
-        async for result in self._run_command(event, prefixed, approval_id):
+    async def download_all_command(self, event: AstrMessageEvent, url: str = '', approval_id: str = ''):
+        """下载合集、分集视频或全部图片（支持与 /zip、/merge 组合使用）。"""
+        payload_url, parsed_approval = self._extract_command_input(event, 'us', url, approval_id)
+        async for result in self._run_command(event, payload_url, parsed_approval):
             yield result
 
     @filter.command('zip')
-    async def download_zip_command(self, event: AstrMessageEvent, url: str, approval_id: str = ''):
-        """以 ZIP 压缩包形式下载并发送。"""
-        prefixed = url if url.lstrip().lower().startswith('/zip') else f'/zip {url}'
-        async for result in self._run_command(event, prefixed, approval_id):
+    async def download_zip_command(self, event: AstrMessageEvent, url: str = '', approval_id: str = ''):
+        """以 ZIP 压缩包形式下载并发送（支持与 /us 组合使用）。"""
+        payload_url, parsed_approval = self._extract_command_input(event, 'zip', url, approval_id)
+        async for result in self._run_command(event, payload_url, parsed_approval):
+            yield result
+
+    @filter.command('merge')
+    async def download_merge_command(self, event: AstrMessageEvent, url: str = '', approval_id: str = ''):
+        """以合并转发聊天记录（QQ）或媒体组相册（Telegram）发送（支持与 /us 组合使用）。"""
+        payload_url, parsed_approval = self._extract_command_input(event, 'merge', url, approval_id)
+        async for result in self._run_command(event, payload_url, parsed_approval):
             yield result
 
     @filter.llm_tool(name='omni_download_and_deliver')
     async def media_tool(self, event: AstrMessageEvent, url: str, download_type: str = 'default', approval_id: str = '') -> str:
-        """下载媒体并由服务发送到当前聊天。支持在链接前加 /us（下载合集/分集/全部图片）和 /zip（打包压缩包发送）。
+        """下载媒体并由服务发送到当前聊天。支持在链接前加 /us（下载合集/分集/全部图片；不加 /us 时图文仅下载首图）、/zip（打包压缩包发送）和 /merge（以合并转发/媒体组发送）。
 
         Args:
-            url(string): 作品或视频分享链接（可附带 /us 或 /zip 前缀指令）。
+            url(string): 作品或视频分享链接（可附带 /us、/zip 或 /merge 前缀指令）。
             download_type(string): default 或 VIDEO_WITH_AUDIO、VIDEO_ONLY、AUDIO_ONLY、GIF、COVER、IMAGE。
             approval_id(string): 高消耗请求批准后返回的确认ID，普通请求留空。
         """
