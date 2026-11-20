@@ -1326,7 +1326,7 @@ async function refresh(syncBots = true) {
     dd.textContent = value;
     $('service-status').append(dt, dd);
   }
-  for (const id of ['approvals', 'deliveries', 'errors', 'cleanup-log']) $(id).replaceChildren();
+  for (const id of ['approvals', 'deliveries', 'admin-tasks', 'errors', 'cleanup-log']) $(id).replaceChildren();
   for (const approval of status.approvals) {
     row($('approvals'), approval.summary + (approval.approved ? '（已批准）' : ''), approval.approved ? '' : '批准此请求', async () => {
       await api('approvals/' + approval.id, 'POST');
@@ -1344,6 +1344,23 @@ async function refresh(syncBots = true) {
     });
   }
   empty($('deliveries'), '没有交付记录');
+  let adminTasks = {tasks: []};
+  try {
+    adminTasks = await api('tasks?limit=20');
+  } catch (_) {
+    adminTasks = {tasks: []};
+  }
+  for (const task of adminTasks.tasks) {
+    const reason = task.error_message || task.error || '';
+    const label = `${task.id.slice(0, 8)} · ${task.state}${reason ? ' · ' + reason : ''} · 文件 ${task.file_count}`;
+    const canRetry = task.state === 'FAILED' && task.next_action === 'retry';
+    row($('admin-tasks'), label, canRetry ? '重试任务' : '', async () => {
+      await api('tasks/' + encodeURIComponent(task.id) + '/retry', 'POST');
+      notify('任务已重新加入下载队列');
+      await refresh();
+    });
+  }
+  empty($('admin-tasks'), '暂无任务');
   for (const error of status.errors) row($('errors'), `${error.id.slice(0, 8)} · ${error.error_message || error.error}`);
   empty($('errors'), '暂无错误');
   if (status.cleanup_error) row($('errors'), status.cleanup_error + ' · 文件清理已延后，平台发送状态不受影响');

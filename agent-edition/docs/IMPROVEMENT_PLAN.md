@@ -68,7 +68,7 @@
 ### Sprint 03：管理与接入（未开始）
 
 - 首次启动向导：后端 `GET/POST /api/admin/onboarding` 已完成（已有配置不算新用户、可跳过）；管理页向导界面待接入。
-- 本地任务管理页：后端 `GET /api/admin/tasks`、`POST /api/admin/tasks/{id}/retry` 已完成（仅可重试可恢复错误）；管理页界面待接入。
+- 本地任务管理页：后端与“最近任务”列表（含可恢复失败一键重试）已接入；历史筛选、批量操作与打开目录待做。
 - 配置备份迁移：已完成 `GET /api/admin/config/export`、`POST /api/admin/config/import`（校验 + `settings.json.bak` 备份；凭据仍只在 Vault）。
 - MCP 工具结果结构化：任务结果新增 `stage`/`retryable`/`suggested_action`/`next_action`；工具数量与参数保持 23 项不变。调用次数收敛待做。
 - 机器人配额：已完成按 `owner` 的 `max_active_per_owner`；群组/文件大小/每日配额与限流待做。

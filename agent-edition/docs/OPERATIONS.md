@@ -19,7 +19,7 @@
 - 输出实际信息：下载完成后 `metadata.outputs` 列出每个成品的 `type`、`ext`、`bytes`，图片带实际 `width`/`height`，音视频带探测到的宽高与是否含音轨；只返回元数据，不返回本机路径。
 - 单调用方并发配额：`max_active_per_owner`（0 = 不限制，1–50）限制同一 `owner` 的未完成任务数，超过时返回 `LIMIT_EXCEEDED`，不影响其他调用方。
 - 首次启动引导接口：`GET /api/admin/onboarding` 返回 `first_run`、`completed` 与建议步骤；`POST /api/admin/onboarding/complete` 写入 `.onboarded` 标记。已有 `settings.json` 的安装不会被判定为新用户；引导只提供步骤提示，不强制修改配置。
-- 任务管理接口：`GET /api/admin/tasks?limit=50` 返回最近任务的状态、错误、`next_action` 与文件数；`POST /api/admin/tasks/{id}/retry` 仅重试 `retryable=true` 的失败任务（复用其他任务成品的派生任务会被拒绝，避免重复下载）。
+- 任务管理接口：`GET /api/admin/tasks?limit=50` 返回最近任务的状态、错误、`next_action` 与文件数；`POST /api/admin/tasks/{id}/retry` 仅重试 `retryable=true` 的失败任务（复用其他任务成品的派生任务会被拒绝，避免重复下载）。管理页“06 服务状态”中的“最近任务”区域会列出最近 20 个任务，并可对可恢复失败一键“重试任务”。
 - 机器人交付代理策略：配置 `proxy` 后，指向公网域名的 Telegram / OneBot API 会通过该代理发送；`127.0.0.1`、`localhost`、私网地址（如本机 NapCat）始终直连，避免本地协议端被代理拦截或无法回环。
 - 重启恢复：服务启动时未开始的 `QUEUED` 任务保留并由调度器继续；已开始的下载标记 `RESTART_INTERRUPTED` 失败并保留原因；发送中的交付标记 `UNCERTAIN` 等待人工核对；`READY` 任务若缓存文件缺失或大小变化，会标记 `FILE_MISSING`，不会再被当作可交付。
 
