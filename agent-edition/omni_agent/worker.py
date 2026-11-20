@@ -467,7 +467,33 @@ async def execute(request, emit):
         zip_path = pack_paths_to_zip(paths, root / 'output', metadata.get('title') or 'omni_media', request['max_file_bytes'])
         validate_output(zip_path, root, options, request['max_file_bytes'])
         paths = [zip_path]
+    metadata = dict(metadata, outputs=describe_outputs(paths))
     emit({'kind': 'result', 'result': {'paths': paths, 'metadata': metadata}})
+
+
+def describe_outputs(paths):
+    """报告成品的实际类型与尺寸；只返回元数据，不暴露本机路径。"""
+    described = []
+    for raw in paths:
+        path = Path(raw)
+        item = {'bytes': path.stat().st_size, 'ext': path.suffix.lower().lstrip('.')}
+        if path.suffix.lower() == '.zip':
+            item['type'] = 'zip'
+        elif path.suffix.lower() in {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif'}:
+            from PIL import Image
+            with Image.open(path) as image:
+                item.update({'type': 'image', 'width': image.width, 'height': image.height})
+        else:
+            try:
+                from engine.media_verifier import probe
+                actual = probe(path)
+                item.update({'type': 'video', 'width': actual.get('width') or 0,
+                             'height': actual.get('height') or 0,
+                             'audio': bool(actual.get('audio'))})
+            except Exception:
+                item['type'] = 'media'
+        described.append(item)
+    return described
 
 
 def validate_output(name, root, options, maximum):

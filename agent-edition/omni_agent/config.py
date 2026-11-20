@@ -32,6 +32,8 @@ class Settings(BaseModel):
     max_cache_bytes: int = Field(4 * 1024**3, ge=1024**2, le=1024**4)
     concurrency: int = Field(2, ge=1, le=8)
     max_queue: int = Field(100, ge=1, le=1000)
+    # 0 = 不限制；按 owner 统计未结束任务，避免单个用户占满队列
+    max_active_per_owner: int = Field(0, ge=0, le=50)
     task_timeout: int = Field(1800, ge=10, le=7200)
     # Bounded automatic retries for transient network/download failures. 0 disables.
     task_retries: int = Field(2, ge=0, le=5)

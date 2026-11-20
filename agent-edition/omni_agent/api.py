@@ -437,6 +437,10 @@ def create_app(service=None):
     async def import_config(payload: dict):
         return {'ok': True, 'settings': service.import_settings(payload)}
 
+    @app.post('/api/admin/links/extract')
+    async def extract_links(payload: dict):
+        return service.extract_links(payload.get('text', ''))
+
     @app.post('/api/admin/pick-directory')
     async def admin_pick_directory(body: PickDirArgs):
         return await pick_directory(body.initial_dir, body.title)

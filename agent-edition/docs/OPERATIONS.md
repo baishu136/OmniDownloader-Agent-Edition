@@ -15,6 +15,9 @@
 - 配置备份与迁移：`GET /api/admin/config/export` 导出不含凭据的非敏感配置（Cookie 与机器人令牌保存在 Vault，不会进入导出文件）；`POST /api/admin/config/import` 校验通过后写入，写入前保留 `settings.json.bak`，校验或写入失败时原配置保持不变。
 - 清理预览：`GET /api/admin/cleanup/preview?expired=true` 返回下一次清理会删除的文件数与字节数（不修改磁盘或数据库）；实际清理仍由 `POST /api/admin/cleanup` 执行。
 - 下载前空间检查：开始下载前若缓存磁盘剩余不足 64 MiB，任务直接以 `DISK_FULL` 失败，不会下载到一半才报错。
+- 聊天文本链接识别：`POST /api/admin/links/extract` 接收整段聊天文本，返回其中每条链接及其 `/us`、`/zip`、`/merge` 前缀标记；重复链接只保留一次，私网/回环地址标记为 `SSRF_BLOCKED`，非白名单站点标记为 `UNSUPPORTED_PLATFORM`，不创建任务、不发起网络请求。常见追踪参数（`utm_*`、`spm_id_from`、`share_source` 等）会被移除。
+- 输出实际信息：下载完成后 `metadata.outputs` 列出每个成品的 `type`、`ext`、`bytes`，图片带实际 `width`/`height`，音视频带探测到的宽高与是否含音轨；只返回元数据，不返回本机路径。
+- 单调用方并发配额：`max_active_per_owner`（0 = 不限制，1–50）限制同一 `owner` 的未完成任务数，超过时返回 `LIMIT_EXCEEDED`，不影响其他调用方。
 - 重启恢复：服务启动时未开始的 `QUEUED` 任务保留并由调度器继续；已开始的下载标记 `RESTART_INTERRUPTED` 失败并保留原因；发送中的交付标记 `UNCERTAIN` 等待人工核对；`READY` 任务若缓存文件缺失或大小变化，会标记 `FILE_MISSING`，不会再被当作可交付。
 
 ## 链接前缀下载指令

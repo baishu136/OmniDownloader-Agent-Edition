@@ -85,6 +85,62 @@ def parse_download_commands(raw):
     return text, all_items, pack_zip, merge_forward
 
 
+_TRACKING_PARAMS = {
+    'fbclid', 'gclid', 'yclid', 'msclkid', 'igshid', 'spm_id_from', 'vd_source',
+    'share_source', 'share_medium', 'share_plat', 'share_session_id', 'share_tag',
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'utm_id',
+}
+_URL_RE = re.compile(r'https?://[^\s<>"”]+')
+_TRAILING = '。，,;；!！、）)]}】>」』'
+
+
+def _strip_tracking(url):
+    from urllib.parse import parse_qsl, urlencode, urlsplit as split, urlunsplit
+    parts = split(url)
+    if not parts.query:
+        return url
+    kept = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if not (k.lower().startswith('utm_') or k.lower() in _TRACKING_PARAMS)]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept, doseq=True), ''))
+
+
+def extract_chat_links(raw):
+    """从整段聊天文本中提取多个媒体链接，并保留紧邻链接的 /us、/zip、/merge 指令。
+
+    返回顺序与原文一致并去重；无法通过白名单/安全校验的链接标记 valid=False，
+    不会让调用方误以为可下载。短链接仍由后续解析流程执行跳转与 SSRF 校验。
+    """
+    text = str(raw or '')
+    results, seen, cursor = [], set(), 0
+    for match in _URL_RE.finditer(text):
+        segment = text[cursor:match.start()]
+        cursor = match.end()
+        flags = {name: False for name in ('us', 'zip', 'merge')}
+        for command in re.findall(r'/(us|zip|merge)(?=\s|$|https?://)', segment, re.I):
+            flags[command.lower()] = True
+        url = _strip_tracking(match.group(0).rstrip(_TRAILING))
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            # 先做地址安全校验，私网/回环应报告 SSRF 而不是“平台不支持”
+            validate_url(url, initial=False, resolve=False)
+            validate_url(url, initial=True, resolve=False)
+            valid, reason, code = True, '', ''
+        except AgentError as error:
+            valid, reason, code = False, error.message, error.code
+        results.append({
+            'url': url,
+            'valid': valid,
+            'error_code': code,
+            'reason': reason,
+            'all_items': flags['us'],
+            'pack_zip': flags['zip'],
+            'merge_forward': flags['merge'],
+        })
+    return results
+
+
 def parse_download_command(raw):
     """向后兼容的三元组前缀解析接口，返回 (clean_text, all_items, pack_zip)。"""
     clean, all_items, pack_zip, _ = parse_download_commands(raw)

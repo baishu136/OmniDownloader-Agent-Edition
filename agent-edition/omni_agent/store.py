@@ -149,7 +149,7 @@ class Store:
             return
         row = self.job(job_id)
         merged = self._parsed_meta(row)
-        for key in ('platform', 'title', 'author', 'media_type', 'file_count', 'command_summary', 'adapter', 'target', 'notify_adapter', 'notify_target', 'notify_message_id'):
+        for key in ('platform', 'title', 'author', 'media_type', 'file_count', 'command_summary', 'adapter', 'target', 'notify_adapter', 'notify_target', 'notify_message_id', 'outputs'):
             val = metadata.get(key)
             if val not in (None, ''):
                 merged[key] = safe_text(val) if isinstance(val, str) else val

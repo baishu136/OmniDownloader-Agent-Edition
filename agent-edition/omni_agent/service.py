@@ -69,7 +69,10 @@ class SettingsUpdate(BaseModel):
     max_cache_bytes: int | None = Field(None, ge=1024**2, le=1024**4)
     concurrency: int | None = Field(None, ge=1, le=8)
     max_queue: int | None = Field(None, ge=1, le=1000)
+    max_active_per_owner: int | None = Field(None, ge=0, le=50)
     task_timeout: int | None = Field(None, ge=10, le=7200)
+    task_retries: int | None = Field(None, ge=0, le=5)
+    retry_base_seconds: int | None = Field(None, ge=1, le=30)
     cache_ttl: int | None = Field(None, ge=60, le=2592000)
     download_dir: str | None = None
     image_dir: str | None = None
@@ -330,6 +333,13 @@ class Service:
 
     def cleanup_preview(self, *, expired=False):
         return self.store.cleanup_preview(expired=expired)
+
+    def extract_links(self, text):
+        """预览一段聊天文本中的媒体链接及其前缀指令，不创建任务。"""
+        if not isinstance(text, str) or len(text) > 100_000:
+            raise AgentError('INVALID_PARAMETER', '文本为空或超过 100000 字符')
+        from .security import extract_chat_links
+        return {'links': extract_chat_links(text)}
 
     def export_settings(self):
         """导出非敏感配置；机器人令牌与 Cookie 保存在 Vault，不在 settings.json。"""
@@ -1009,6 +1019,13 @@ class Service:
         queued = self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('QUEUED','DOWNLOADING','PROCESSING')").fetchone()[0]
         if queued >= s.max_queue:
             raise AgentError('QUEUE_FULL', '下载队列已满')
+        if s.max_active_per_owner:
+            active = self.store.db.execute(
+                "SELECT COUNT(*) FROM jobs WHERE owner=? AND state IN ('QUEUED','DOWNLOADING','PROCESSING')",
+                (owner,),
+            ).fetchone()[0]
+            if active >= s.max_active_per_owner:
+                raise AgentError('LIMIT_EXCEEDED', f'单个调用方最多同时提交 {s.max_active_per_owner} 个未完成任务')
         unit_reserve = min(s.max_file_bytes, 20 * 1024**2) if resolved['download_type'] == 'IMAGE' else s.max_file_bytes
         reserve_bytes = min(unit_reserve * count, s.max_file_bytes * 2) if count > 1 else unit_reserve
         if self.store.usage() + reserve_bytes > s.max_cache_bytes or shutil.disk_usage(self.config.cache).free < reserve_bytes:
