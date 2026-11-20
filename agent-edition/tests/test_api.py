@@ -409,7 +409,7 @@ def test_autostart_command_api_and_boundary(service, tmp_path, monkeypatch):
     mcp_exe.write_bytes(b'')
     monkeypatch.setattr(sys, 'frozen', True, raising=False)
     monkeypatch.setattr(sys, 'executable', str(mcp_exe))
-    monkeypatch.setattr(autostart.os, 'name', 'nt')
+    monkeypatch.setattr(autostart, '_is_windows', lambda: True)
     _, frozen_argv = autostart.build_autostart_command()
     assert frozen_argv[0] == str(gui_exe) and '--serve' in frozen_argv and '--no-browser' in frozen_argv and '--tray' in frozen_argv
     monkeypatch.setattr(sys, 'frozen', False, raising=False)
@@ -417,7 +417,7 @@ def test_autostart_command_api_and_boundary(service, tmp_path, monkeypatch):
     # 2. Windows/桌面支持环境下的管理接口读写与陈旧路径识别
     reg_store = {}
     monkeypatch.setattr(autostart, 'is_autostart_supported', lambda: (True, ''))
-    monkeypatch.setattr(autostart.os, 'name', 'nt')
+    monkeypatch.setattr(autostart, '_is_windows', lambda: True)
     monkeypatch.setattr(autostart, '_read_windows_run_value', lambda: reg_store.get('val'))
 
     def fake_write(value):

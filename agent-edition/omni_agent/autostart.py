@@ -12,13 +12,17 @@ RUN_VALUE_NAME = 'OmniDownloaderAgent'
 LINUX_DESKTOP_NAME = 'omni-downloader-agent.desktop'
 
 
+def _is_windows() -> bool:
+    return os.name == 'nt'
+
+
 def _is_container() -> bool:
     return Path('/.dockerenv').exists() or bool(os.environ.get('container'))
 
 
 def is_autostart_supported() -> tuple[bool, str]:
     """判断当前运行环境是否支持桌面级开机自启动。"""
-    if os.name == 'nt':
+    if _is_windows():
         return True, ''
     if sys.platform.startswith('linux'):
         if _is_container():
@@ -38,7 +42,7 @@ def _normalize_data_dir(path: str | Path | None) -> Path | None:
 def _resolve_gui_python() -> str:
     """Windows 源码运行时优先选用 pythonw.exe，避免开机后残留控制台黑框。"""
     exe = Path(sys.executable)
-    if os.name == 'nt':
+    if _is_windows():
         if getattr(sys, 'frozen', False):
             gui_exe = exe.with_name('OmniDownloaderAgent.exe')
             if gui_exe.is_file():
@@ -59,7 +63,7 @@ def build_autostart_command(
     """构造开机自启动命令行（静默后台托盘启动，不自动弹出浏览器窗口）。"""
     executable = _resolve_gui_python()
     service_args = ['--serve', '--no-browser']
-    if os.name == 'nt':
+    if _is_windows():
         service_args.append('--tray')
     clean_host = str(host or '127.0.0.1').strip() or '127.0.0.1'
     if clean_host != '127.0.0.1':
@@ -85,7 +89,7 @@ def build_autostart_command(
         )
         argv = [executable, '-c', runner_code, *service_args]
 
-    if os.name == 'nt':
+    if _is_windows():
         return subprocess.list2cmdline(argv), argv
     import shlex
     return shlex.join(argv), argv
@@ -143,7 +147,7 @@ def get_autostart_status(
         }
 
     expected_cmd, _ = build_autostart_command(data_dir=data_dir, host=host, port=port)
-    if os.name == 'nt':
+    if _is_windows():
         try:
             current = _read_windows_run_value()
         except OSError as exc:
@@ -211,7 +215,7 @@ def set_autostart(
         return get_autostart_status(data_dir=data_dir, host=host, port=port)
 
     command, _ = build_autostart_command(data_dir=data_dir, host=host, port=port)
-    if os.name == 'nt':
+    if _is_windows():
         try:
             _write_windows_run_value(command if enabled else None)
         except OSError as exc:
