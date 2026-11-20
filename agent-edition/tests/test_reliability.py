@@ -186,6 +186,15 @@ async def test_per_owner_active_limit_is_enforced(service):
     await service.download('bob', 'https://www.youtube.com/watch?v=quota-c', DownloadOptions())
 
 
+async def test_daily_owner_quota_is_enforced(service):
+    service.update_settings({'max_jobs_per_owner_per_day': 1})
+    await service.download('alice', 'https://www.youtube.com/watch?v=daily-a', DownloadOptions())
+    with pytest.raises(AgentError) as error:
+        await service.download('alice', 'https://www.youtube.com/watch?v=daily-b', DownloadOptions())
+    assert error.value.code == 'LIMIT_EXCEEDED'
+    await service.download('bob', 'https://www.youtube.com/watch?v=daily-c', DownloadOptions())
+
+
 def test_public_job_exposes_next_action(service):
     ready = ready_task(service)
     assert service.store.public_job(ready['id'], 'alice')['next_action'] == 'deliver_or_save'

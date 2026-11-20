@@ -3,7 +3,7 @@
 日期：2026-11-20。下列记录来自实际执行，模拟 API 和真实平台验收严格区分。
 
 - Windows 原核心：`python -m pytest windows/tests -q`，142 通过，存在既有 Pydantic 弃用警告（新增 TikTok 图文拦截与图片解析、快手图集与图片后缀 `photoUrl` 视频误判拦截）。
-- Agent 独立测试：`python -m pytest agent-edition/tests -q`，154 通过（2026-11-20 稳定性增量后），覆盖：
+- Agent 独立测试：`python -m pytest agent-edition/tests -q`，155 通过（2026-11-20 稳定性增量后），覆盖：
   - 结构化错误分类（`stage`/`retryable`/`suggested_action`）、未知错误按消息判定可重试，以及 URL、凭据与 Windows/POSIX 绝对路径脱敏；
   - 临时性错误的有上限指数退避重试、非可重试错误不重试、重试不重复登记文件、重试次数上限与结构化失败回报；
   - 重启时 `QUEUED` 继续调度、进行中任务显式失败、`READY` 缓存缺失标记 `FILE_MISSING`；交付前预检缺失或截断文件并拒绝创建交付记录；
@@ -13,6 +13,7 @@
   - 清理预览与实际清理计数一致、磁盘不足在下载前以 `DISK_FULL` 阻断、配置导出/导入校验与失败回退、任务 `next_action` 提示；
   - 聊天文本多链接识别（前缀指令、去重、追踪参数清理、SSRF 与非白名单标记）以及成品实际类型/尺寸元数据；
   - 首次启动标记、管理任务列表与仅可重试可恢复错误的约束；
+  - 按调用方的并发与自然日新建任务配额；
   - 机器人交付代理策略（公网 Bot 绑定代理、本机/私网直连）；
   - 管理页“最近任务”区域与重试接口：真实启动服务后页面与 `/static/app.js` 正常返回、`node --check` 通过，创建失败任务后 `GET /api/admin/tasks` 返回 `next_action`，`POST .../retry` 将其重新置为 `QUEUED`（未做浏览器截图，本机浏览器控制不可用）；
   - 独立默认工作目录解析（`./data/` 及便携目录同级 `data/`）与无 `auth.json` 验证；

@@ -30,7 +30,7 @@
 ### 1.3 测试复现
 
 - 改造前基线：`pytest agent-edition/tests -q` → **111 通过 / 1 失败**。失败项为 `test_visual_events_outbox_server_bot_notify_and_mcp_progress`，原因是本地「跳过 error 直发」补丁与上游断言冲突。
-- 改造后：**154 通过 / 0 失败**（新增 `test_errors.py` 8 项、`test_reliability.py` 17 项、`test_credentials.py` 7 项、`test_links.py` 5 项、`test_outputs.py` 2 项、`test_delivery_proxy.py` 4 项；原失败项恢复通过）。
+- 改造后：**155 通过 / 0 失败**（新增 `test_errors.py` 8 项、`test_reliability.py` 18 项、`test_credentials.py` 7 项、`test_links.py` 5 项、`test_outputs.py` 2 项、`test_delivery_proxy.py` 4 项；原失败项恢复通过）。
 
 ### 1.4 部分支持或尚未实现（未在本轮伪装为完成）
 
@@ -71,7 +71,7 @@
 - 本地任务管理页：后端与“最近任务”列表（含可恢复失败一键重试）已接入；历史筛选、批量操作与打开目录待做。
 - 配置备份迁移：已完成 `GET /api/admin/config/export`、`POST /api/admin/config/import`（校验 + `settings.json.bak` 备份；凭据仍只在 Vault）。
 - MCP 工具结果结构化：任务结果新增 `stage`/`retryable`/`suggested_action`/`next_action`；工具数量与参数保持 23 项不变。调用次数收敛待做。
-- 机器人配额：已完成按 `owner` 的 `max_active_per_owner`；群组/文件大小/每日配额与限流待做。
+- 机器人配额：已完成按 `owner` 的 `max_active_per_owner` 与 `max_jobs_per_owner_per_day`；群组级独立配额与基于调用频率的限流待做。
 
 ### Sprint 04：质量验收（未开始）
 
@@ -93,4 +93,4 @@
 python -m pytest agent-edition/tests -q
 ```
 
-预期：154 通过。Windows 便携包已实际构建并完成 stdio MCP 冒烟；Docker 构建因本机未安装 Docker 未执行。
+预期：155 通过。Windows 便携包已实际构建并完成 stdio MCP 冒烟；Docker 构建因本机未安装 Docker 未执行。

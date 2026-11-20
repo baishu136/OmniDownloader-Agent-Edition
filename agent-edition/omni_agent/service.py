@@ -70,6 +70,7 @@ class SettingsUpdate(BaseModel):
     concurrency: int | None = Field(None, ge=1, le=8)
     max_queue: int | None = Field(None, ge=1, le=1000)
     max_active_per_owner: int | None = Field(None, ge=0, le=50)
+    max_jobs_per_owner_per_day: int | None = Field(None, ge=0, le=500)
     task_timeout: int | None = Field(None, ge=10, le=7200)
     task_retries: int | None = Field(None, ge=0, le=5)
     retry_base_seconds: int | None = Field(None, ge=1, le=30)
@@ -1079,6 +1080,13 @@ class Service:
             ).fetchone()[0]
             if active >= s.max_active_per_owner:
                 raise AgentError('LIMIT_EXCEEDED', f'单个调用方最多同时提交 {s.max_active_per_owner} 个未完成任务')
+        if s.max_jobs_per_owner_per_day:
+            import datetime
+            midnight = datetime.datetime.combine(datetime.date.today(), datetime.time.min).timestamp()
+            today = self.store.db.execute(
+                'SELECT COUNT(*) FROM jobs WHERE owner=? AND created>=?', (owner, midnight)).fetchone()[0]
+            if today >= s.max_jobs_per_owner_per_day:
+                raise AgentError('LIMIT_EXCEEDED', f'单个调用方每天最多提交 {s.max_jobs_per_owner_per_day} 个任务')
         unit_reserve = min(s.max_file_bytes, 20 * 1024**2) if resolved['download_type'] == 'IMAGE' else s.max_file_bytes
         reserve_bytes = min(unit_reserve * count, s.max_file_bytes * 2) if count > 1 else unit_reserve
         if self.store.usage() + reserve_bytes > s.max_cache_bytes or shutil.disk_usage(self.config.cache).free < reserve_bytes:

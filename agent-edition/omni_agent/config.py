@@ -34,6 +34,8 @@ class Settings(BaseModel):
     max_queue: int = Field(100, ge=1, le=1000)
     # 0 = 不限制；按 owner 统计未结束任务，避免单个用户占满队列
     max_active_per_owner: int = Field(0, ge=0, le=50)
+    # 0 = 不限制；按自然日统计单个 owner 新建任务数
+    max_jobs_per_owner_per_day: int = Field(0, ge=0, le=500)
     task_timeout: int = Field(1800, ge=10, le=7200)
     # Bounded automatic retries for transient network/download failures. 0 disables.
     task_retries: int = Field(2, ge=0, le=5)
