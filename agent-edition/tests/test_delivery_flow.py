@@ -17,7 +17,7 @@ async def test_service_success_upload_receipt_and_cleanup(service,monkeypatch):
     row=ready_task(service,'agent')
     path=Path(service.store.files(row['id'])[0]['path'])
     transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'ok':True,'result':{'message_id':101,'chat':{'id':123}}}))
-    monkeypatch.setattr('omni_agent.service.make_adapter',lambda config:TelegramAdapter(config,transport))
+    monkeypatch.setattr('omni_agent.service.make_adapter',lambda config,**kwargs:TelegramAdapter(config,transport))
     response=await service.deliver('agent',row['id'],'telegram','123','document','send')
     await service.run_delivery(service.store.delivery(response['id']))
     assert service.store.delivery(response['id'])['state']=='SENT'
@@ -30,13 +30,13 @@ async def test_service_failure_keeps_file_for_retry(service,monkeypatch):
     row=ready_task(service,'agent')
     path=Path(service.store.files(row['id'])[0]['path'])
     rejected=httpx.MockTransport(lambda r:httpx.Response(403,json={'ok':False}))
-    monkeypatch.setattr('omni_agent.service.make_adapter',lambda config:TelegramAdapter(config,rejected))
+    monkeypatch.setattr('omni_agent.service.make_adapter',lambda config,**kwargs:TelegramAdapter(config,rejected))
     response=await service.deliver('agent',row['id'],'telegram','123','document','send')
     await service.run_delivery(service.store.delivery(response['id']))
     assert service.store.delivery(response['id'])['state']=='FAILED' and path.exists()
     service.retry_delivery(response['id'])
     accepted=httpx.MockTransport(lambda r:httpx.Response(200,json={'ok':True,'result':{'message_id':102,'chat':{'id':123}}}))
-    monkeypatch.setattr('omni_agent.service.make_adapter',lambda config:TelegramAdapter(config,accepted))
+    monkeypatch.setattr('omni_agent.service.make_adapter',lambda config,**kwargs:TelegramAdapter(config,accepted))
     await service.run_delivery(service.store.delivery(response['id']))
     assert service.store.delivery(response['id'])['state']=='SENT' and not path.exists()
 
@@ -47,7 +47,7 @@ async def test_auto_delete_off_and_manual_cleanup(service,monkeypatch):
     job=ready_task(service,'agent')
     path=Path(service.store.files(job['id'])[0]['path'])
     transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'ok':True,'result':{'message_id':101,'chat':{'id':123}}}))
-    monkeypatch.setattr('omni_agent.service.make_adapter',lambda config:TelegramAdapter(config,transport))
+    monkeypatch.setattr('omni_agent.service.make_adapter',lambda config,**kwargs:TelegramAdapter(config,transport))
     response=await service.deliver('agent',job['id'],'telegram','123','document','send')
     await service.run_delivery(service.store.delivery(response['id']))
     assert path.exists()
@@ -103,7 +103,7 @@ async def test_onebot_service_honors_qq_message_and_forward_collection_settings(
             data = {}
         return httpx.Response(200, json={'status': 'ok', 'retcode': 0, 'data': data})
 
-    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg: OneBotAdapter(cfg, httpx.MockTransport(handler)))
+    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg,**kwargs: OneBotAdapter(cfg, httpx.MockTransport(handler)))
     delivery = await service.deliver('agent', row['id'], 'onebot', 'group:100', 'auto', 'fwd-send')
     await service.run_delivery(service.store.delivery(delivery['id']))
 
@@ -169,7 +169,7 @@ async def test_ordered_collection_merge_command_forward_batching_and_telegram_me
             data = {}
         return httpx.Response(200, json={'status': 'ok', 'retcode': 0, 'data': data})
 
-    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg: OneBotAdapter(cfg, httpx.MockTransport(ob_handler)))
+    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg,**kwargs: OneBotAdapter(cfg, httpx.MockTransport(ob_handler)))
     delivery = await service.deliver('agent', row['id'], 'onebot', 'group:200', 'auto', 'merge-35-send')
     await service.run_delivery(service.store.delivery(delivery['id']))
 
@@ -225,7 +225,7 @@ async def test_ordered_collection_merge_command_forward_batching_and_telegram_me
             })
         return httpx.Response(200, json={'ok': True, 'result': {'message_id': 900, 'chat': {'id': 123}}})
 
-    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg: TelegramAdapter(cfg, httpx.MockTransport(tg_handler)))
+    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg,**kwargs: TelegramAdapter(cfg, httpx.MockTransport(tg_handler)))
     d_tg = await service.deliver('agent', row_tg['id'], 'telegram', '123', 'auto', 'tg-12-send')
     await service.run_delivery(service.store.delivery(d_tg['id']))
 
@@ -255,7 +255,7 @@ async def test_ordered_collection_merge_command_forward_batching_and_telegram_me
             return httpx.Response(200, json={'ok': False, 'description': 'PHOTO_INVALID_DIMENSIONS'})
         return httpx.Response(200, json={'ok': True, 'result': {'message_id': 950 + len(fb_calls), 'chat': {'id': 123}}})
 
-    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg: TelegramAdapter(cfg, httpx.MockTransport(fb_handler)))
+    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg,**kwargs: TelegramAdapter(cfg, httpx.MockTransport(fb_handler)))
     d_fb = await service.deliver('agent', row_fb['id'], 'telegram', '123', 'auto', 'tg-fb-send')
     await service.run_delivery(service.store.delivery(d_fb['id']))
     assert service.store.delivery(d_fb['id'])['state'] == 'SENT'
@@ -280,7 +280,7 @@ async def test_service_delivery_corrects_wrong_video_kind_and_preserves_mixed_or
         single_calls.append(request.url.path.rsplit('/', 1)[-1])
         return httpx.Response(200, json={'ok': True, 'result': {'message_id': 1001, 'chat': {'id': 123}}})
 
-    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg: TelegramAdapter(cfg, httpx.MockTransport(single_handler)))
+    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg,**kwargs: TelegramAdapter(cfg, httpx.MockTransport(single_handler)))
     d_single = await service.deliver('agent', row_single['id'], 'telegram', '123', 'video', 'tg-single-img-send')
     await service.run_delivery(service.store.delivery(d_single['id']))
     assert service.store.delivery(d_single['id'])['state'] == 'SENT'
@@ -310,7 +310,7 @@ async def test_service_delivery_corrects_wrong_video_kind_and_preserves_mixed_or
             return httpx.Response(200, json={'ok': True, 'result': [{'message_id': 1100 + i, 'chat': {'id': 123}} for i in range(count)]})
         return httpx.Response(200, json={'ok': True, 'result': {'message_id': 1150, 'chat': {'id': 123}}})
 
-    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg: TelegramAdapter(cfg, httpx.MockTransport(mix_handler)))
+    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg,**kwargs: TelegramAdapter(cfg, httpx.MockTransport(mix_handler)))
     d_mix = await service.deliver('agent', row_mix['id'], 'telegram', '123', 'auto', 'tg-mix-send')
     await service.run_delivery(service.store.delivery(d_mix['id']))
     assert mix_calls == ['sendPhoto', 'sendAnimation', 'sendMediaGroup']
@@ -330,7 +330,7 @@ async def test_service_delivery_corrects_wrong_video_kind_and_preserves_mixed_or
     big_calls = []
     adapter_obj = TelegramAdapter(small_cfg, httpx.MockTransport(lambda r: (big_calls.append(r.url.path.rsplit('/', 1)[-1]), httpx.Response(200, json={'ok': True, 'result': {'message_id': 1200 + len(big_calls), 'chat': {'id': 123}}}))[1]))
     monkeypatch.setattr(adapter_obj, 'limit', lambda kind: 200 if kind == 'photo' else 1024**2)
-    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg: adapter_obj)
+    monkeypatch.setattr('omni_agent.service.make_adapter', lambda cfg,**kwargs: adapter_obj)
     d_big = await service.deliver('agent', row_big['id'], 'telegram', '123', 'auto', 'tg-big-send')
     await service.run_delivery(service.store.delivery(d_big['id']))
     assert service.store.delivery(d_big['id'])['state'] == 'SENT'

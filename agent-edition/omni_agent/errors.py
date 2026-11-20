@@ -53,6 +53,9 @@ _STAGE_BY_CODE = {
     'INVALID_RANGE': STAGE_PARSING,
     'CAPABILITY_UNAVAILABLE': STAGE_PARSING,
     'MEDIA_UNCONFIRMED': STAGE_PARSING,
+    'CONTENT_UNAVAILABLE': STAGE_PARSING,
+    'ACCESS_DENIED': STAGE_PARSING,
+    'QUALITY_UNAVAILABLE': STAGE_PARSING,
     'EXTRACTOR_CHANGED': STAGE_PARSING,
     'UPSTREAM_ERROR': STAGE_PARSING,
     # downloading / media processing
@@ -119,7 +122,7 @@ _STAGE_BY_CODE = {
 
 _ACTIONS = {
     STAGE_AUTH: '请重新登录该平台或更新 Cookie 后重试',
-    STAGE_PARSING: '请确认链接有效且内容公开；必要时更新解析组件',
+    STAGE_PARSING: '请确认链接有效、内容可公开访问且账号有权限；必要时更新解析组件',
     STAGE_DOWNLOADING: '请检查网络或代理后重试',
     STAGE_STORAGE: '请检查磁盘空间、目录权限或文件是否已被移动',
     STAGE_DELIVERY: '请检查机器人连接与目标会话；结果不确定时先核对平台消息记录',

@@ -15,7 +15,7 @@ async def test_cleanup_failure_never_changes_confirmed_sent_state(service,monkey
     job=ready_task(service,'agent')
     path=Path(service.store.files(job['id'])[0]['path'])
     transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'ok':True,'result':{'message_id':22,'chat':{'id':123}}}))
-    monkeypatch.setattr('omni_agent.service.make_adapter',lambda cfg:TelegramAdapter(cfg,transport))
+    monkeypatch.setattr('omni_agent.service.make_adapter',lambda cfg,**kwargs:TelegramAdapter(cfg,transport))
     response=await service.deliver('agent',job['id'],'telegram','123','document','cleanup-failure')
     def fail_cleanup():raise PermissionError('File temporarily locked')
     monkeypatch.setattr(service.store,'cleanup',fail_cleanup)

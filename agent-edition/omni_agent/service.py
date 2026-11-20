@@ -34,7 +34,7 @@ from .cookie_login import (
 )
 from .credentials import Vault
 from .delivery import BotConfig, IMAGE_EXTENSIONS, detect_media_kind, make_adapter
-from .errors import AgentError, safe_text
+from .errors import AgentError, classify_error, safe_text
 from .runner import Runner
 from .security import controlled, is_profile, parse_download_commands, source_url
 from .store import ACTIVE, Store
@@ -306,7 +306,7 @@ class Service:
 
     async def probe_bot(self, name):
         try:
-            result = await make_adapter(self.bot_config(name)).probe()
+            result = await make_adapter(self.bot_config(name), proxy=self.config.settings.proxy).probe()
         except AgentError as error:
             self.bot_status[name] = {
                 'connected': False,
@@ -340,6 +340,59 @@ class Service:
             raise AgentError('INVALID_PARAMETER', '文本为空或超过 100000 字符')
         from .security import extract_chat_links
         return {'links': extract_chat_links(text)}
+
+    def onboarding_status(self):
+        marker = self.config.directory / '.onboarded'
+        return {
+            'first_run': bool(self.config.first_run) and not marker.is_file(),
+            'completed': marker.is_file(),
+            'suggested_steps': [
+                'download_dir', 'image_dir', 'proxy', 'bot', 'cookies', 'mcp',
+            ] if not marker.is_file() else [],
+        }
+
+    def complete_onboarding(self):
+        from .config import atomic_write
+        atomic_write(self.config.directory / '.onboarded', b'1')
+        return self.onboarding_status()
+
+    def list_admin_tasks(self, *, limit: int = 50):
+        """管理页任务列表：只返回非敏感字段与逐文件状态。"""
+        limit = max(1, min(int(limit or 50), 200))
+        rows = self.store.db.execute('SELECT * FROM jobs ORDER BY created DESC LIMIT ?', (limit,)).fetchall()
+        tasks = []
+        for raw in rows:
+            row = dict(raw)
+            files = self.store.files(row['id'])
+            tasks.append({
+                'id': row['id'],
+                'owner': row['owner'],
+                'state': row['state'],
+                'progress': row['progress'],
+                'error': row['error'],
+                'error_message': row.get('error_message', ''),
+                'next_action': self.store.public_job(row['id'], row['owner'])['next_action'],
+                'file_count': len(files),
+                'created': row['created'],
+                'updated': row['updated'],
+            })
+        return {'tasks': tasks, 'total': len(tasks)}
+
+    def retry_job(self, identifier):
+        """仅允许重试可恢复的失败任务；凭据/权限/内容类错误须由用户重新提交。"""
+        row = self.store.job(identifier)
+        if row['state'] != 'FAILED':
+            raise AgentError('INVALID_STATE', '仅可重试失败的任务')
+        if row.get('source_id'):
+            raise AgentError('INVALID_STATE', '该任务复用了其他任务的成品；请重试源任务')
+        spec = classify_error(row['error'], row.get('error_message', ''))
+        if not spec['retryable']:
+            raise AgentError('INVALID_STATE', '该失败原因不可自动重试，请按建议处理后重新提交链接')
+        self.store.db.execute(
+            "UPDATE jobs SET state='QUEUED',error='',error_message='',progress=0,speed='',visual_stage='receive',updated=? WHERE id=?",
+            (time.time(), identifier),
+        )
+        return self.store.public_job(identifier, row['owner'])
 
     def export_settings(self):
         """导出非敏感配置；机器人令牌与 Cookie 保存在 Vault，不在 settings.json。"""
@@ -960,7 +1013,7 @@ class Service:
         if bool(notify_adapter) != bool(notify_target):
             raise AgentError('INVALID_PARAMETER', '指定直发状态通知时须同时提供 notify_adapter 与 notify_target')
         if notify_adapter and notify_target:
-            make_adapter(self.bot_config(notify_adapter)).check_target(notify_target)
+            make_adapter(self.bot_config(notify_adapter), proxy=self.config.settings.proxy).check_target(notify_target)
         explicit_image_zip = (options.download_type == 'IMAGE_ZIP') or (options.use_defaults and s.default_type == 'IMAGE_ZIP')
         resolved = self.resolve_options(options, cmd_all=cmd_all, cmd_zip=cmd_zip)
         if (collection or resolved['all_items']) and not s.collections and resolved['download_type'] != 'IMAGE':
@@ -1164,7 +1217,7 @@ class Service:
             if not resolved:
                 return False
             adapter_name, target = resolved
-            adapter = make_adapter(self.bot_config(adapter_name))
+            adapter = make_adapter(self.bot_config(adapter_name), proxy=self.config.settings.proxy)
             meta = self.store._parsed_meta(job_row)
             msg_id = meta.get('notify_message_id') if self.config.settings.visual_reuse_message else None
             any_sent = False
@@ -1283,7 +1336,7 @@ class Service:
         delivery_error = ''
         if send_adapter in ('telegram', 'onebot') and send_target:
             try:
-                bot = make_adapter(self.bot_config(send_adapter))
+                bot = make_adapter(self.bot_config(send_adapter), proxy=self.config.settings.proxy)
                 sample = previews['receive']['message'] or '[测试] OmniDownloader 下载可视化状态通知测试'
                 delivered = await bot.send_text(send_target, f'[测试通知] {sample}')
             except AgentError as exc:
@@ -1448,7 +1501,7 @@ class Service:
 
     async def deliver(self, owner, identifier, adapter, target, kind, request_key, *, after_seq: int | None = None):
         config = self.bot_config(adapter)
-        bot = make_adapter(config)
+        bot = make_adapter(config, proxy=self.config.settings.proxy)
         bot.check_target(target)
         row, new = self.store.create_delivery(identifier, owner, adapter, target, kind, request_key)
         await self._dispatch_visual_events(identifier, owner, stages_filter={'complete', 'error'})
@@ -1458,7 +1511,7 @@ class Service:
         identifier = row['id']
         self.store.db.execute("UPDATE deliveries SET state='SENDING',updated=? WHERE id=? AND state='QUEUED'", (time.time(), identifier))
         try:
-            adapter = make_adapter(self.bot_config(row['adapter']))
+            adapter = make_adapter(self.bot_config(row['adapter']), proxy=self.config.settings.proxy)
             s = self.config.settings
             pending = []
             for file in self.store.files(row['task_id']):

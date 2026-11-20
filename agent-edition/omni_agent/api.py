@@ -675,6 +675,22 @@ def create_app(service=None):
     async def diagnostics():
         return service.diagnose()
 
+    @app.get('/api/admin/onboarding')
+    async def onboarding():
+        return service.onboarding_status()
+
+    @app.post('/api/admin/onboarding/complete')
+    async def onboarding_complete():
+        return service.complete_onboarding()
+
+    @app.get('/api/admin/tasks')
+    async def admin_tasks(limit: int = 50):
+        return service.list_admin_tasks(limit=limit)
+
+    @app.post('/api/admin/tasks/{identifier}/retry')
+    async def admin_retry_task(identifier: str):
+        return service.retry_job(identifier)
+
     @app.get('/api/admin/bots')
     async def bots():
         return service.get_bot_configs()

@@ -138,6 +138,8 @@ class Config:
         data_dir = directory or os.environ.get('OMNI_AGENT_DATA') or default_data_dir()
         self.directory = private_dir(data_dir)
         self.path = self.directory / 'settings.json'
+        # 仅供首次启动引导：已有 settings.json 的安装不会被当作新用户
+        self.first_run = not self.path.exists()
         self.settings = Settings.model_validate_json(self.path.read_text('utf-8')) if self.path.exists() else Settings(
             cache_dir=os.environ.get('OMNI_AGENT_CACHE', ''), proxy=os.environ.get('OMNI_AGENT_PROXY', ''))
         self.cache = private_dir(Path(self.settings.cache_dir or self.directory / 'cache') / 'omni-agent-managed')

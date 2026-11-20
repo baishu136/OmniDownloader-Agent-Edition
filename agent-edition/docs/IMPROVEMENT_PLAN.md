@@ -30,7 +30,7 @@
 ### 1.3 测试复现
 
 - 改造前基线：`pytest agent-edition/tests -q` → **111 通过 / 1 失败**。失败项为 `test_visual_events_outbox_server_bot_notify_and_mcp_progress`，原因是本地「跳过 error 直发」补丁与上游断言冲突。
-- 改造后：**147 通过 / 0 失败**（新增 `test_errors.py` 7 项、`test_reliability.py` 14 项、`test_credentials.py` 7 项、`test_links.py` 5 项、`test_outputs.py` 2 项；原失败项恢复通过）。
+- 改造后：**154 通过 / 0 失败**（新增 `test_errors.py` 8 项、`test_reliability.py` 17 项、`test_credentials.py` 7 项、`test_links.py` 5 项、`test_outputs.py` 2 项、`test_delivery_proxy.py` 4 项；原失败项恢复通过）。
 
 ### 1.4 部分支持或尚未实现（未在本轮伪装为完成）
 
@@ -63,12 +63,12 @@
 - 画质/格式：只在可用格式内选择、降级需显式允许已由既有策略实现；本轮新增成品实际 `outputs` 元数据（类型、扩展名、字节、宽高、是否有音轨），不返回路径。
 - 文件与缓存：原子写入、同名冲突、SHA-256 已完成；磁盘空间预检与清理预览本轮完成（`DISK_FULL`、`GET /api/admin/cleanup/preview`）。
 - 进度反馈：阶段、速度、最终交付状态已有；已下载字节/总字节依赖底层核心进度，尚未实现。
-- 代理诊断：已有代理格式校验、连通性测试与环境自检；解析/下载/交付分阶段使用情况与失败归因尚未实现。
+- 代理诊断：已有代理格式校验、连通性测试与环境自检；本轮补齐机器人交付代理策略（公网 Bot 走代理、本机/私网直连）。解析/下载分阶段使用情况与失败归因尚未实现。
 
 ### Sprint 03：管理与接入（未开始）
 
-- 首次启动向导（全部可跳过，已有配置不强制）。
-- 本地任务管理页（查看、取消、重试、重发、清理、脱敏详情）。
+- 首次启动向导：后端 `GET/POST /api/admin/onboarding` 已完成（已有配置不算新用户、可跳过）；管理页向导界面待接入。
+- 本地任务管理页：后端 `GET /api/admin/tasks`、`POST /api/admin/tasks/{id}/retry` 已完成（仅可重试可恢复错误）；管理页界面待接入。
 - 配置备份迁移：已完成 `GET /api/admin/config/export`、`POST /api/admin/config/import`（校验 + `settings.json.bak` 备份；凭据仍只在 Vault）。
 - MCP 工具结果结构化：任务结果新增 `stage`/`retryable`/`suggested_action`/`next_action`；工具数量与参数保持 23 项不变。调用次数收敛待做。
 - 机器人配额：已完成按 `owner` 的 `max_active_per_owner`；群组/文件大小/每日配额与限流待做。
@@ -93,4 +93,4 @@
 python -m pytest agent-edition/tests -q
 ```
 
-预期：147 通过。Windows 核心回归与 Docker 构建需在对应环境另行执行。
+预期：154 通过。Windows 便携包已实际构建并完成 stdio MCP 冒烟；Docker 构建因本机未安装 Docker 未执行。

@@ -4,8 +4,11 @@ import contextlib
 import io
 import json
 import mimetypes
+import os
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 import time
 from typing import Literal, Protocol
 from urllib.parse import urlsplit
@@ -18,6 +21,35 @@ from .errors import AgentError
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif', '.jfif'}
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.flv'}
 AUDIO_EXTENSIONS = {'.mp3', '.m4a', '.flac', '.opus', '.ogg', '.wav', '.aac'}
+
+
+def _video_thumb(path: Path, at_seconds: float = 2.0) -> str:
+    """本地补丁：给视频消息生成一张比第 0 帧更可用的封面。
+
+    QQ/NapCat 默认取视频第一帧；片头黑场或淡入时预览发黑发虚。这里取第 2 秒
+    截图作为 `thumb`，NapCat 会用它覆盖自动生成的缩略图。失败返回空串。
+    """
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return ''
+    fd, out = tempfile.mkstemp(suffix='.jpg', prefix='omni-thumb-')
+    os.close(fd)
+    try:
+        subprocess.run(
+            [exe, '-y', '-hide_banner', '-loglevel', 'error', '-ss', str(at_seconds),
+             '-i', str(path), '-frames:v', '1', '-q:v', '2', out],
+            timeout=20, check=False, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return out if os.path.getsize(out) > 0 else ''
+    except Exception:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+        return ''
 _TELEGRAM_CONVERT_PHOTO_EXTS = {'.webp', '.avif', '.bmp', '.jfif'}
 _WIN_DRIVE_RE = re.compile(r'^[A-Za-z]:[/\\]')
 
@@ -103,15 +135,32 @@ class BotDeliveryAdapter(Protocol):
     async def send(self, path: Path, target: str, kind: str) -> dict: ...
 
 
+def delivery_proxy(base_url: str, proxy: str) -> str | None:
+    """远端机器人走显式代理；本机/私网机器人直连，避免 NapCat 被代理拦断。"""
+    if not proxy:
+        return None
+    from urllib.parse import urlsplit
+    from .security import public_ip
+    host = (urlsplit(base_url).hostname or '').lower()
+    if not host or host in ('localhost', '::1') or host.endswith(('.local', '.internal')):
+        return None
+    try:
+        return proxy if public_ip(host) else None
+    except ValueError:
+        # 域名由代理端解析；是否公网由后续请求决定
+        return proxy
+
+
 class APIAdapter:
-    def __init__(self, config, transport=None):
+    def __init__(self, config, transport=None, proxy: str = ''):
         self.config, self.transport = config, transport
+        self.proxy = delivery_proxy(config.base_url, proxy)
 
     async def request(self, path, *, timeout: float | None = None, **kwargs):
         # 禁止跟随重定向，防止恶意节点窃取机器人请求头或令牌
         read_timeout = float(timeout) if timeout is not None else 120.0
         async with httpx.AsyncClient(timeout=httpx.Timeout(read_timeout, connect=10), transport=self.transport,
-                                     trust_env=False, follow_redirects=False) as client:
+                                     trust_env=False, follow_redirects=False, proxy=self.proxy) as client:
             for attempt in range(3):
                 for value in kwargs.get('files', {}).values():
                     if isinstance(value, tuple) and hasattr(value[1], 'seek'):
@@ -152,6 +201,9 @@ class APIAdapter:
 
 
 class TelegramAdapter(APIAdapter):
+    def __init__(self, config, transport=None, proxy=''):
+        super().__init__(config, transport, proxy=proxy)
+
     async def probe(self):
         if not self.config.enabled:
             raise AgentError('BOT_DISABLED', '请先保存并启用 Telegram 连接')
@@ -361,8 +413,8 @@ class TelegramAdapter(APIAdapter):
 
 
 class OneBotAdapter(APIAdapter):
-    def __init__(self, config, transport=None):
-        super().__init__(config, transport)
+    def __init__(self, config, transport=None, proxy=''):
+        super().__init__(config, transport, proxy=proxy)
         self._probe_cache: dict | None = None
         self._checked_targets: set[str] = set()
 
@@ -448,17 +500,27 @@ class OneBotAdapter(APIAdapter):
         if use_message:
             action = 'send_group_msg' if chat_type == 'group' else 'send_private_msg'
             id_key = 'group_id' if chat_type == 'group' else 'user_id'
-            segment = {'type': category, 'data': {'file': self._media_file_uri(remote)}}
-            result = await self.api(action, {id_key: number, 'message': [segment]})
-            if not isinstance(result, dict) or not any(result.get(k) for k in ('message_id', 'id')):
-                raise AgentError('DELIVERY_UNCERTAIN', '协议端未返回可核对的消息标识；保留文件等待核对')
-            return {
-                'platform': 'onebot',
-                'mode': 'message',
-                'media_type': category,
-                'target': target,
-                **{k: result[k] for k in ('message_id', 'id') if k in result},
-            }
+            thumb = _video_thumb(Path(path)) if category == 'video' else ''
+            try:
+                segment = {'type': category, 'data': {'file': self._media_file_uri(remote)}}
+                if thumb:
+                    segment['data']['thumb'] = thumb.replace('\\', '/')
+                result = await self.api(action, {id_key: number, 'message': [segment]})
+                if not isinstance(result, dict) or not any(result.get(k) for k in ('message_id', 'id')):
+                    raise AgentError('DELIVERY_UNCERTAIN', '协议端未返回可核对的消息标识；保留文件等待核对')
+                return {
+                    'platform': 'onebot',
+                    'mode': 'message',
+                    'media_type': category,
+                    'target': target,
+                    **{k: result[k] for k in ('message_id', 'id') if k in result},
+                }
+            finally:
+                if thumb:
+                    try:
+                        os.unlink(thumb)
+                    except OSError:
+                        pass
 
         target_key = f'file:{target}'
         if target_key not in self._checked_targets:
@@ -539,5 +601,5 @@ class OneBotAdapter(APIAdapter):
         }
 
 
-def make_adapter(config, transport=None):
-    return (TelegramAdapter if config.adapter == 'telegram' else OneBotAdapter)(config, transport)
+def make_adapter(config, transport=None, proxy=''):
+    return (TelegramAdapter if config.adapter == 'telegram' else OneBotAdapter)(config, transport, proxy=proxy)

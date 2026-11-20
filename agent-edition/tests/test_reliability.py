@@ -7,7 +7,7 @@ import pytest
 from conftest import ready_task
 from omni_agent import service as service_module
 from omni_agent.errors import AgentError
-from omni_agent.service import DownloadOptions
+from omni_agent.service import DownloadOptions, Service
 
 
 class FlakyRunner:
@@ -192,6 +192,34 @@ def test_public_job_exposes_next_action(service):
     failed, _ = service.store.create_job('alice', {}, 'next-action', 'next-action-1')
     service.store.fail(failed['id'], 'TIMEOUT', error_message='超时')
     assert service.store.public_job(failed['id'], 'alice')['next_action'] == 'retry'
+
+
+def test_onboarding_status_and_completion(service):
+    assert service.onboarding_status()['first_run'] is True
+    assert service.onboarding_status()['completed'] is False
+    assert service.complete_onboarding()['completed'] is True
+    reopened = Service(service.config.directory)
+    try:
+        status = reopened.onboarding_status()
+        assert status['first_run'] is False and status['completed'] is True
+        assert status['suggested_steps'] == []
+    finally:
+        reopened.store.db.close()
+
+
+def test_admin_task_list_and_retry_guard(service):
+    retryable, _ = service.store.create_job('alice', {}, 'admin-a', 'admin-a-1')
+    service.store.fail(retryable['id'], 'TIMEOUT', error_message='超时')
+    permanent, _ = service.store.create_job('alice', {}, 'admin-b', 'admin-b-1')
+    service.store.fail(permanent['id'], 'COOKIE_EXPIRED', error_message='登录失效')
+    tasks = service.list_admin_tasks()['tasks']
+    assert {task['id'] for task in tasks} == {retryable['id'], permanent['id']}
+    assert all('next_action' in task for task in tasks)
+    retried = service.retry_job(retryable['id'])
+    assert retried['state'] == 'QUEUED' and retried['error'] == ''
+    with pytest.raises(AgentError) as error:
+        service.retry_job(permanent['id'])
+    assert error.value.code == 'INVALID_STATE'
 
 
 def test_diagnostics_reports_environment_without_secrets(service):

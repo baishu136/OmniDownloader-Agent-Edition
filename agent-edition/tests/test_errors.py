@@ -23,6 +23,14 @@ def test_unknown_code_with_transient_message_is_retryable():
     assert spec['stage'] == 'DOWNLOADING'
 
 
+def test_core_media_codes_are_classified():
+    assert classify_error('ACCESS_DENIED')['stage'] == 'PARSING'
+    assert classify_error('CONTENT_UNAVAILABLE')['retryable'] is False
+    assert classify_error('QUALITY_UNAVAILABLE')['suggested_action']
+    assert classify_error('RATE_LIMITED')['retryable'] is True
+    assert classify_error('PROXY_ERROR')['stage'] == 'DOWNLOADING'
+
+
 def test_unknown_code_with_permanent_message_is_not_retryable():
     spec = classify_error('ENGINE_UNKNOWN', '该视频已被删除')
     assert spec['retryable'] is False
