@@ -3,7 +3,13 @@
 日期：2026-11-20。下列记录来自实际执行，模拟 API 和真实平台验收严格区分。
 
 - Windows 原核心：`python -m pytest windows/tests -q`，142 通过，存在既有 Pydantic 弃用警告（新增 TikTok 图文拦截与图片解析、快手图集与图片后缀 `photoUrl` 视频误判拦截）。
-- Agent 独立测试：`python -m pytest agent-edition/tests -q`，112 通过，覆盖：
+- Agent 独立测试：`python -m pytest agent-edition/tests -q`，134 通过（2026-11-20 稳定性增量后），覆盖：
+  - 结构化错误分类（`stage`/`retryable`/`suggested_action`）、未知错误按消息判定可重试，以及 URL、凭据与 Windows/POSIX 绝对路径脱敏；
+  - 临时性错误的有上限指数退避重试、非可重试错误不重试、重试不重复登记文件、重试次数上限与结构化失败回报；
+  - 重启时 `QUEUED` 继续调度、进行中任务显式失败、`READY` 缓存缺失标记 `FILE_MISSING`；交付前预检缺失或截断文件并拒绝创建交付记录；
+  - Cookie 保存后解密回读、失败回滚且保持启用状态、上一版本备份与恢复接口、重启后可读，以及 Agent 接口不暴露回滚备份字段；
+  - 环境自检报告（目录可写、磁盘余量、数据库、加密存储、FFmpeg/Deno、代理、Bot、凭据可读）不含 Cookie 明文或键名；
+  - 交付状态逐文件列出 `sent` 标记，部分成功时可继续发送未完成文件；
   - 独立默认工作目录解析（`./data/` 及便携目录同级 `data/`）与无 `auth.json` 验证；
   - 免令牌 HTTP 管理接口与官方 MCP SDK 真实 `stdio` / Streamable HTTP 握手及 23 项工具（含 `list_bridges`）发现；
   - 设置读取/局部更新/自动保存/重置默认设置，以及 `download_dir`、`image_dir` 永久导出、页内目录浏览/创建、原生文件夹选择降级逻辑，以及仅限管理端与系统托盘的「开机自启动」开关（Windows 注册表 `HKCU\...\Run` 静默 `--no-browser --tray` 启动、容器/无桌面环境诚实禁用提示、与 Agent 零改写权限隔离）；

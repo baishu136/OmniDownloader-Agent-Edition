@@ -10,6 +10,9 @@
 - 网络代理诊断：支持 `http` / `https` / `socks5` 代理，兼容 Fake-IP / TUN；可在设置页直接点击“测试连通性”测量代理 TCP 握手及国内外媒体目标连通延迟。
 - 已取消令牌授权设定：无 `auth.json`，打开 `http://127.0.0.1:58080/` 即可直接进入设置页；更改开关即自动保存，目录与代理提供显式保存与清空按钮，并支持“重置默认设置”。
 - 开机自启动（Windows / 桌面环境）：可在设置页“01 下载与存储设置”底部开关「开机自动启动服务」或右键 Windows 系统托盘图标一键开启/关闭（启用后写入当前用户注册表 `Run` 项，随系统登录后以 `--no-browser --tray` 后台静默运行、不自动弹出浏览器，并在双开主程序时自动唤起管理页；Docker/无桌面环境自动提示由容器 `restart` 策略管理）。
+- 失败自动重试：`task_retries`（0–5，默认 2）控制临时性网络/下载错误的重试次数，`retry_base_seconds`（1–30，默认 1）为指数退避基数（带 0–25% 随机抖动，单次等待上限 30 秒）。仅 `retryable=true` 的错误（超时、连接重置、DNS、代理、5xx、限流、工作进程异常退出等）会重试；Cookie 失效、视频不存在、无权限、文件超限、磁盘不足、需要审批等错误不会重试。重试前会丢弃本次未登记的临时产物，取消与停机信号始终优先。
+- 结构化错误：所有接口错误在原有 `code`/`message` 之外附带 `stage`（`REQUEST`/`AUTHENTICATING`/`PARSING`/`DOWNLOADING`/`STORAGE`/`DELIVERY`/`INTERNAL`）、`retryable` 与 `suggested_action`；任务与交付状态同样返回这三个字段。Agent 可据此决定重试还是请求人工处理。
+- 重启恢复：服务启动时未开始的 `QUEUED` 任务保留并由调度器继续；已开始的下载标记 `RESTART_INTERRUPTED` 失败并保留原因；发送中的交付标记 `UNCERTAIN` 等待人工核对；`READY` 任务若缓存文件缺失或大小变化，会标记 `FILE_MISSING`，不会再被当作可交付。
 
 ## 链接前缀下载指令
 
@@ -46,6 +49,7 @@
 - **内置页内导航与防 Google 风控纯净登录模式（解决 Edge / Chrome 无法登录 Google 问题）**：浏览器默认优先选用 Google Chrome（其次 Microsoft Edge / Brave），支持在页面直接切换本机已安装的浏览器并选择「智能模式 / 始终纯净无调试 / 始终实时监听」；启动参数默认启用 `--disable-blink-features=AutomationControlled` 与 `--disable-background-mode` 屏蔽 `navigator.webdriver` 与后台锁，且在涉及 `accounts.google.com`、YouTube、Google 管理或独立账号容器时智能进入**纯净无调试模式**（不传入 `--remote-debugging-port`），用户可像日常浏览器一样无障碍登录 Google，关窗或点击确认按钮后自动通过 Windows `WM_CLOSE` 优雅刷盘退出并由同内核无头进程无损读出全量 Cookie（含 `HttpOnly` 与 App-Bound 加密会话）。实时 CDP 监听模式下活动面板顶部仍提供「Google 账号页」「平台登录页」「重新加载登录页」及一键「纯净模式重开」。
 - **Google / 独立登录档案（多账号隔离容器）**：支持新建与激活多个命名独立档案，每个档案使用独立浏览器隔离目录 `data/browser-profiles/<id>_e<epoch>/` 互不串号；支持单容器打开登录、后台无头免密同步、全选/退出当前/退出所选（通过两阶段递增 `epoch` 与 `owner_token` 所有权校验仅删除仍归属于该档案的凭据，绝不误删手工覆写的新会话），同时保留底部默认共享档案的「一键免密同步」「管理 Google 登录」与「清理共享档案」。
 - **默认浏览器打开与多格式导入**：任何环境均可点击「默认浏览器打开」跳转官方登录页，或上传/粘贴 Netscape `cookies.txt`、HTTP `Cookie:` 请求头及浏览器扩展导出的 JSON 数组。
+- **保存即回读、失败不覆盖、可回滚**：新 Cookie 先加密写入，再通过一次解密回读（Cookiejar 解析）确认可用，才标记为已保存（`UNVERIFIED`，除非平台支持在线校验并返回有效）；写入、回读或解析任一失败会恢复上一版本并保持原有启用状态。每次成功导入都会保留上一版本，管理接口 `POST /api/admin/sessions/{platform}/restore` 可一键回滚；`GET /api/admin/sessions` 的 `rollback_available` 字段指示是否存在备份（仅管理页可见，Agent 接口不返回）。
 - **严格权限隔离**：仅用户可在管理页登录、管理多账号容器、导入或重新启用 Cookie；Agent 仅拥有 `list_cookie_statuses`（只读非敏感状态，不含 `ui`/`owner_token`/独立档案目录）、`disable_platform_cookie`（禁用）与 `remove_platform_cookie`（移除）权限。
 
 ## 自动识别已接入桥接与 MCP 工具（23 项）

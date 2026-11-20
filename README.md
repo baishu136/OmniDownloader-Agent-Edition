@@ -7,6 +7,7 @@
 - 官方 MCP Python SDK：stdio 与 Streamable HTTP，23 个媒体、设置管理、自动识别桥接、运维与 Cookie 权限控制工具。
 - 免令牌本机直连与文件夹/代理工具：取消 `auth.json` 与令牌锁屏，打开管理页直接进入设置工作区；提供原生文件夹选择弹窗（无头环境降级为页内服务端浏览）、显式保存按键、重置默认设置及网络代理连通性测试（兼容 Fake-IP / TUN）。
 - 下载可视化高可靠反馈与报错直出：基于持久化事件流 `visual_events` 与 `after_seq`/`wait_seconds` 长轮询防止极速下载或缓存命中丢失状态，支持按节点开关或全关静默、自定义模板/Agent 决定模式、`server_bot` 白名单 QQ/Telegram 机器人即时文本直发（含 Telegram 同任务原地编辑刷新）与 MCP 进度通知、页内预览及试发测试，以及任意报错直接输出完整脱敏报错原因。
+- 稳定性与可恢复性：临时性下载错误按 `task_retries` / `retry_base_seconds` 有上限退避重试；重启时排队任务继续、进行中任务显式失败、缓存缺失的 `READY` 任务标记 `FILE_MISSING`；交付前校验文件存在与大小并逐文件回报发送状态；错误统一带 `stage` / `retryable` / `suggested_action`；`GET /api/admin/diagnostics` 提供不含凭据的环境自检；Cookie 保存后解密回读，失败不覆盖旧凭据并支持 `POST /api/admin/sessions/{platform}/restore` 回滚。
 - 自动识别已接入桥接：自动追踪与扫描 Streamable HTTP (`/mcp`)、MCP stdio (`--stdio`)、AstrBot 插件及本地 Bot 连接状态。
 - 图文独立格式、智能识别与指令前缀：默认模式自动识别图文作品，支持 `/us`（下载合集、分集视频、全部图片；不加 `/us` 时图文仅下载首图）、`/zip`（打包成 ZIP 压缩包发送）与 `/merge`（以合并转发或媒体组相册发送）；支持单独设置图片输出格式 `image_format`（`original` / `jpg` / `png` / `webp`，遇动图自动保留动态）及独立设置媒体/图文/缓存目录。
 - QQ / OneBot 11 / NapCat 与 Telegram 合集发送：严格保持多图/合集原始顺序，支持配置 QQ 视频/图片以聊天消息或群/私聊文件发送、将合集/图集打包为合并转发聊天记录（`send_*_forward_msg`，默认单批 30 条上限 `qq_forward_max_items` 自动分批），以及 Telegram `sendMediaGroup` 相册聚合、WebP/AVIF 内存转换与 GIF `sendAnimation`。
