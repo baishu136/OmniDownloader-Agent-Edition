@@ -651,6 +651,14 @@ def create_app(service=None):
     async def verify_cookie(platform: str):
         return await service.verify_cookie(platform)
 
+    @app.post('/api/admin/sessions/{platform}/restore')
+    async def restore_cookie(platform: str):
+        return service.restore_cookie(platform)
+
+    @app.get('/api/admin/diagnostics')
+    async def diagnostics():
+        return service.diagnose()
+
     @app.get('/api/admin/bots')
     async def bots():
         return service.get_bot_configs()

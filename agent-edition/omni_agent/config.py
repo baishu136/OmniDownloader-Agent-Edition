@@ -33,6 +33,9 @@ class Settings(BaseModel):
     concurrency: int = Field(2, ge=1, le=8)
     max_queue: int = Field(100, ge=1, le=1000)
     task_timeout: int = Field(1800, ge=10, le=7200)
+    # Bounded automatic retries for transient network/download failures. 0 disables.
+    task_retries: int = Field(2, ge=0, le=5)
+    retry_base_seconds: int = Field(1, ge=1, le=30)
     cache_ttl: int = Field(86400, ge=60, le=2592000)
     download_dir: str = ''
     image_dir: str = ''

@@ -7,7 +7,7 @@ import sqlite3
 import time
 import uuid
 
-from .errors import AgentError, safe_text
+from .errors import AgentError, classify_error, safe_text
 from .security import controlled
 from .visualization import build_visualization, stage_from_task_state, summarize_command
 
@@ -96,12 +96,36 @@ class Store:
             raise
 
     def recover(self):
-        # Never retry an ambiguous upload: upstream may have accepted it before
-        # the process died. Keep both media and receipt ledger for reconciliation.
+        # Queued jobs were never started, so the dispatcher can safely run them
+        # after restart. In-flight downloads cannot be resumed by the legacy
+        # core; they end with an explicit reason instead of a false success.
+        # Ambiguous uploads are never retried automatically.
         with self.transaction():
-            self.db.execute("UPDATE jobs SET state='FAILED', error='RESTART_INTERRUPTED', error_message='服务重启导致下载任务中断，请重新发起下载' WHERE state IN ('QUEUED','DOWNLOADING','PROCESSING')")
+            self.db.execute("UPDATE jobs SET state='FAILED', error='RESTART_INTERRUPTED', error_message='服务重启导致下载任务中断，请重新发起下载' WHERE state IN ('DOWNLOADING','PROCESSING')")
             self.db.execute("UPDATE deliveries SET state='UNCERTAIN', error='RESTART_DURING_SEND', error_message='发送期间服务重启，结果不确定；请核对后重试' WHERE state='SENDING'")
             self.db.execute("UPDATE jobs SET state='FAILED', error='DELIVERY_UNCERTAIN', error_message='发送期间服务重启，请核对平台消息记录' WHERE state='SENDING'")
+        self.reconcile_ready_files()
+
+    def reconcile_ready_files(self):
+        """READY jobs whose managed files vanished must not look deliverable."""
+        for row in self.db.execute("SELECT * FROM jobs WHERE state='READY'").fetchall():
+            files = self.files(row['id'])
+            if not files:
+                continue
+            broken = False
+            for record in files:
+                if record['state'] == 'CLEANED':
+                    continue
+                try:
+                    path = controlled(self.config.cache, record['path'])
+                except AgentError:
+                    broken = True
+                    break
+                if not path.is_file() or path.stat().st_size != record['bytes']:
+                    broken = True
+                    break
+            if broken:
+                self.fail(row['id'], 'FILE_MISSING', 'FAILED', error_message='缓存文件缺失或已变化，请重新下载')
 
     def job(self, job_id, owner=None):
         row = self.db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
@@ -391,8 +415,12 @@ class Store:
             latest_seq=latest_seq,
             server_notified=stage_notified,
         )
+        error_spec = classify_error(row['error'], row.get('error_message', '')) if row['error'] else {}
         return {k: row[k] for k in ('id', 'state', 'progress', 'speed', 'error', 'created', 'updated')} | {
             'error_message': row.get('error_message', '') or row['error'],
+            'stage': error_spec.get('stage', ''),
+            'retryable': error_spec.get('retryable', False),
+            'suggested_action': error_spec.get('suggested_action', ''),
             'metadata': meta,
             'file_count': len(files),
             'files': [{'file_id': f['id'], 'bytes': f['bytes'], 'state': f['state']} for f in files],
@@ -407,8 +435,15 @@ class Store:
                 raise AgentError('IDEMPOTENCY_CONFLICT', '交付请求键已用于其他参数')
             return dict(previous), False
         if job['state'] not in ('READY', 'SENT', 'SENDING'): raise AgentError('NOT_READY', '下载任务尚未就绪')
-        if not self.files(job_id) or any(f['state'] == 'CLEANED' for f in self.files(job_id)):
+        records = self.files(job_id)
+        if not records or any(f['state'] == 'CLEANED' for f in records):
             raise AgentError('NOT_FOUND', '文件已经清理')
+        # Preflight before a delivery row exists: a missing or truncated file
+        # must fail here with a precise reason instead of during sending.
+        for record in records:
+            path = controlled(self.config.cache, record['path'])
+            if not path.is_file() or path.stat().st_size != record['bytes']:
+                raise AgentError('FILE_MISSING', '缓存文件缺失或大小已变化，请重新下载后再发送')
         identifier, now = uuid.uuid4().hex, time.time()
         with self.transaction():
             self.merge_job_metadata(job_id, {'adapter': adapter, 'target': target})
@@ -463,6 +498,11 @@ class Store:
             latest_seq=latest_seq,
             server_notified=stage_notified,
         )
+        error_spec = classify_error(row['error'], row.get('error_message', '')) if row['error'] else {}
+        sent_ids = {
+            item['file_id']
+            for item in self.db.execute('SELECT file_id FROM receipts WHERE delivery_id=?', (identifier,))
+        }
         result = {
             'id': row['id'],
             'task_id': row['task_id'],
@@ -471,6 +511,13 @@ class Store:
             'state': row['state'],
             'error': row['error'],
             'error_message': row.get('error_message', '') or row['error'],
+            'stage': error_spec.get('stage', ''),
+            'retryable': error_spec.get('retryable', False),
+            'suggested_action': error_spec.get('suggested_action', ''),
+            'files': [
+                {'file_id': f['id'], 'bytes': f['bytes'], 'state': f['state'], 'sent': f['id'] in sent_ids}
+                for f in files
+            ],
             'visualization': vis,
         }
         if include_receipts:

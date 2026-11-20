@@ -3,6 +3,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import random
 from pathlib import Path
 import shutil
 import sys
@@ -35,7 +36,7 @@ from .credentials import Vault
 from .delivery import BotConfig, IMAGE_EXTENSIONS, detect_media_kind, make_adapter
 from .errors import AgentError, safe_text
 from .runner import Runner
-from .security import is_profile, parse_download_commands, source_url
+from .security import controlled, is_profile, parse_download_commands, source_url
 from .store import ACTIVE, Store
 from .visualization import build_visualization, format_error_detail, stage_from_task_state
 
@@ -116,6 +117,11 @@ class BotConfigUpdate(BaseModel):
     allowed_targets: list[str] | None = Field(None, max_length=200)
     shared_root: str | None = None
     remote_root: str | None = None
+
+
+async def _retry_pause(seconds: float) -> None:
+    """Indirection so tests can run the backoff logic without real waits."""
+    await asyncio.sleep(seconds)
 
 
 class Service:
@@ -327,6 +333,12 @@ class Service:
     def _validation_key(self, platform):
         return 'validation-' + str(list(self.domains).index(platform))
 
+    def _session_blob_path(self, platform):
+        return self.sessions._path(platform)
+
+    def _session_backup_path(self, platform):
+        return self.sessions._path(platform).with_suffix('.backup.bin')
+
     def _session_info(self, platform, *, include_ui=False):
         raw = self.vault.get(self._validation_key(platform))
         validation = json.loads(raw) if raw else {'state': 'UNVERIFIED'}
@@ -342,6 +354,8 @@ class Service:
             'validation': clean_validation,
         }
         if include_ui:
+            # 管理页专用：是否存在可回滚的上一版本；对 Agent 不可见
+            info['rollback_available'] = status['state'] == 'IMPORTED' and self._session_backup_path(platform).is_file()
             mock_probe = find_local_browser()
             pref_browser = self.browser_prefs.get()['browser']
             if mock_probe is None:
@@ -407,18 +421,87 @@ class Service:
         return True
 
     def import_cookie(self, platform, text, *, source='import', owner_token=''):
-        """仅限用户管理页调用：加密导入或更新平台 Cookie 并默认启用。"""
+        """仅限用户管理页调用：加密导入或更新平台 Cookie 并默认启用。
+
+        新凭据必须先通过「加密写入 + 解密回读」才算保存成功；任一环节失败都会
+        恢复上一版本，绝不会用一份不可用凭据覆盖仍在生效的登录状态。
+        """
         if platform not in self.domains:
             raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
         normalized = normalize_cookie_text(platform, text, self.domains)
+        path = self._session_blob_path(platform)
+        pending = path.with_suffix('.pending.bin')
+        had_previous = path.is_file()
+        was_enabled = self.sessions.is_enabled(platform)
+        if had_previous:
+            shutil.copyfile(path, pending)
         try:
             self.sessions.import_text(platform, normalized)
+            self.sessions.set_enabled(platform, True)
+            # 回读会走一次解密与 Cookiejar 解析，等价于「保存后可用」检查
+            if len(self.sessions.jar(platform)) == 0:
+                raise AgentError('INVALID_COOKIE', 'Cookie 保存后回读为空，已保留上一版本')
+        except AgentError:
+            self._rollback_cookie_file(platform, pending, had_previous, was_enabled)
+            raise
         except (ValueError, OSError):
+            self._rollback_cookie_file(platform, pending, had_previous, was_enabled)
             raise AgentError('INVALID_COOKIE', 'Cookie文件无效或不包含此平台有效凭据') from None
-        self.sessions.set_enabled(platform, True)
-        payload = {'state': 'UNVERIFIED', 'source': source, 'updated_at': time.time()}
+        if had_previous:
+            # 只有新版本通过回读后，才把它上一版留作可回滚备份
+            pending.replace(self._session_backup_path(platform))
+        else:
+            pending.unlink(missing_ok=True)
+        payload = {'state': 'UNVERIFIED', 'source': source, 'updated_at': time.time(), 'readback_ok': True}
         if owner_token:
             payload['owner_token'] = owner_token
+        self.vault.put(self._validation_key(platform), json.dumps(payload))
+        return self._session_info(platform, include_ui=True)
+
+    def _rollback_cookie_file(self, platform, pending, had_previous, was_enabled):
+        path = self._session_blob_path(platform)
+        try:
+            if had_previous and pending.is_file():
+                pending.replace(path)
+            elif not had_previous:
+                path.unlink(missing_ok=True)
+            self.sessions.set_enabled(platform, was_enabled)
+        except OSError:
+            pass
+        finally:
+            pending.unlink(missing_ok=True)
+
+    def restore_cookie(self, platform):
+        """仅限用户管理页调用：回滚到上一个已接受并成功回读的凭据版本。"""
+        if platform not in self.domains:
+            raise AgentError('UNSUPPORTED_PLATFORM', '未知平台')
+        backup = self._session_backup_path(platform)
+        if not backup.is_file():
+            raise AgentError('NOT_FOUND', '没有可回滚的上一版本凭据')
+        try:
+            readable = bool(self.vault.protect(backup.read_bytes(), True).strip())
+        except Exception:
+            readable = False
+        if not readable:
+            raise AgentError('INVALID_COOKIE', '备份凭据无法解密，未替换当前文件')
+        path = self._session_blob_path(platform)
+        was_enabled = self.sessions.is_enabled(platform)
+        previous = path.with_suffix('.restore-prev.tmp')
+        had_current = path.is_file()
+        if had_current:
+            shutil.copyfile(path, previous)
+        temporary = path.with_suffix('.rollback.tmp')
+        shutil.copyfile(backup, temporary)
+        temporary.replace(path)
+        self.sessions.set_enabled(platform, True)
+        if len(self.sessions.jar(platform)) == 0:
+            if had_current and previous.is_file():
+                previous.replace(path)
+            self.sessions.set_enabled(platform, was_enabled)
+            previous.unlink(missing_ok=True)
+            raise AgentError('INVALID_COOKIE', '备份凭据回读失败，已恢复当前文件')
+        previous.unlink(missing_ok=True)
+        payload = {'state': 'UNVERIFIED', 'source': 'rollback', 'updated_at': time.time(), 'readback_ok': True}
         self.vault.put(self._validation_key(platform), json.dumps(payload))
         return self._session_info(platform, include_ui=True)
 
@@ -1140,6 +1223,37 @@ class Service:
                 delivery_error = exc.message
         return {'previews': previews, 'delivered': delivered, 'delivery_error': delivery_error}
 
+    def _reset_job_workspace(self, identifier):
+        """丢弃上一次尝试的未登记产物；账本中的文件不受影响。"""
+        state = self.config.cache / 'jobs' / identifier
+        try:
+            root = controlled(self.config.cache, state)
+        except AgentError:
+            return
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+
+    async def _call_with_retry(self, payload, identifier, progress):
+        """仅对临时性错误做有上限的指数退避重试，并遵守取消与停机信号。"""
+        settings = self.config.settings
+        attempts = int(getattr(settings, 'task_retries', 0) or 0)
+        base = float(getattr(settings, 'retry_base_seconds', 1) or 1)
+        delay = base
+        for attempt in range(attempts + 1):
+            try:
+                return await self.runner.call(payload, identifier, progress)
+            except asyncio.CancelledError:
+                raise
+            except AgentError as error:
+                row = self.store.job(identifier)
+                if (attempt >= attempts or not error.retryable or self.stopping
+                        or row['state'] in ('CANCELLED', 'READY', 'SENT')):
+                    raise
+                self._reset_job_workspace(identifier)
+                await _retry_pause(delay + random.uniform(0, delay * 0.25))
+                delay = min(delay * 2, 30.0)
+        raise AgentError('INTERNAL_ERROR', '重试流程异常结束')
+
     async def run_job(self, row):
         identifier = row['id']
         loop = asyncio.get_running_loop()
@@ -1182,7 +1296,7 @@ class Service:
                 if ev:
                     pending_bg.append(loop.create_task(self._dispatch_visual_events(identifier, row['owner'])))
 
-            result = await self.runner.call(payload, identifier, progress)
+            result = await self._call_with_retry(payload, identifier, progress)
             self._export_to_storage(payload, result['paths'], metadata=result.get('metadata'))
             if result.get('metadata'):
                 self.store.merge_job_metadata(identifier, result['metadata'])
@@ -1414,6 +1528,78 @@ class Service:
         return {'file_id': identifier, 'uri': 'omni-file://' + identifier, 'bytes': record['bytes'],
                 'sha256': record['digest'], 'mime_type': mimetypes.guess_type(path.name)[0] or 'application/octet-stream',
                 'name': path.name, 'delivery': 'Use deliver_media with the owning task_id; this URI is not a filesystem path.'}
+
+    def diagnose(self):
+        """本机环境自检：只报告状态与数量，不包含任何凭据、路径或密钥。"""
+        checks = []
+
+        def add(identifier, state, detail):
+            checks.append({'id': identifier, 'state': state, 'detail': detail})
+
+        settings = self.config.settings
+        for identifier, directory, label in (
+            ('data_dir', self.config.directory, '状态目录'),
+            ('cache_dir', self.config.cache, '缓存目录'),
+        ):
+            try:
+                probe = Path(directory) / '.diagnostic.tmp'
+                probe.write_bytes(b'ok')
+                probe.unlink()
+                add(identifier, 'ok', f'{label}可写')
+            except OSError:
+                add(identifier, 'fail', f'{label}不可写')
+        try:
+            free = shutil.disk_usage(self.config.cache).free
+            limit = max(settings.max_file_bytes * 2, 1024 ** 3)
+            add('disk_space', 'warn' if free < limit else 'ok',
+                f'剩余 {free // (1024 ** 2)} MiB；单文件上限 {settings.max_file_bytes // (1024 ** 2)} MiB')
+        except OSError:
+            add('disk_space', 'fail', '无法读取磁盘剩余空间')
+        try:
+            healthy = self.store.db.execute('PRAGMA quick_check').fetchone()[0] == 'ok'
+            add('database', 'ok' if healthy else 'fail', '任务账本可读' if healthy else '任务账本校验失败')
+        except Exception:
+            add('database', 'fail', '任务账本无法读取')
+        try:
+            sealed = self.vault.protect(b'omni-health')
+            roundtrip = self.vault.protect(sealed, True) == b'omni-health'
+            add('vault', 'ok' if roundtrip else 'fail',
+                '凭据加密存储可读写' if roundtrip else '凭据加密回读失败')
+        except Exception:
+            add('vault', 'fail', '凭据加密存储不可用')
+        from .credentials import native_runtime
+        try:
+            import imageio_ffmpeg
+            ffmpeg = bool(native_runtime('ffmpeg')) or Path(imageio_ffmpeg.get_ffmpeg_exe()).is_file()
+        except (ImportError, RuntimeError):
+            ffmpeg = bool(native_runtime('ffmpeg'))
+        add('ffmpeg', 'ok' if ffmpeg else 'warn', '可用' if ffmpeg else '未找到 FFmpeg，音频/合并/GIF 能力受限')
+        add('deno', 'ok' if native_runtime('deno') else 'warn',
+            '可用' if native_runtime('deno') else '未找到 Deno，部分解析器受限')
+        add('proxy', 'ok' if settings.proxy else 'ok',
+            '已配置代理（未做实时连通性测试）' if settings.proxy else '未配置代理（直连）')
+        for name in ('telegram', 'onebot'):
+            cfg = self.bot_config(name)
+            if cfg.enabled:
+                count = len(cfg.allowed_targets or [])
+                add(f'bot_{name}', 'ok' if count else 'warn',
+                    f'已启用，允许目标 {count} 个' if count else '已启用但未配置允许目标')
+        readable, unreadable = 0, 0
+        for platform in self.domains:
+            if not self.sessions.is_enabled(platform):
+                continue
+            if self.sessions.status(platform)['state'] != 'IMPORTED':
+                continue
+            try:
+                if len(self.sessions.jar(platform)):
+                    readable += 1
+                else:
+                    unreadable += 1
+            except Exception:
+                unreadable += 1
+        add('credentials', 'fail' if unreadable else 'ok',
+            f'可读 {readable} 个平台' + (f'，{unreadable} 个平台读取失败' if unreadable else ''))
+        return {'ok': all(c['state'] != 'fail' for c in checks), 'checks': checks, 'version': __version__}
 
     def capabilities(self):
         from importlib.metadata import version

@@ -88,7 +88,14 @@ class Runner:
                 line = await read
                 if not line: break
                 event = json.loads(line)
-                if event['kind'] == 'error': raise AgentError(event['code'], event['message'])
+                if event['kind'] == 'error':
+                    raise AgentError(
+                        event['code'],
+                        event['message'],
+                        stage=event.get('stage'),
+                        retryable=event.get('retryable'),
+                        suggested_action=event.get('suggested_action'),
+                    )
                 if event['kind'] in ('progress', 'metadata') and progress: progress(event)
                 if event['kind'] == 'result': result = event['result']
             await process.wait()
