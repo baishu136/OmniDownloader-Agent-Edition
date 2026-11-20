@@ -108,11 +108,22 @@ def stdio(server_url, directory):
 
 
 def serve(args):
+    import httpx
     import uvicorn
     from .api import create_app
     from .service import Service
 
+    if not args.no_browser and args.host in ('127.0.0.1', 'localhost'):
+        try:
+            with httpx.Client(trust_env=False, timeout=0.6) as client:
+                if client.get(f'http://127.0.0.1:{args.port}/health').status_code == 200:
+                    webbrowser.open(f'http://127.0.0.1:{args.port}/')
+                    return
+        except httpx.HTTPError:
+            pass
+
     service = Service(args.data)
+    service.runtime_endpoint = {'host': args.host, 'port': int(args.port)}
     first_start = not (service.config.directory / 'has-started').exists()
     config = uvicorn.Config(
         create_app(service),
@@ -142,12 +153,34 @@ def serve(args):
         image = Image.new('RGB', (64, 64), '#0969b7')
         draw = ImageDraw.Draw(image)
         draw.line([(16, 20), (32, 40), (48, 20)], fill='white', width=6)
+
+        def _autostart_checked(_item):
+            try:
+                return bool(service.get_autostart_status().get('enabled'))
+            except Exception:
+                return False
+
+        def _autostart_supported(_item):
+            try:
+                return bool(service.get_autostart_status().get('supported'))
+            except Exception:
+                return False
+
+        def _toggle_autostart(icon_obj, _item):
+            try:
+                current = bool(service.get_autostart_status().get('enabled'))
+                service.set_autostart(not current)
+                icon_obj.update_menu()
+            except Exception:
+                pass
+
         icon = pystray.Icon(
             'omni-agent',
             image,
             'OmniDownloader Agent Edition',
             menu=pystray.Menu(
-                pystray.MenuItem('打开管理页面', lambda: webbrowser.open(f'http://127.0.0.1:{args.port}/')),
+                pystray.MenuItem('打开管理页面', lambda: webbrowser.open(f'http://127.0.0.1:{args.port}/'), default=True),
+                pystray.MenuItem('开机自启动', _toggle_autostart, checked=_autostart_checked, enabled=_autostart_supported),
                 pystray.MenuItem('安全退出', lambda: (setattr(server, 'should_exit', True), icon.stop())),
             ),
         )

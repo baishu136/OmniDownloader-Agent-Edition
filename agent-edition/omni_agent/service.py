@@ -13,6 +13,7 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import __version__
+from .autostart import get_autostart_status, set_autostart
 from .bridges import BridgeRegistry
 from .config import Config, Settings, private_dir
 from .cookie_login import (
@@ -139,6 +140,26 @@ class Service:
         self._notify_locks: dict[str, asyncio.Lock] = {}
         self._notify_inflight: dict[str, asyncio.Event] = {}
         self._startup_probe = None
+        self.runtime_endpoint = {'host': '127.0.0.1', 'port': 58080}
+
+    def get_autostart_status(self) -> dict:
+        """读取当前运行实例对应的系统开机自启动真实状态。"""
+        ep = self.runtime_endpoint or {}
+        return get_autostart_status(
+            data_dir=self.config.directory,
+            host=str(ep.get('host') or '127.0.0.1'),
+            port=int(ep.get('port') or 58080),
+        )
+
+    def set_autostart(self, enabled: bool) -> dict:
+        """启用或取消当前运行实例的系统开机自启动。"""
+        ep = self.runtime_endpoint or {}
+        return set_autostart(
+            bool(enabled),
+            data_dir=self.config.directory,
+            host=str(ep.get('host') or '127.0.0.1'),
+            port=int(ep.get('port') or 58080),
+        )
 
     async def start(self):
         # 同一状态目录同时只允许运行一个服务实例，避免损坏任务与文件账本

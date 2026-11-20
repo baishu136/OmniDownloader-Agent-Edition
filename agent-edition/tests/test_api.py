@@ -389,3 +389,72 @@ async def test_download_command_prefixes_us_and_zip(service):
     )
     assert nine_img_col['state'] == 'QUEUED'
 
+
+def test_autostart_command_api_and_boundary(service, tmp_path, monkeypatch):
+    import sys
+    from fastapi.testclient import TestClient
+    from omni_agent import autostart
+    from omni_agent.api import create_app
+
+    # 1. 命令构建：默认与自定义端口/数据目录，且冻结模式优先使用 GUI 托盘入口
+    cmd, argv = autostart.build_autostart_command(data_dir=tmp_path / 'custom data', host='127.0.0.1', port=59001)
+    assert '--serve' in argv and '--no-browser' in argv and '--port' in argv and '59001' in argv
+    assert '--data' in argv and str((tmp_path / 'custom data').resolve()) in cmd
+
+    fake_dir = tmp_path / 'portable'
+    fake_dir.mkdir()
+    gui_exe = fake_dir / 'OmniDownloaderAgent.exe'
+    mcp_exe = fake_dir / 'OmniDownloaderAgentMCP.exe'
+    gui_exe.write_bytes(b'')
+    mcp_exe.write_bytes(b'')
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    monkeypatch.setattr(sys, 'executable', str(mcp_exe))
+    monkeypatch.setattr(autostart.os, 'name', 'nt')
+    _, frozen_argv = autostart.build_autostart_command()
+    assert frozen_argv[0] == str(gui_exe) and '--serve' in frozen_argv and '--no-browser' in frozen_argv and '--tray' in frozen_argv
+    monkeypatch.setattr(sys, 'frozen', False, raising=False)
+
+    # 2. Windows/桌面支持环境下的管理接口读写与陈旧路径识别
+    reg_store = {}
+    monkeypatch.setattr(autostart, 'is_autostart_supported', lambda: (True, ''))
+    monkeypatch.setattr(autostart.os, 'name', 'nt')
+    monkeypatch.setattr(autostart, '_read_windows_run_value', lambda: reg_store.get('val'))
+
+    def fake_write(value):
+        if value is None:
+            reg_store.pop('val', None)
+        else:
+            reg_store['val'] = value
+
+    monkeypatch.setattr(autostart, '_write_windows_run_value', fake_write)
+    service.runtime_endpoint = {'host': '127.0.0.1', 'port': 58080}
+
+    with TestClient(create_app(service)) as client:
+        assert client.get('/api/admin/autostart').json()['enabled'] is False
+        on_res = client.put('/api/admin/autostart', json={'enabled': True})
+        assert on_res.status_code == 200
+        assert on_res.json()['enabled'] is True and on_res.json()['stale'] is False
+        assert '--no-browser' in reg_store['val'] and '--tray' in reg_store['val']
+        assert client.get('/api/admin/status').json()['autostart']['enabled'] is True
+
+        # 模拟安装目录迁移导致注册表命令陈旧
+        reg_store['val'] = '"C:\\Old\\OmniDownloaderAgent.exe" --serve --no-browser'
+        assert client.get('/api/admin/autostart').json()['stale'] is True
+
+        # 关闭自启与重复关闭均保持幂等
+        off_res = client.put('/api/admin/autostart', json={'enabled': False})
+        assert off_res.status_code == 200 and off_res.json()['enabled'] is False and 'val' not in reg_store
+        assert client.put('/api/admin/autostart', json={'enabled': False}).json()['enabled'] is False
+
+        # Agent 端工具边界隔离：不能通过 Settings 或 MCP 修改系统开机启动项
+        bad_agent = client.post('/api/tools/update_settings', json={'settings': {'autostart': True}}).json()
+        assert bad_agent['ok'] is False
+
+        # 3. 无桌面/容器环境：诚实返回 supported=False，拒绝伪开启
+        monkeypatch.setattr(autostart, 'is_autostart_supported', lambda: (False, 'HEADLESS'))
+        unsupported = client.get('/api/admin/autostart').json()
+        assert unsupported['supported'] is False and unsupported['enabled'] is False
+        rejected = client.put('/api/admin/autostart', json={'enabled': True})
+        assert rejected.status_code == 400 and rejected.json()['error']['code'] == 'CAPABILITY_UNAVAILABLE'
+        assert client.put('/api/admin/autostart', json={'enabled': False}).status_code == 200
+

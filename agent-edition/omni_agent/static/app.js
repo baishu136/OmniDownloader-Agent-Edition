@@ -1272,6 +1272,22 @@ async function loadBots() {
   }
 }
 
+function renderAutostart(info) {
+  const sw = $('autostart-switch');
+  const hint = $('autostart-hint');
+  if (!sw || !hint) return;
+  const data = info && typeof info === 'object' ? info : null;
+  if (!data) {
+    sw.disabled = true;
+    hint.textContent = '无法读取开机自启动状态';
+    return;
+  }
+  const supported = Boolean(data.supported);
+  sw.disabled = !supported;
+  sw.checked = supported && Boolean(data.enabled);
+  hint.textContent = data.message || (supported ? '切换后即时写入系统启动项（静默后台托盘运行）' : '当前运行环境不支持桌面开机自启动');
+}
+
 // -------------------- 服务状态轮询与刷新 --------------------
 
 async function refresh(syncBots = true) {
@@ -1279,13 +1295,20 @@ async function refresh(syncBots = true) {
   const cap = status.capabilities;
   $('version').textContent = cap.version;
   $('connection').textContent = '服务已连接';
+  if (status.autostart) renderAutostart(status.autostart);
   if (syncBots && Array.isArray(status.bots)) renderBotSummary(status.bots);
   renderBridges(status.bridges || [], status.bridge_hints || []);
+
+  const as = status.autostart || {};
+  const autostartSummary = !as.supported
+    ? '当前环境不支持（由容器或系统守护进程管理）'
+    : (as.enabled ? (as.stale ? '已开启（启动路径待同步）' : '已开启（后台托盘静默运行）') : '未开启');
 
   const entries = [
     ['MCP 服务', '运行中 · 免令牌直连（Streamable HTTP 与 stdio · 23 工具）'],
     ['HTTP 地址', location.origin + '/mcp'],
     ['下载指令前缀', '/us（合集、分集视频、全部图片；不加时图文仅首图）· /zip（压缩包发送）· /merge（合并转发发送）'],
+    ['开机自启动', autostartSummary],
     ['服务数据目录', status.data_path],
     ['媒体下载保存目录', status.download_dir || '未指定（仅存受控缓存）'],
     ['图文保存目录', status.image_dir || '未指定（跟随媒体下载目录）'],
@@ -1755,6 +1778,25 @@ $('import-cookie').addEventListener('click', () => action($('import-cookie'), as
     throw err;
   }
 }));
+
+$('autostart-switch').addEventListener('change', async e => {
+  const sw = e.target;
+  const nextEnabled = Boolean(sw.checked);
+  sw.disabled = true;
+  setSaveStatus('saving', '正在更新启动项...');
+  try {
+    const res = await api('autostart', 'PUT', {enabled: nextEnabled});
+    renderAutostart(res);
+    setSaveStatus('saved', '已保存');
+    notify(res.enabled ? '已开启开机自动启动（后台托盘静默运行）' : '已关闭开机自动启动');
+    await refresh(false);
+  } catch (err) {
+    sw.checked = !nextEnabled;
+    sw.disabled = false;
+    setSaveStatus('error', '保存失败');
+    notify(err.message, true);
+  }
+});
 
 $('scan-bridges').addEventListener('click', () => action($('scan-bridges'), async () => {
   const res = await api('bridges/scan', 'POST');

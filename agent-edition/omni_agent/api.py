@@ -143,6 +143,10 @@ class VisualTestArgs(Input):
     target: str = ''
 
 
+class AutoStartArgs(Input):
+    enabled: bool
+
+
 class Retry(Input):
     reconciled_allow_retry: bool = False
 
@@ -470,10 +474,19 @@ def create_app(service=None):
             'download_dir': s.download_dir,
             'image_dir': s.image_dir or s.download_dir,
             'bots': service.get_bot_configs(),
+            'autostart': service.get_autostart_status(),
             'bridges': service.bridges.list_bridges(),
             'bridge_hints': service.bridges.local_hints,
             'local_browser': service.get_browser_preferences().get('resolved_name') or ((find_local_browser() or {}).get('name', '')),
         }
+
+    @app.get('/api/admin/autostart')
+    async def admin_autostart_get():
+        return service.get_autostart_status()
+
+    @app.put('/api/admin/autostart')
+    async def admin_autostart_set(body: AutoStartArgs):
+        return service.set_autostart(body.enabled)
 
     @app.get('/api/admin/bridges')
     async def admin_bridges():

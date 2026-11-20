@@ -74,6 +74,9 @@ def main():
                 settings = client.get(url + '/api/admin/config').json()
                 settings['default_height'] = 720
                 assert client.put(url + '/api/admin/config', json=settings).status_code == 200
+                autostart = client.get(url + '/api/admin/autostart').json()
+                assert autostart['supported'] is True and autostart['mode'] == 'registry'
+                assert client.get(url + '/api/admin/status').json()['autostart']['mode'] == 'registry'
                 assert client.get(url + '/').status_code == 200
             asyncio.run(mcp_check(directory / 'OmniDownloaderAgentMCP.exe', url, env))
             request = {'action': 'verify_session', 'platform': 'YouTube', 'state': str(Path(data) / 'worker'), 'data': data}

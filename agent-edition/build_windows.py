@@ -68,7 +68,7 @@ def main():
         '工作与数据目录优先使用独立工作区根目录下的 data/（独立便携复制时使用同级 data/），不再写入 %LOCALAPPDATA%。\n'
         '支持在管理页选择文件夹与保存目录、测试网络代理连通性、配置下载阶段可视化通知与自动识别已接入桥接。\n'
         '平台 Cookie 支持官方扫码、拉起本机 Chrome/Edge 独立窗口登录自动捕获及多格式加密导入；Agent 仅可查看非敏感状态、禁用与移除 Cookie。\n'
-        '右下角托盘菜单可打开管理页或安全退出。MCP stdio 请使用 OmniDownloaderAgentMCP.exe --stdio 。\n'
+        '右下角托盘菜单可打开管理页、开关“开机自启动”（登录后静默托盘运行不自动弹浏览器）或安全退出。MCP stdio 请使用 OmniDownloaderAgentMCP.exe --stdio 。\n'
         '无需安装 Python 或 FFmpeg。未提供平台测试账号，平台登录和真实发送请按 docs/OPERATIONS.md 验证。\n',encoding='utf-8')
     release=BASE/'dist'/f'OmniDownloader-Agent-Edition-{VERSION}-windows-x64.zip'
     with zipfile.ZipFile(release,'w',zipfile.ZIP_DEFLATED) as archive:

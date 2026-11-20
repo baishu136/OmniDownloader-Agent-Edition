@@ -3,10 +3,10 @@
 日期：2026-11-20。下列记录来自实际执行，模拟 API 和真实平台验收严格区分。
 
 - Windows 原核心：`python -m pytest windows/tests -q`，142 通过，存在既有 Pydantic 弃用警告（新增 TikTok 图文拦截与图片解析、快手图集与图片后缀 `photoUrl` 视频误判拦截）。
-- Agent 独立测试：`python -m pytest agent-edition/tests -q`，111 通过，覆盖：
+- Agent 独立测试：`python -m pytest agent-edition/tests -q`，112 通过，覆盖：
   - 独立默认工作目录解析（`./data/` 及便携目录同级 `data/`）与无 `auth.json` 验证；
   - 免令牌 HTTP 管理接口与官方 MCP SDK 真实 `stdio` / Streamable HTTP 握手及 23 项工具（含 `list_bridges`）发现；
-  - 设置读取/局部更新/自动保存/重置默认设置，以及 `download_dir`、`image_dir` 永久导出、页内目录浏览/创建与原生文件夹选择降级逻辑；
+  - 设置读取/局部更新/自动保存/重置默认设置，以及 `download_dir`、`image_dir` 永久导出、页内目录浏览/创建、原生文件夹选择降级逻辑，以及仅限管理端与系统托盘的「开机自启动」开关（Windows 注册表 `HKCU\...\Run` 静默 `--no-browser --tray` 启动、容器/无桌面环境诚实禁用提示、与 Agent 零改写权限隔离）；
   - 网络代理格式校验、不可达端口快速报错与 HTTP 连通性延迟探测；
   - 图文自动识别、独立格式与打包分离：默认模式下自动识别/回退图文提取，不加 `/us` 时仅下载首图（或当前单集视频），支持 `/us`（全量）、`/zip`（打包）与 `/merge`（合并转发）任意组合解析，支持 `image_format`（`original`/`jpg`/`png`/`webp`，散图与 ZIP 包均统一转换并更新 `manifest.json`，多帧 GIF 动图保留动态与字节直通），以及 `task_files.ord` 严格保序；
   - QQ 与 Telegram 合集/图集发送验证与防图片误发视频防护：QQ 视频/图片消息与群文件切换、`.zip` 强制文件上传、合并转发（`send_group_forward_msg`）及默认 30 条上限（`qq_forward_max_items`）自动分批、单次交付探针缓存、Windows 盘符 `file:///` URI 转换；Telegram 与 OneBot 结合二进制文件头魔数与扩展名（`.jfif` 等）防误将图片/动图/ZIP 按视频发送（即便上游错传 `kind='video'` 或扩展名错标 `.mp4` 也不走 `sendVideo`）、`sendMediaGroup` 相册分批、连续混排（穿插 GIF/大文件）严格保序及 `BOT_REJECTED` / `BOT_FILE_TOO_LARGE` 单发降级 `sendDocument` 兜底、WebP/AVIF/BMP/JFIF EXIF 方向校正与内存无损转 JPEG/PNG、`is_profile()` 排除 TikTok `/photo/` 与 X `/u/status/` 单作品链接，以及 `worker.py` `COVER` 封面传递与魔数防伪装守卫；
