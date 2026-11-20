@@ -30,7 +30,7 @@
 ### 1.3 测试复现
 
 - 改造前基线：`pytest agent-edition/tests -q` → **111 通过 / 1 失败**。失败项为 `test_visual_events_outbox_server_bot_notify_and_mcp_progress`，原因是本地「跳过 error 直发」补丁与上游断言冲突。
-- 改造后：**134 通过 / 0 失败**（新增 `test_errors.py` 7 项、`test_reliability.py` 9 项、`test_credentials.py` 6 项；原失败项恢复通过）。
+- 改造后：**139 通过 / 0 失败**（新增 `test_errors.py` 7 项、`test_reliability.py` 13 项、`test_credentials.py` 7 项；原失败项恢复通过）。
 
 ### 1.4 部分支持或尚未实现（未在本轮伪装为完成）
 
@@ -55,13 +55,13 @@
 | S1-6 失败原因可直发且不泄露路径 | 脱敏后输出完整原因 | `errors.py`、`service.py` | S1-1 | 既有可视化测试 | ✅ 完成 |
 | S1-7 环境自检 | 目录/磁盘/数据库/代理/Bot/凭据检查与脱敏报告 | `service.py`、`api.py`、管理页 | S1-1 | `test_reliability.py` | ✅ 完成（API，管理页入口待接） |
 | S1-8 交付部分恢复明细 | 逐文件发送状态与安全续发接口 | `store.py`、`service.py` | S1-4 | `test_reliability.py` | ✅ 完成（续发沿用既有 receipts 机制） |
-| S1-9 Cookie 候选/验证增强 | 可校验平台失败时保留有效版本并提示 | S1-5 基础上 | S1-5 | 扩展测试 | ⏳ 待做 |
+| S1-9 Cookie 候选/验证增强 | 可校验平台失败时保留有效版本并提示 | S1-5 基础上 | S1-5 | `test_credentials.py` | ✅ 完成 |
 
-### Sprint 02：下载体验（未开始）
+### Sprint 02：下载体验（进行中）
 
 - 智能链接解析：整段聊天文案提取、多链接、重复识别、短链跳转仍走 SSRF 校验。
 - 画质/格式：只在可用格式内选择，降级需显式允许，返回实际格式。
-- 文件与缓存：原子写入、同名冲突、SHA-256、磁盘空间预检、清理预览。
+- 文件与缓存：原子写入、同名冲突、SHA-256 已完成；磁盘空间预检与清理预览本轮完成（`DISK_FULL`、`GET /api/admin/cleanup/preview`）。
 - 进度反馈：字节数、速度、阶段、最终交付状态；仅在可靠时显示 ETA。
 - 代理诊断：解析/下载/交付分阶段使用情况与失败归因。
 

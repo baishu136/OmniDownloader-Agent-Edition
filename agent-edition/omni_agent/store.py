@@ -416,11 +416,20 @@ class Store:
             server_notified=stage_notified,
         )
         error_spec = classify_error(row['error'], row.get('error_message', '')) if row['error'] else {}
+        next_action = {
+            'READY': 'deliver_or_save',
+            'SENDING': 'wait',
+            'SENT': 'none',
+            'QUEUED': 'wait',
+            'DOWNLOADING': 'wait',
+            'PROCESSING': 'wait',
+        }.get(row['state'], 'retry' if error_spec.get('retryable') else 'ask_user')
         return {k: row[k] for k in ('id', 'state', 'progress', 'speed', 'error', 'created', 'updated')} | {
             'error_message': row.get('error_message', '') or row['error'],
             'stage': error_spec.get('stage', ''),
             'retryable': error_spec.get('retryable', False),
             'suggested_action': error_spec.get('suggested_action', ''),
+            'next_action': next_action,
             'metadata': meta,
             'file_count': len(files),
             'files': [{'file_id': f['id'], 'bytes': f['bytes'], 'state': f['state']} for f in files],
@@ -544,6 +553,37 @@ class Store:
             if not pending:
                 self.update_job(row['task_id'], 'SENT')
             self.record_visual_event(row['task_id'], 'sent', 'SENT', delivery_id=identifier)
+
+    def cleanup_preview(self, *, expired=False):
+        """列出下一次清理会删除的文件，不修改数据库或磁盘。"""
+        now = time.time()
+        expiring: set[str] = set()
+        if expired:
+            expiring = {
+                row['id'] for row in self.db.execute(
+                    """SELECT id FROM jobs WHERE updated<? AND state IN ('READY','FAILED','CANCELLED')
+                       AND id NOT IN (SELECT task_id FROM deliveries WHERE state IN ('QUEUED','SENDING','UNCERTAIN'))""",
+                    (now - self.config.settings.cache_ttl,),
+                )
+            }
+        items = []
+        for file in self.db.execute("SELECT * FROM files WHERE state!='CLEANED'").fetchall():
+            tasks = [r[0] for r in self.db.execute('SELECT task_id FROM task_files WHERE file_id=?', (file['id'],))]
+            placeholders = ','.join('?' for _ in tasks)
+            hold = self.db.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE id IN ({placeholders}) AND state NOT IN ('SENT','CLEANED','EXPIRED','CANCELLED')",
+                tasks,
+            ).fetchone()[0]
+            if hold:
+                continue
+            pending = self.db.execute(
+                f"SELECT COUNT(*) FROM deliveries WHERE task_id IN ({placeholders}) AND state!='SENT' AND NOT (state='FAILED' AND updated<?)",
+                (*tasks, now - self.config.settings.cache_ttl if expired else 0),
+            ).fetchone()[0]
+            if pending:
+                continue
+            items.append({'file_id': file['id'], 'bytes': file['bytes'], 'state': file['state']})
+        return {'files': len(items), 'bytes': sum(item['bytes'] for item in items), 'items': items[:200]}
 
     def cleanup(self, *, expired=False):
         removed, bytes_removed = 0, 0

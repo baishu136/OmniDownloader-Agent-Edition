@@ -429,6 +429,14 @@ def create_app(service=None):
     async def reset_settings(body: ResetSettingsArgs | None = None):
         return {'ok': True, **service.reset_settings(reset_cache_dir=bool(body and body.reset_cache_dir))}
 
+    @app.get('/api/admin/config/export')
+    async def export_config():
+        return service.export_settings()
+
+    @app.post('/api/admin/config/import')
+    async def import_config(payload: dict):
+        return {'ok': True, 'settings': service.import_settings(payload)}
+
     @app.post('/api/admin/pick-directory')
     async def admin_pick_directory(body: PickDirArgs):
         return await pick_directory(body.initial_dir, body.title)
@@ -520,6 +528,10 @@ def create_app(service=None):
     @app.post('/api/admin/cleanup')
     async def cleanup():
         return service.cleanup_cache()
+
+    @app.get('/api/admin/cleanup/preview')
+    async def cleanup_preview(expired: bool = False):
+        return service.cleanup_preview(expired=expired)
 
     @app.post('/api/admin/approvals/{identifier}')
     async def approve(identifier: str):

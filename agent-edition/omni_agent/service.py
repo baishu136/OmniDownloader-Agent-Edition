@@ -328,6 +328,42 @@ class Service:
     def cleanup_cache(self):
         return self.store.cleanup()
 
+    def cleanup_preview(self, *, expired=False):
+        return self.store.cleanup_preview(expired=expired)
+
+    def export_settings(self):
+        """导出非敏感配置；机器人令牌与 Cookie 保存在 Vault，不在 settings.json。"""
+        return {
+            'version': __version__,
+            'exported_at': time.time(),
+            'settings': self.config.settings.model_dump(),
+        }
+
+    def import_settings(self, payload):
+        """校验后导入配置；写入前保留上一份 settings.json，失败时恢复。"""
+        if not isinstance(payload, dict):
+            raise AgentError('INVALID_PARAMETER', '配置导入需要 JSON 对象')
+        data = payload.get('settings', payload)
+        if not isinstance(data, dict):
+            raise AgentError('INVALID_PARAMETER', '配置字段必须是 JSON 对象')
+        try:
+            settings = Settings.model_validate(data)
+        except ValidationError as error:
+            first = error.errors()[0]
+            field = '.'.join(str(part) for part in first.get('loc', ())) or 'settings'
+            raise AgentError('INVALID_PARAMETER', f'配置无效：{field} {first.get("msg", "")}'.strip()) from None
+        backup = self.config.path.with_suffix('.json.bak')
+        previous = self.config.path.read_bytes() if self.config.path.exists() else None
+        if previous is not None:
+            backup.write_bytes(previous)
+        try:
+            self.config.save(settings)
+        except Exception:
+            if previous is not None:
+                backup.write_bytes(previous)
+            raise
+        return self.get_settings()
+
     # -------------------- 平台 Cookie 状态与操作（严格隔离） --------------------
 
     def _validation_key(self, platform):
@@ -584,6 +620,7 @@ class Service:
             if not plat or not netscape or plat not in self.domains:
                 continue
             owner_tok = uuid.uuid4().hex if account_id else ''
+            previous_state = self._session_info(plat)['validation'].get('state', '')
             try:
                 self.import_cookie(plat, netscape, source=source, owner_token=owner_tok)
                 if account_id:
@@ -592,11 +629,24 @@ class Service:
             except AgentError:
                 continue
             if plat in ('哔哩哔哩', 'Pixiv'):
-                try:
-                    await self.verify_cookie(plat)
-                except AgentError:
-                    pass
+                await self._verify_or_restore(plat, previous_state)
         return saved
+
+    async def _verify_or_restore(self, platform: str, previous_state: str):
+        """在线校验新凭据；若失败且上一版本有效，则自动回滚，避免捕获把登录状态弄丢。"""
+        try:
+            result = await self.verify_cookie(platform)
+        except AgentError:
+            return None
+        if (result.get('state') == 'INVALID' and previous_state == 'VALID'
+                and self._session_backup_path(platform).is_file()):
+            restored = self.restore_cookie(platform)
+            raw = self.vault.get(self._validation_key(platform))
+            marker = json.loads(raw) if raw else {}
+            marker.update({'state': 'UNVERIFIED', 'rollback_reason': 'NEW_COOKIE_REJECTED'})
+            self.vault.put(self._validation_key(platform), json.dumps(marker))
+            return {'state': 'ROLLED_BACK', 'session': restored}
+        return result
 
     async def start_browser_login(self, platform: str):
         if platform != MULTI_PLATFORM_KEY and platform not in self.domains:
@@ -1275,6 +1325,13 @@ class Service:
             if payload['action'] == 'collection' and not self.config.settings.collections:
                 raise AgentError('FEATURE_DISABLED', '当前设置关闭了合集下载')
             self.store.update_job(identifier, 'DOWNLOADING', visual_stage='start')
+
+            try:
+                free = shutil.disk_usage(self.config.cache).free
+            except OSError:
+                free = None
+            if free is not None and free < 64 * 1024 ** 2:
+                raise AgentError('DISK_FULL', f'缓存磁盘剩余空间不足 64 MiB（当前 {free // (1024 ** 2)} MiB）')
 
             def progress(event):
                 if self.store.job(identifier)['state'] == 'CANCELLED':

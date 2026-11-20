@@ -136,6 +136,55 @@ def test_delivery_reports_per_file_send_state(service):
     assert states[files[1]['id']] is False
 
 
+def test_cleanup_preview_matches_actual_cleanup(service):
+    job = ready_task(service)
+    delivery, _ = service.store.create_delivery(job['id'], 'alice', 'telegram', '123', 'document', 'cleanup-1')
+    for file in service.store.files(job['id']):
+        service.store.receipt(delivery['id'], file['id'], {'message_id': 1, 'platform': 'telegram'})
+    service.store.sent(delivery['id'])
+    preview = service.store.cleanup_preview()
+    assert preview['files'] == 1 and preview['bytes'] > 0
+    removed = service.store.cleanup()
+    assert removed['files_removed'] == 1
+    assert service.store.cleanup_preview()['files'] == 0
+
+
+async def test_disk_space_preflight_blocks_before_download(service, no_wait, monkeypatch):
+    import collections
+    configure(service)
+    service.runner = FlakyRunner(service.config, service.store, failures=0)
+    row = await queue_job(service)
+    usage = collections.namedtuple('usage', 'total used free')
+    monkeypatch.setattr(service_module.shutil, 'disk_usage', lambda _path: usage(10 ** 12, 10 ** 12, 1024))
+    await service.run_job(row)
+    job = service.store.public_job(row['id'], 'alice')
+    assert service.runner.calls == 0
+    assert job['state'] == 'FAILED' and job['error'] == 'DISK_FULL'
+
+
+def test_settings_export_import_and_backup(service):
+    service.update_settings({'max_height': 2161})
+    exported = service.export_settings()
+    assert exported['settings']['max_height'] == 2161
+    payload = dict(exported['settings'], max_height=1440, default_height=1080)
+    service.import_settings({'settings': payload})
+    assert service.get_settings()['max_height'] == 1440
+    assert service.config.path.with_suffix('.json.bak').is_file()
+    before = service.get_settings()
+    with pytest.raises(AgentError) as error:
+        service.import_settings({'settings': dict(payload, unknown_field=1)})
+    assert error.value.code == 'INVALID_PARAMETER'
+    assert service.get_settings() == before
+
+
+def test_public_job_exposes_next_action(service):
+    ready = ready_task(service)
+    assert service.store.public_job(ready['id'], 'alice')['next_action'] == 'deliver_or_save'
+    failed, _ = service.store.create_job('alice', {}, 'next-action', 'next-action-1')
+    service.store.fail(failed['id'], 'TIMEOUT', error_message='超时')
+    assert service.store.public_job(failed['id'], 'alice')['next_action'] == 'retry'
+
+
 def test_diagnostics_reports_environment_without_secrets(service):
     import json
     service.import_cookie('哔哩哔哩', 'SESSDATA=diag-secret; bili_jct=diag-jct')

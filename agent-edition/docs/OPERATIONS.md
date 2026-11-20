@@ -11,7 +11,10 @@
 - 已取消令牌授权设定：无 `auth.json`，打开 `http://127.0.0.1:58080/` 即可直接进入设置页；更改开关即自动保存，目录与代理提供显式保存与清空按钮，并支持“重置默认设置”。
 - 开机自启动（Windows / 桌面环境）：可在设置页“01 下载与存储设置”底部开关「开机自动启动服务」或右键 Windows 系统托盘图标一键开启/关闭（启用后写入当前用户注册表 `Run` 项，随系统登录后以 `--no-browser --tray` 后台静默运行、不自动弹出浏览器，并在双开主程序时自动唤起管理页；Docker/无桌面环境自动提示由容器 `restart` 策略管理）。
 - 失败自动重试：`task_retries`（0–5，默认 2）控制临时性网络/下载错误的重试次数，`retry_base_seconds`（1–30，默认 1）为指数退避基数（带 0–25% 随机抖动，单次等待上限 30 秒）。仅 `retryable=true` 的错误（超时、连接重置、DNS、代理、5xx、限流、工作进程异常退出等）会重试；Cookie 失效、视频不存在、无权限、文件超限、磁盘不足、需要审批等错误不会重试。重试前会丢弃本次未登记的临时产物，取消与停机信号始终优先。
-- 结构化错误：所有接口错误在原有 `code`/`message` 之外附带 `stage`（`REQUEST`/`AUTHENTICATING`/`PARSING`/`DOWNLOADING`/`STORAGE`/`DELIVERY`/`INTERNAL`）、`retryable` 与 `suggested_action`；任务与交付状态同样返回这三个字段。Agent 可据此决定重试还是请求人工处理。
+- 结构化错误：所有接口错误在原有 `code`/`message` 之外附带 `stage`（`REQUEST`/`AUTHENTICATING`/`PARSING`/`DOWNLOADING`/`STORAGE`/`DELIVERY`/`INTERNAL`）、`retryable` 与 `suggested_action`；任务与交付状态同样返回这三个字段，任务额外返回 `next_action`（`wait`/`retry`/`deliver_or_save`/`ask_user`/`none`）。Agent 可据此决定重试还是请求人工处理。
+- 配置备份与迁移：`GET /api/admin/config/export` 导出不含凭据的非敏感配置（Cookie 与机器人令牌保存在 Vault，不会进入导出文件）；`POST /api/admin/config/import` 校验通过后写入，写入前保留 `settings.json.bak`，校验或写入失败时原配置保持不变。
+- 清理预览：`GET /api/admin/cleanup/preview?expired=true` 返回下一次清理会删除的文件数与字节数（不修改磁盘或数据库）；实际清理仍由 `POST /api/admin/cleanup` 执行。
+- 下载前空间检查：开始下载前若缓存磁盘剩余不足 64 MiB，任务直接以 `DISK_FULL` 失败，不会下载到一半才报错。
 - 重启恢复：服务启动时未开始的 `QUEUED` 任务保留并由调度器继续；已开始的下载标记 `RESTART_INTERRUPTED` 失败并保留原因；发送中的交付标记 `UNCERTAIN` 等待人工核对；`READY` 任务若缓存文件缺失或大小变化，会标记 `FILE_MISSING`，不会再被当作可交付。
 
 ## 链接前缀下载指令

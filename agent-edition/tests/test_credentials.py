@@ -64,6 +64,26 @@ def test_restore_without_backup_is_refused(service):
     assert error.value.code == 'NOT_FOUND'
 
 
+async def test_rejected_capture_restores_previous_valid_cookie(service, monkeypatch):
+    import json
+    service.import_cookie('哔哩哔哩', 'SESSDATA=good; bili_jct=good')
+    service.import_cookie('哔哩哔哩', 'SESSDATA=current; bili_jct=current')
+    service.vault.put(service._validation_key('哔哩哔哩'),
+                      json.dumps({'state': 'VALID', 'source': 'import'}))
+
+    async def invalid(_platform):
+        return {'state': 'INVALID'}
+
+    monkeypatch.setattr(service, 'verify_cookie', invalid)
+    saved = await service._save_captured_batch(
+        [{'platform': '哔哩哔哩', 'netscape': 'SESSDATA=rejected; bili_jct=rejected'}], mode='auto')
+    assert '哔哩哔哩' in saved
+    values = {name: value for _, name, value in cookies(service, '哔哩哔哩')}
+    assert values['SESSDATA'] == 'current'
+    marker = json.loads(service.vault.get(service._validation_key('哔哩哔哩')))
+    assert marker['rollback_reason'] == 'NEW_COOKIE_REJECTED'
+
+
 def test_cookie_survives_service_restart(service):
     service.import_cookie('哔哩哔哩', 'SESSDATA=restart-me; bili_jct=restart-jct')
     reopened = Service(service.config.directory)
