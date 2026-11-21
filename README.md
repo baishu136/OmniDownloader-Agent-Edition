@@ -3,6 +3,7 @@
 面向 AI Agent、QQ / Telegram 机器人的独立 Headless 媒体解析、下载与交付服务。
 
 本仓库独立维护代码、版本、CI 和发行包。媒体引擎复用自 [OmniDownloader](https://github.com/baishu136/OmniDownloader)，来源与许可见 [UPSTREAM.md](UPSTREAM.md) 和 [LICENSE](LICENSE)。
+[![M8ven Score](https://m8ven.ai/badge/mcp/baishu136-omnidownloader-agent-edition-1080cm?v=b980816968c36b8a26ea39b8e943552b)](https://m8ven.ai/mcp/baishu136-omnidownloader-agent-edition-1080cm?s=readme)
 
 - 官方 MCP Python SDK：stdio 与 Streamable HTTP，23 个媒体、设置管理、自动识别桥接、运维与 Cookie 权限控制工具。
 - 免令牌本机直连与文件夹/代理工具：取消 `auth.json` 与令牌锁屏，打开管理页直接进入设置工作区；提供原生文件夹选择弹窗（无头环境降级为页内服务端浏览）、显式保存按键、重置默认设置及网络代理连通性测试（兼容 Fake-IP / TUN）。
